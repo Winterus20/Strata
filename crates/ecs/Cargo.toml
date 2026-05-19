@@ -1,0 +1,15 @@
+[package]
+name = "strata-ecs"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+strata-core = { path = "../core" }
+bevy_ecs.workspace = true
+bevy_app.workspace = true
+bevy_math.workspace = true
+bevy_transform.workspace = true
+glam.workspace = true
+hashbrown.workspace = true
+tracing.workspace = true
+serde = { workspace = true, features = ["derive"] }

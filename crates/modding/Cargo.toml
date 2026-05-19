@@ -1,0 +1,19 @@
+[package]
+name = "strata-modding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+strata-core = { path = "../core" }
+strata-ecs = { path = "../ecs" }
+strata-plugin-api = { path = "../plugin-api" }
+
+bevy_ecs.workspace = true
+bevy_app.workspace = true
+wasmtime.workspace = true
+notify.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde = { workspace = true, features = ["derive"] }
+toml = "0.8"

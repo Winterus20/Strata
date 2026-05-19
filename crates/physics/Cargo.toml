@@ -1,0 +1,15 @@
+[package]
+name = "strata-physics"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+strata-core = { path = "../core" }
+strata-ecs = { path = "../ecs" }
+strata-meshing = { path = "../meshing" }
+bevy_rapier3d.workspace = true
+bevy_ecs.workspace = true
+bevy_app.workspace = true
+bevy_math.workspace = true
+glam.workspace = true
+tracing.workspace = true

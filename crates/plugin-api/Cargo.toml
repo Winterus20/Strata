@@ -1,0 +1,13 @@
+[package]
+name = "strata-plugin-api"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy_ecs.workspace = true
+bevy_app.workspace = true
+semver.workspace = true
+libloading.workspace = true
+tracing.workspace = true
+anyhow.workspace = true

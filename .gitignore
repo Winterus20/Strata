@@ -1,0 +1,5 @@
+/target
+*.pdb
+/world_data
+/.openclaude
+/.opencode

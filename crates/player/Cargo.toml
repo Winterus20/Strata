@@ -1,0 +1,18 @@
+[package]
+name = "strata-player"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+strata-ecs = { path = "../ecs" }
+strata-physics = { path = "../physics" }
+strata-inventory = { path = "../inventory" }
+bevy_ecs.workspace = true
+bevy_app.workspace = true
+bevy_math.workspace = true
+bevy_transform.workspace = true
+bevy_rapier3d.workspace = true
+bevy_time.workspace = true
+glam.workspace = true
+strata-core = { version = "0.1.0", path = "../core" }

@@ -1,0 +1,415 @@
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use anyhow::Result;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use strata_core::{BlockId, BlockPos, BlockProperties, BlockRegistry, ChunkPos};
+use strata_render::engine::RenderEngine;
+use tracing::info;
+use winit::event::{ElementState, MouseButton};
+use winit::keyboard::Key;
+use winit::window::CursorGrabMode;
+
+mod camera;
+mod chunk_gen_worker;
+mod debug_overlay;
+mod dirty_manager;
+mod input;
+mod lazy_loader;
+mod mesh_worker;
+mod render;
+mod world;
+
+use camera::{Camera, CameraController};
+use chunk_gen_worker::ChunkGenWorker;
+use debug_overlay::DebugOverlay;
+use dirty_manager::DirtyChunkManager;
+use input::InputState;
+use lazy_loader::LazyChunkLoader;
+use world::WorldManager;
+
+struct App {
+    registry: BlockRegistry,
+    window: Option<Arc<winit::window::Window>>,
+    render: Option<RenderEngine>,
+    camera: Camera,
+    camera_controller: CameraController,
+    world: WorldManager,
+    input: InputState,
+    lazy_loader: LazyChunkLoader,
+    chunk_gen_worker: ChunkGenWorker,
+    dirty_manager: DirtyChunkManager,
+    debug: DebugOverlay,
+    frame_count: u32,
+    fps_timer: Instant,
+    current_fps: f32,
+    last_frame_time: Instant,
+    render_distance: u32,
+    last_player_chunk: Option<ChunkPos>,
+}
+
+impl App {
+    fn new() -> Self {
+        let mut registry = BlockRegistry::new();
+        registry.register(BlockProperties {
+            id: BlockId::STONE,
+            name: "stone",
+            transparent: false,
+            solid: true,
+            hardness: 2.0,
+            light_emission: 0,
+            face_textures: [1, 1, 1, 1, 1, 1],
+        });
+        registry.register(BlockProperties {
+            id: BlockId::DIRT,
+            name: "dirt",
+            transparent: false,
+            solid: true,
+            hardness: 0.6,
+            light_emission: 0,
+            face_textures: [2, 2, 2, 2, 2, 2],
+        });
+        registry.register(BlockProperties {
+            id: BlockId::GRASS,
+            name: "grass",
+            transparent: false,
+            solid: true,
+            hardness: 0.6,
+            light_emission: 0,
+            face_textures: [3, 3, 2, 4, 3, 3],
+        });
+        registry.register(BlockProperties {
+            id: BlockId::BEDROCK,
+            name: "bedrock",
+            transparent: false,
+            solid: true,
+            hardness: 999.0,
+            light_emission: 0,
+            face_textures: [5, 5, 5, 5, 5, 5],
+        });
+
+        let mut world = WorldManager::new(42);
+
+        // Generate initial chunks synchronously (needed for spawn height)
+        for x in -2..=2 {
+            for z in -2..=2 {
+                let pos = ChunkPos(glam::IVec2::new(x, z));
+                world.get_or_generate(pos);
+            }
+        }
+
+        // Create background worker pool (4 threads for chunk gen + meshing)
+        let chunk_gen_worker = ChunkGenWorker::new(42, "world_data", 4);
+
+        let spawn_height = world.terrain_height_at(0, 0) + 2.0;
+        let mut camera = Camera::new(1280.0 / 720.0);
+        camera.position.y = spawn_height;
+        camera.pitch = -0.3;
+
+        Self {
+            registry,
+            window: None,
+            render: None,
+            camera,
+            camera_controller: CameraController::default(),
+            world,
+            input: InputState::default(),
+            lazy_loader: LazyChunkLoader::new(),
+            chunk_gen_worker,
+            dirty_manager: DirtyChunkManager::new(),
+            debug: DebugOverlay::new(),
+            frame_count: 0,
+            fps_timer: Instant::now(),
+            current_fps: 0.0,
+            last_frame_time: Instant::now(),
+            render_distance: 8,
+            last_player_chunk: None,
+        }
+    }
+}
+
+impl winit::application::ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if self.window.is_none() {
+            let window = Arc::new(
+                event_loop
+                    .create_window(
+                        winit::window::WindowAttributes::default()
+                            .with_title("Strata - Phase 2")
+                            .with_inner_size(winit::dpi::PhysicalSize::new(1280u32, 720u32)),
+                    )
+                    .unwrap(),
+            );
+            info!("Window created");
+            let render = pollster::block_on(RenderEngine::new(Arc::clone(&window), &self.registry));
+            match render {
+                Ok(mut engine) => {
+                    self.world.init_mesh_worker();
+                    self.debug.init(&engine.device, engine.config.format);
+                    // Upload initial CPU-built meshes
+                    for x in -2..=2 {
+                        for z in -2..=2 {
+                            let pos = ChunkPos(glam::IVec2::new(x, z));
+                            if let Some(mesh) = self.world.get_mesh(pos) {
+                                engine.chunk_renderer.upload_mesh(&engine.device, pos, mesh);
+                            }
+                        }
+                    }
+                    self.render = Some(engine);
+                    self.window = Some(window);
+                    let w = self.window.as_ref().unwrap();
+                    w.set_cursor_visible(false);
+                    let _ = w
+                        .set_cursor_grab(CursorGrabMode::Locked)
+                        .or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined));
+                }
+                Err(e) => {
+                    tracing::error!("Failed to create RenderEngine: {}", e);
+                }
+            }
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &winit::event_loop::ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: winit::event::DeviceEvent,
+    ) {
+        if let winit::event::DeviceEvent::MouseMotion { delta, .. } = event {
+            self.input
+                .handle_mouse_motion(winit::dpi::PhysicalPosition::new(delta.0, delta.1));
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        _window_id: winit::window::WindowId,
+        event: winit::event::WindowEvent,
+    ) {
+        match event {
+            winit::event::WindowEvent::CloseRequested => {
+                event_loop.exit();
+            }
+            winit::event::WindowEvent::KeyboardInput { event, .. } => {
+                self.input
+                    .handle_keyboard_input(&event.logical_key, event.state);
+
+                if event.state == ElementState::Pressed
+                    && let Key::Character(ch) = &event.logical_key
+                    && ch.as_str() == "q"
+                {
+                    event_loop.exit();
+                }
+            }
+            winit::event::WindowEvent::MouseInput { state, button, .. } => {
+                if state == ElementState::Pressed
+                    && let Some(window) = &self.window
+                {
+                    window.set_cursor_visible(false);
+                    let _ = window
+                        .set_cursor_grab(CursorGrabMode::Locked)
+                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+                }
+
+                if state == ElementState::Pressed && self.render.is_some() {
+                    let (origin, forward) = {
+                        let (s, c) = self.camera.pitch.sin_cos();
+                        let (sy, cy) = self.camera.yaw.sin_cos();
+                        let fwd = glam::Vec3::new(cy * c, s, sy * c);
+                        (self.camera.position, fwd)
+                    };
+
+                    match button {
+                        MouseButton::Left => {
+                            if let Some(pos) = self
+                                .world
+                                .get_block_in_front_of_camera(origin, forward, 6.0)
+                                && let Some((chunk_pos, _, _, _)) = pos.to_chunk_local()
+                            {
+                                self.world.break_block(pos);
+                                self.dirty_manager.mark_dirty(chunk_pos);
+                            }
+                        }
+                        MouseButton::Right => {
+                            if let Some(pos) = self
+                                .world
+                                .get_block_in_front_of_camera(origin, forward, 6.0)
+                            {
+                                let to_hit = glam::IVec3::new(
+                                    pos.0.x - (origin.x as i32),
+                                    pos.0.y - (origin.y as i32),
+                                    pos.0.z - (origin.z as i32),
+                                );
+                                let normal = if to_hit.x.abs() > to_hit.y.abs()
+                                    && to_hit.x.abs() > to_hit.z.abs()
+                                {
+                                    glam::IVec3::new(to_hit.x.signum(), 0, 0)
+                                } else if to_hit.y.abs() > to_hit.z.abs() {
+                                    glam::IVec3::new(0, to_hit.y.signum(), 0)
+                                } else {
+                                    glam::IVec3::new(0, 0, to_hit.z.signum())
+                                };
+                                let adjacent = BlockPos(pos.0 - normal);
+                                if let Some((chunk_pos, _, _, _)) = adjacent.to_chunk_local() {
+                                    self.world.place_block(adjacent, BlockId::STONE);
+                                    self.dirty_manager.mark_dirty(chunk_pos);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            winit::event::WindowEvent::Resized(size) => {
+                if let Some(render) = &mut self.render {
+                    render.resize(size.width, size.height);
+                }
+            }
+            winit::event::WindowEvent::CursorEntered { .. } => {
+                if let Some(window) = &self.window {
+                    window.set_cursor_visible(false);
+                    let _ = window
+                        .set_cursor_grab(CursorGrabMode::Locked)
+                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_frame_time).as_secs_f32();
+        self.last_frame_time = now;
+
+        // 1. Camera update with input
+        let (yaw_delta, pitch_delta) = self.input.cursor_delta();
+        self.camera_controller.update_camera(
+            &mut self.camera,
+            dt,
+            strata_render::camera::CameraInput {
+                forward: self.input.forward() as f32,
+                strafe: self.input.strafe() as f32,
+                vertical: self.input.vertical() as f32,
+                yaw_delta,
+                pitch_delta,
+            },
+        );
+        self.input.update();
+
+        // 2. Lazy chunk loading and unloading based on player position (gated on chunk boundary crossing)
+        let player_chunk =
+            ChunkPos::from_world(self.camera.position.x as i32, self.camera.position.z as i32);
+        if self.last_player_chunk != Some(player_chunk) {
+            let required = self
+                .world
+                .get_required_chunks(player_chunk, self.render_distance);
+            self.lazy_loader.request_chunks(&required);
+            self.lazy_loader.prioritize(player_chunk);
+
+            // 4. Unload distant chunks and clean up GPU buffers
+            let removed = self.world
+                .unload_distant_chunks(player_chunk, self.render_distance);
+            if let Some(render) = &mut self.render {
+                for pos in &removed {
+                    render.chunk_renderer.remove_mesh(*pos);
+                }
+            }
+
+            self.last_player_chunk = Some(player_chunk);
+        }
+
+        // Submit chunk gen requests to background workers (non-blocking, throttled per frame)
+        self.lazy_loader.process(&self.chunk_gen_worker);
+
+        // 3. Poll for completed chunks from background workers and upload to GPU
+        {
+            let completed = self.chunk_gen_worker.poll();
+            for result in completed {
+                self.lazy_loader.mark_completed(result.pos);
+                self.world.insert_generated_chunk(result.pos, result.chunk);
+                if let Some(render) = &mut self.render {
+                    render.chunk_renderer.upload_mesh(&render.device, result.pos, &result.mesh);
+                }
+            }
+        }
+
+        // 5. Propagate light for light-dirty chunks (throttled: 4/frame)
+        self.world.propagate_light();
+
+        // 6. Process dirty chunks (submits mesh rebuilds to background thread)
+        let _rebuilt = self.dirty_manager.process(&mut self.world);
+        // Poll for any completed dirty rebuilds (from dirty chunk or other mesh updates)
+        if let Some(render) = &mut self.render {
+            let completed = self.world.poll_completed_meshes();
+            for (pos, mesh) in completed {
+                render.chunk_renderer.upload_mesh(&render.device, pos, &mesh);
+            }
+        }
+
+        // 7. Render
+        if let Some(render) = &mut self.render {
+            // Sync camera
+            render.camera = self.camera.clone();
+            render.update_camera();
+
+            // Frustum culling (uses cached chunk keys)
+            render.chunk_renderer.cull(&render.frustum, self.world.get_chunk_keys());
+
+            // Update debug stats
+            self.debug.visible_chunks = render.chunk_renderer.visible_count();
+            self.debug.chunk_count = render.chunk_renderer.total_count();
+            self.debug.player_position = (
+                self.camera.position.x,
+                self.camera.position.y,
+                self.camera.position.z,
+            );
+
+            let output = render.render_frame();
+            if let Some(mut output) = output {
+                self.debug.render(
+                    &render.device,
+                    &render.queue,
+                    &mut output.encoder,
+                    render.config.format,
+                    &output.view,
+                    render.config.width,
+                    render.config.height,
+                );
+                render
+                    .queue
+                    .submit(std::iter::once(output.encoder.finish()));
+                output.frame.present();
+            }
+        }
+
+        // 7. FPS update + window title
+        if let Some(window) = &self.window {
+            self.frame_count += 1;
+            if self.fps_timer.elapsed() >= Duration::from_secs(1) {
+                self.current_fps = self.frame_count as f32 / self.fps_timer.elapsed().as_secs_f32();
+                self.debug.fps = self.current_fps;
+                window.set_title(&self.debug.debug_string());
+                self.frame_count = 0;
+                self.fps_timer = Instant::now();
+            }
+        }
+    }
+}
+
+fn main() -> Result<()> {
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .init();
+
+    info!("Strata Phase 2 client starting...");
+
+    let event_loop = winit::event_loop::EventLoop::new()?;
+    let mut app = App::new();
+    event_loop.run_app(&mut app)?;
+
+    Ok(())
+}

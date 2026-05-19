@@ -1,0 +1,28 @@
+[package]
+name = "strata-network"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+strata-core = { path = "../core" }
+strata-ecs = { path = "../ecs" }
+bevy_ecs = "0.18"
+bevy_app = "0.18"
+bevy_time.workspace = true
+bevy_renet2 = { workspace = true }
+bevy_replicon = { workspace = true }
+bevy_replicon_renet2 = { workspace = true, features = ["native_transport"] }
+postcard = { workspace = true }
+serde = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+glam.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "network_bench"
+harness = false

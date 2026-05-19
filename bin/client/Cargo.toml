@@ -1,0 +1,28 @@
+[package]
+name = "strata-client"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+strata-core = { path = "../../crates/core" }
+strata-ecs = { path = "../../crates/ecs" }
+strata-world-gen = { path = "../../crates/world-gen" }
+strata-meshing = { path = "../../crates/meshing" }
+strata-storage = { path = "../../crates/storage" }
+strata-physics = { path = "../../crates/physics" }
+strata-render = { path = "../../crates/render" }
+strata-lighting = { path = "../../crates/lighting" }
+
+winit.workspace = true
+wgpu.workspace = true
+glam.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+hashbrown.workspace = true
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+image = "0.25"
+mimalloc.workspace = true
+# glyphon text rendering requires wgpu >= 28 (blocked on workspace wgpu 27 -> 28 upgrade).
+# glyphon = "0.10"

@@ -1,0 +1,52 @@
+package strata:engine-api;
+
+/// Blok kaydı ve yönetimi için arayüz.
+interface block-registry {
+    record block-properties {
+        name: string,
+        hardness: f32,
+        blast-resistance: f32,
+        transparent: bool,
+        light-emission: u8,
+    }
+
+    /// Yeni bir blok türü kaydeder ve bu bloğun benzersiz ID'sini döner.
+    register-block: func(properties: block-properties) -> u16;
+
+    /// Verilen ID'ye ait bloğun adını döner.
+    get-block-name: func(id: u16) -> string;
+}
+
+/// Basit entity etkileşimi için arayüz.
+interface entity-control {
+    record vec3 {
+        x: f32,
+        y: f32,
+        z: f32,
+    }
+
+    /// Dünyaya yeni bir entity ekler ve ID'sini döner.
+    spawn-entity: func(entity-type: u16, position: vec3) -> u32;
+
+    /// Bir entity'nin pozisyonunu günceller.
+    set-entity-position: func(entity-id: u32, position: vec3);
+}
+
+/// Host (Strata) tarafından tetiklenen ve modlar tarafından uygulanan olay yakalayıcıları (hooks).
+interface event-hooks {
+    /// Bir blok yerleştirildiğinde tetiklenir.
+    on-block-placed: func(x: s32, y: s32, z: s32, block-id: u16);
+
+    /// Bir blok kırıldığında tetiklenir.
+    on-block-broken: func(x: s32, y: s32, z: s32, block-id: u16);
+
+    /// Her oyun tick'inde (oyuncu bazlı) tetiklenir.
+    on-player-tick: func(player-id: u64, x: f32, y: f32, z: f32);
+}
+
+/// Strata modlarının uyması gereken şablon (world).
+world strata-mod {
+    import block-registry;
+    import entity-control;
+    export event-hooks;
+}

@@ -1,0 +1,20 @@
+[package]
+name = "strata-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+glam.workspace = true
+rkyv.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bevy_ecs.workspace = true
+bevy_math.workspace = true
+hashbrown.workspace = true
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "chunk_bench"
+harness = false

@@ -1,0 +1,17 @@
+[package]
+name = "strata-render"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+strata-core = { path = "../core" }
+strata-meshing = { path = "../meshing" }
+strata-ecs = { path = "../ecs" }
+glam.workspace = true
+wgpu.workspace = true
+winit.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+bevy_app.workspace = true
+bytemuck = { version = "1", features = ["derive"] }
+image = "0.25"

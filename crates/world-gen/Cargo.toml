@@ -1,0 +1,18 @@
+[package]
+name = "strata-world-gen"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+strata-core = { path = "../core" }
+fastnoise2.workspace = true
+glam.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+divan = { workspace = true }
+
+[[bench]]
+name = "world_gen_bench"
+harness = false
+
