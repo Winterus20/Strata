@@ -10,6 +10,7 @@ pub struct RenderOutput {
 }
 use crate::camera::Camera;
 use crate::chunk_renderer::ChunkRenderer;
+use crate::crosshair::Crosshair;
 use crate::frustum::Frustum;
 use crate::pipeline::RenderPipelineManager;
 use crate::texture_manager::TextureManager;
@@ -28,6 +29,7 @@ pub struct RenderEngine {
     pub uniform_buffer: wgpu::Buffer,
     pub uniform_bind_group: wgpu::BindGroup,
     pub depth_texture: wgpu::TextureView,
+    pub crosshair: Crosshair,
 }
 
 impl RenderEngine {
@@ -132,6 +134,7 @@ impl RenderEngine {
         let camera = Camera::new(aspect);
         let frustum = Frustum::from_view_projection(camera.view_projection_matrix());
         let chunk_renderer = ChunkRenderer::new();
+        let crosshair = Crosshair::new(&device, &queue, format);
 
         Ok(Self {
             surface,
@@ -146,6 +149,7 @@ impl RenderEngine {
             uniform_buffer,
             uniform_bind_group,
             depth_texture,
+            crosshair,
         })
     }
 
@@ -238,6 +242,26 @@ impl RenderEngine {
             render_pass.set_bind_group(0, Some(&self.uniform_bind_group), &[]);
             render_pass.set_bind_group(1, Some(&self.texture_manager.bind_group), &[]);
             self.chunk_renderer.render(&mut render_pass);
+        }
+
+        // Crosshair overlay (no depth, alpha blended)
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Crosshair Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            self.crosshair.render(&mut pass);
         }
 
         Some(RenderOutput {

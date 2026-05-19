@@ -1,9 +1,11 @@
 use crate::noise::TerrainNoise;
+use crate::structure::TreePlacer;
 use strata_core::{BlockId, CHUNK_HEIGHT, CHUNK_WIDTH, Chunk};
 
 /// Procedural terrain generator using noise-based heightmap.
 pub struct TerrainGenerator {
     noise: TerrainNoise,
+    tree_placer: TreePlacer,
 }
 
 impl TerrainGenerator {
@@ -11,6 +13,7 @@ impl TerrainGenerator {
     pub fn new(seed: u32) -> Self {
         Self {
             noise: TerrainNoise::new(seed),
+            tree_placer: TreePlacer::new(seed),
         }
     }
 
@@ -47,6 +50,8 @@ impl TerrainGenerator {
                 }
             }
         }
+
+        self.tree_placer.place_trees(chunk);
         chunk.dirty = false;
     }
 }

@@ -5,6 +5,7 @@
 
 pub mod camera;
 pub mod chunk_renderer;
+pub mod crosshair;
 pub mod engine;
 pub mod frustum;
 pub mod pipeline;

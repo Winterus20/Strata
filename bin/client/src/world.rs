@@ -233,11 +233,52 @@ impl WorldManager {
         self.terrain_gen.height_at(x, z)
     }
 
-    pub fn raycast(&self, origin: Vec3, direction: Vec3, max_dist: f32) -> Option<BlockPos> {
+    /// Check if an AABB overlaps any solid block in loaded chunks.
+    pub fn is_colliding(&self, aabb_min: Vec3, aabb_max: Vec3) -> bool {
+        let min_x = aabb_min.x.floor() as i32;
+        let min_y = aabb_min.y.floor() as i32;
+        let min_z = aabb_min.z.floor() as i32;
+        let max_x = aabb_max.x.floor() as i32;
+        let max_y = aabb_max.y.floor() as i32;
+        let max_z = aabb_max.z.floor() as i32;
+
+        for bx in min_x..=max_x {
+            for by in min_y..=max_y {
+                if by < 0 || by >= 256 {
+                    continue;
+                }
+                for bz in min_z..=max_z {
+                    let world_pos = BlockPos(IVec3::new(bx, by, bz));
+                    let Some((chunk_pos, lx, ly, lz)) = world_pos.to_chunk_local() else {
+                        continue;
+                    };
+                    if let Some(chunk) = self.chunks.get(&chunk_pos)
+                        && !chunk.get_block(lx, ly, lz).is_air()
+                    {
+                        if aabb_min.x < (bx + 1) as f32
+                            && aabb_max.x > bx as f32
+                            && aabb_min.y < (by + 1) as f32
+                            && aabb_max.y > by as f32
+                            && aabb_min.z < (bz + 1) as f32
+                            && aabb_max.z > bz as f32
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Raycast returning `(block_pos, face_normal)` where `face_normal`
+    /// is the direction from the neighboring air block toward the hit block.
+    pub fn raycast(&self, origin: Vec3, direction: Vec3, max_dist: f32) -> Option<(BlockPos, IVec3)> {
         let dir = direction.normalize();
         let step = 0.1;
         let steps = (max_dist / step) as usize;
         let mut pos = origin;
+        let mut prev_bpos: Option<IVec3> = None;
 
         for _ in 0..steps {
             pos += dir * step;
@@ -246,30 +287,30 @@ impl WorldManager {
             let bz = pos.z.floor() as i32;
 
             if !(0..256).contains(&by) {
+                prev_bpos = Some(IVec3::new(bx, by, bz));
                 continue;
             }
 
             let world_pos = BlockPos(IVec3::new(bx, by, bz));
             let Some((chunk_pos, lx, ly, lz)) = world_pos.to_chunk_local() else {
+                prev_bpos = Some(IVec3::new(bx, by, bz));
                 continue;
             };
 
             if let Some(chunk) = self.chunks.get(&chunk_pos)
                 && !chunk.get_block(lx, ly, lz).is_air()
             {
-                return Some(world_pos);
+                let normal = match prev_bpos {
+                    Some(p) => IVec3::new(bx - p.x, by - p.y, bz - p.z).signum(),
+                    None => -dir.as_ivec3().signum(),
+                };
+                return Some((world_pos, normal));
             }
+
+            prev_bpos = Some(IVec3::new(bx, by, bz));
         }
 
         None
     }
 
-    pub fn get_block_in_front_of_camera(
-        &self,
-        origin: Vec3,
-        direction: Vec3,
-        max_dist: f32,
-    ) -> Option<BlockPos> {
-        self.raycast(origin, direction, max_dist)
-    }
 }

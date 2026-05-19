@@ -24,11 +24,6 @@ impl InputState {
         (self.move_right as i8) - (self.move_left as i8)
     }
 
-    /// Returns vertical movement: positive = up (jump), negative = down.
-    pub fn vertical(&self) -> i8 {
-        self.jump as i8
-    }
-
     /// Returns accumulated cursor delta since last update, then resets.
     pub fn cursor_delta(&mut self) -> (f32, f32) {
         let dx = self.mouse_dx as f32;
@@ -44,9 +39,10 @@ impl InputState {
                 "s" | "S" => self.move_backward = pressed,
                 "a" | "A" => self.move_left = pressed,
                 "d" | "D" => self.move_right = pressed,
-                " " => self.jump = pressed,
+                " " | "\u{00a0}" => self.jump = pressed,
                 _ => {}
             },
+            Key::Named(NamedKey::Space) => self.jump = pressed,
             Key::Named(NamedKey::Shift) => self.sprint = pressed,
             _ => {}
         }

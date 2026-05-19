@@ -333,6 +333,8 @@ fn get_texture_id(block_id: u16, face_id: u8) -> u16 {
             }
         }
         4 => 3, // BEDROCK -> bedrock.png (layer 3)
+        5 => 4, // WOOD -> wood.png (layer 4)
+        6 => 5, // LEAVES -> leaves.png (layer 5)
         _ => 0,
     }
 }

@@ -2,6 +2,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use anyhow::Result;
+use glam::Vec3;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use strata_core::{BlockId, BlockPos, BlockProperties, BlockRegistry, ChunkPos};
@@ -10,6 +11,13 @@ use tracing::info;
 use winit::event::{ElementState, MouseButton};
 use winit::keyboard::Key;
 use winit::window::CursorGrabMode;
+
+const PLAYER_GRAVITY: f32 = -20.0;
+const PLAYER_WALK_SPEED: f32 = 10.0;
+const PLAYER_SPRINT_SPEED: f32 = 15.0;
+const PLAYER_JUMP_VELOCITY: f32 = 8.0;
+const PLAYER_HALF_WIDTH: f32 = 0.3;
+const PLAYER_HEIGHT: f32 = 1.8;
 
 mod camera;
 mod chunk_gen_worker;
@@ -48,6 +56,8 @@ struct App {
     render_distance: u32,
     last_player_chunk: Option<ChunkPos>,
     last_update_pos: Option<glam::Vec3>,
+    player_velocity: Vec3,
+    grounded: bool,
 }
 
 impl App {
@@ -89,6 +99,24 @@ impl App {
             light_emission: 0,
             face_textures: [5, 5, 5, 5, 5, 5],
         });
+        registry.register(BlockProperties {
+            id: BlockId::WOOD,
+            name: "wood",
+            transparent: false,
+            solid: true,
+            hardness: 1.5,
+            light_emission: 0,
+            face_textures: [6, 6, 6, 6, 6, 6],
+        });
+        registry.register(BlockProperties {
+            id: BlockId::LEAVES,
+            name: "leaves",
+            transparent: true,
+            solid: true,
+            hardness: 0.3,
+            light_emission: 0,
+            face_textures: [7, 7, 7, 7, 7, 7],
+        });
 
         let mut world = WorldManager::new(42);
 
@@ -103,7 +131,8 @@ impl App {
         // Create background worker pool (4 threads for chunk gen + meshing)
         let chunk_gen_worker = ChunkGenWorker::new(42, "world_data", 4);
 
-        let spawn_height = world.terrain_height_at(0, 0) + 2.0;
+        let terrain_floor = world.terrain_height_at(0, 0).floor();
+        let spawn_height = terrain_floor + 2.8; // surface + eye height (1.8)
         let mut camera = Camera::new(1280.0 / 720.0);
         camera.position.y = spawn_height;
         camera.pitch = -0.3;
@@ -127,6 +156,8 @@ impl App {
             render_distance: 8,
             last_player_chunk: None,
             last_update_pos: None,
+            player_velocity: Vec3::ZERO,
+            grounded: false,
         }
     }
 }
@@ -226,9 +257,9 @@ impl winit::application::ApplicationHandler for App {
 
                     match button {
                         MouseButton::Left => {
-                            if let Some(pos) = self
+                            if let Some((pos, _)) = self
                                 .world
-                                .get_block_in_front_of_camera(origin, forward, 6.0)
+                                .raycast(origin, forward, 6.0)
                                 && let Some((chunk_pos, _, _, _)) = pos.to_chunk_local()
                             {
                                 self.world.break_block(pos);
@@ -236,26 +267,33 @@ impl winit::application::ApplicationHandler for App {
                             }
                         }
                         MouseButton::Right => {
-                            if let Some(pos) = self
+                            if let Some((pos, normal)) = self
                                 .world
-                                .get_block_in_front_of_camera(origin, forward, 6.0)
+                                .raycast(origin, forward, 6.0)
                             {
-                                let to_hit = glam::IVec3::new(
-                                    pos.0.x - (origin.x as i32),
-                                    pos.0.y - (origin.y as i32),
-                                    pos.0.z - (origin.z as i32),
-                                );
-                                let normal = if to_hit.x.abs() > to_hit.y.abs()
-                                    && to_hit.x.abs() > to_hit.z.abs()
-                                {
-                                    glam::IVec3::new(to_hit.x.signum(), 0, 0)
-                                } else if to_hit.y.abs() > to_hit.z.abs() {
-                                    glam::IVec3::new(0, to_hit.y.signum(), 0)
-                                } else {
-                                    glam::IVec3::new(0, 0, to_hit.z.signum())
-                                };
                                 let adjacent = BlockPos(pos.0 - normal);
-                                if let Some((chunk_pos, _, _, _)) = adjacent.to_chunk_local() {
+                                // Don't place block inside player
+                                let block_min = adjacent.0.as_vec3();
+                                let block_max = adjacent.0.as_vec3() + glam::Vec3::ONE;
+                                let player_min = glam::Vec3::new(
+                                    self.camera.position.x - PLAYER_HALF_WIDTH,
+                                    self.camera.position.y - PLAYER_HEIGHT,
+                                    self.camera.position.z - PLAYER_HALF_WIDTH,
+                                );
+                                let player_max = glam::Vec3::new(
+                                    self.camera.position.x + PLAYER_HALF_WIDTH,
+                                    self.camera.position.y,
+                                    self.camera.position.z + PLAYER_HALF_WIDTH,
+                                );
+                                let overlaps = block_min.x < player_max.x
+                                    && block_max.x > player_min.x
+                                    && block_min.y < player_max.y
+                                    && block_max.y > player_min.y
+                                    && block_min.z < player_max.z
+                                    && block_max.z > player_min.z;
+                                if !overlaps
+                                    && let Some((chunk_pos, _, _, _)) = adjacent.to_chunk_local()
+                                {
                                     self.world.place_block(adjacent, BlockId::STONE);
                                     self.dirty_manager.mark_dirty(chunk_pos);
                                 }
@@ -336,20 +374,95 @@ impl winit::application::ApplicationHandler for App {
         let dt = now.duration_since(self.last_frame_time).as_secs_f32();
         self.last_frame_time = now;
 
-        // 1. Camera update with input
+        // 1. Camera rotation (yaw/pitch from mouse)
         let (yaw_delta, pitch_delta) = self.input.cursor_delta();
-        self.camera_controller.update_camera(
-            &mut self.camera,
-            dt,
-            strata_render::camera::CameraInput {
-                forward: self.input.forward() as f32,
-                strafe: self.input.strafe() as f32,
-                vertical: self.input.vertical() as f32,
-                yaw_delta,
-                pitch_delta,
-            },
-        );
+        self.camera.yaw -= yaw_delta * self.camera_controller.mouse_sensitivity;
+        self.camera.pitch -= pitch_delta * self.camera_controller.mouse_sensitivity;
+        self.camera.pitch = self.camera.pitch.clamp(-1.55, 1.55);
         self.input.update();
+
+        // 2. Player physics: movement + gravity + collision
+        let (sin_yaw, cos_yaw) = self.camera.yaw.sin_cos();
+        let forward_dir = Vec3::new(cos_yaw, 0.0, sin_yaw).normalize();
+        let right_dir = Vec3::new(sin_yaw, 0.0, -cos_yaw).normalize();
+
+        let move_input = Vec3::new(
+            self.input.strafe() as f32,
+            0.0,
+            self.input.forward() as f32,
+        );
+        let move_speed = if self.input.sprint {
+            PLAYER_SPRINT_SPEED
+        } else {
+            PLAYER_WALK_SPEED
+        };
+
+        // Direct velocity from input (instant response, no acceleration lag)
+        if move_input.length_squared() > 0.0 {
+            let wish_dir = (forward_dir * move_input.z + right_dir * move_input.x).normalize();
+            self.player_velocity.x = wish_dir.x * move_speed;
+            self.player_velocity.z = wish_dir.z * move_speed;
+        } else {
+            self.player_velocity.x = 0.0;
+            self.player_velocity.z = 0.0;
+        }
+
+        // Ground check: test if AABB shifted slightly downward collides with blocks
+        let aabb_min = |pos: Vec3| -> Vec3 {
+            Vec3::new(
+                pos.x - PLAYER_HALF_WIDTH,
+                pos.y - PLAYER_HEIGHT,
+                pos.z - PLAYER_HALF_WIDTH,
+            )
+        };
+        let aabb_max = |pos: Vec3| -> Vec3 {
+            Vec3::new(
+                pos.x + PLAYER_HALF_WIDTH,
+                pos.y,
+                pos.z + PLAYER_HALF_WIDTH,
+            )
+        };
+        let cam = self.camera.position;
+        let below_min = Vec3::new(cam.x - PLAYER_HALF_WIDTH, cam.y - PLAYER_HEIGHT - 0.01, cam.z - PLAYER_HALF_WIDTH);
+        let below_max = Vec3::new(cam.x + PLAYER_HALF_WIDTH, cam.y - 0.01, cam.z + PLAYER_HALF_WIDTH);
+        self.grounded = self.world.is_colliding(below_min, below_max);
+        self.debug.grounded = self.grounded;
+        self.debug.space_pressed = self.input.jump;
+
+        // Jump (before gravity so constant jump height regardless of frame rate)
+        if self.input.jump && self.grounded {
+            self.player_velocity.y = PLAYER_JUMP_VELOCITY;
+        }
+
+        // Gravity (applied to velocity, not position)
+        self.player_velocity.y += PLAYER_GRAVITY * dt;
+
+        // Axis-by-axis collision resolution
+        let dt = dt.min(0.05); // cap to avoid tunneling through blocks
+        let mut new_pos = self.camera.position;
+
+        // X axis
+        new_pos.x += self.player_velocity.x * dt;
+        if self.world.is_colliding(aabb_min(new_pos), aabb_max(new_pos)) {
+            new_pos.x = self.camera.position.x;
+            self.player_velocity.x = 0.0;
+        }
+
+        // Y axis
+        new_pos.y += self.player_velocity.y * dt;
+        if self.world.is_colliding(aabb_min(new_pos), aabb_max(new_pos)) {
+            new_pos.y = self.camera.position.y;
+            self.player_velocity.y = 0.0;
+        }
+
+        // Z axis
+        new_pos.z += self.player_velocity.z * dt;
+        if self.world.is_colliding(aabb_min(new_pos), aabb_max(new_pos)) {
+            new_pos.z = self.camera.position.z;
+            self.player_velocity.z = 0.0;
+        }
+
+        self.camera.position = new_pos;
 
         // 2. Lazy chunk loading and unloading based on player position (gated on chunk boundary crossing + hysteresis)
         let player_pos = self.camera.position;

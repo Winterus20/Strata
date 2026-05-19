@@ -7,6 +7,8 @@ pub struct DebugOverlay {
     pub chunk_count: usize,
     pub visible_chunks: usize,
     pub player_position: (f32, f32, f32),
+    pub grounded: bool,
+    pub space_pressed: bool,
 }
 
 impl DebugOverlay {
@@ -16,19 +18,23 @@ impl DebugOverlay {
             chunk_count: 0,
             visible_chunks: 0,
             player_position: (0.0, 0.0, 0.0),
+            grounded: false,
+            space_pressed: false,
         }
     }
 
     /// Returns a formatted debug string for window title.
     pub fn debug_string(&self) -> String {
         format!(
-            "Strata | FPS: {:.1} | Chunks: {}/{} | Pos: ({:.1}, {:.1}, {:.1})",
+            "Strata | FPS: {:.1} | Chunks: {}/{} | Pos: ({:.1}, {:.1}, {:.1}) | G:{} S:{}",
             self.fps,
             self.visible_chunks,
             self.chunk_count,
             self.player_position.0,
             self.player_position.1,
             self.player_position.2,
+            self.grounded as u8,
+            self.space_pressed as u8,
         )
     }
 

@@ -75,6 +75,10 @@ impl BlockId {
     pub const GRASS: Self = Self(3);
     /// Bedrock (indestructible) block.
     pub const BEDROCK: Self = Self(4);
+    /// Wood log block.
+    pub const WOOD: Self = Self(5);
+    /// Leaves block (transparent).
+    pub const LEAVES: Self = Self(6);
 
     /// Returns `true` if this block is air.
     #[inline]
