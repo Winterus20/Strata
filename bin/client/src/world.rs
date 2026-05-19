@@ -43,7 +43,8 @@ impl WorldManager {
     /// Returns cached chunk keys, rebuilding only if dirty.
     pub fn get_chunk_keys(&mut self) -> &[ChunkPos] {
         if self.chunk_keys_dirty {
-            self.chunk_keys = self.chunks.keys().copied().collect();
+            self.chunk_keys.clear();
+            self.chunk_keys.extend(self.chunks.keys().copied());
             self.chunk_keys_dirty = false;
         }
         &self.chunk_keys

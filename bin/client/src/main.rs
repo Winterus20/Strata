@@ -278,6 +278,55 @@ impl winit::application::ApplicationHandler for App {
                         .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
                 }
             }
+            winit::event::WindowEvent::RedrawRequested => {
+                // 7. Render
+                if let Some(render) = &mut self.render {
+                    // Sync camera
+                    render.camera = self.camera.clone();
+                    render.update_camera();
+
+                    // Frustum culling (uses cached chunk keys)
+                    render.chunk_renderer.cull(&render.frustum, self.world.get_chunk_keys());
+
+                    // Update debug stats
+                    self.debug.visible_chunks = render.chunk_renderer.visible_count();
+                    self.debug.chunk_count = render.chunk_renderer.total_count();
+                    self.debug.player_position = (
+                        self.camera.position.x,
+                        self.camera.position.y,
+                        self.camera.position.z,
+                    );
+
+                    let output = render.render_frame();
+                    if let Some(mut output) = output {
+                        self.debug.render(
+                            &render.device,
+                            &render.queue,
+                            &mut output.encoder,
+                            render.config.format,
+                            &output.view,
+                            render.config.width,
+                            render.config.height,
+                        );
+                        render
+                            .queue
+                            .submit(std::iter::once(output.encoder.finish()));
+                        output.frame.present();
+                    }
+                }
+
+                // 8. FPS update + window title
+                if let Some(window) = &self.window {
+                    self.frame_count += 1;
+                    if self.fps_timer.elapsed() >= Duration::from_secs(1) {
+                        self.current_fps = self.frame_count as f32 / self.fps_timer.elapsed().as_secs_f32();
+                        self.debug.fps = self.current_fps;
+                        window.set_title(&self.debug.debug_string());
+                        self.frame_count = 0;
+                        self.fps_timer = Instant::now();
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -362,52 +411,9 @@ impl winit::application::ApplicationHandler for App {
             }
         }
 
-        // 7. Render
-        if let Some(render) = &mut self.render {
-            // Sync camera
-            render.camera = self.camera.clone();
-            render.update_camera();
-
-            // Frustum culling (uses cached chunk keys)
-            render.chunk_renderer.cull(&render.frustum, self.world.get_chunk_keys());
-
-            // Update debug stats
-            self.debug.visible_chunks = render.chunk_renderer.visible_count();
-            self.debug.chunk_count = render.chunk_renderer.total_count();
-            self.debug.player_position = (
-                self.camera.position.x,
-                self.camera.position.y,
-                self.camera.position.z,
-            );
-
-            let output = render.render_frame();
-            if let Some(mut output) = output {
-                self.debug.render(
-                    &render.device,
-                    &render.queue,
-                    &mut output.encoder,
-                    render.config.format,
-                    &output.view,
-                    render.config.width,
-                    render.config.height,
-                );
-                render
-                    .queue
-                    .submit(std::iter::once(output.encoder.finish()));
-                output.frame.present();
-            }
-        }
-
-        // 7. FPS update + window title
+        // 7. Request redraw
         if let Some(window) = &self.window {
-            self.frame_count += 1;
-            if self.fps_timer.elapsed() >= Duration::from_secs(1) {
-                self.current_fps = self.frame_count as f32 / self.fps_timer.elapsed().as_secs_f32();
-                self.debug.fps = self.current_fps;
-                window.set_title(&self.debug.debug_string());
-                self.frame_count = 0;
-                self.fps_timer = Instant::now();
-            }
+            window.request_redraw();
         }
     }
 }
