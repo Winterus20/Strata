@@ -47,6 +47,7 @@ struct App {
     last_frame_time: Instant,
     render_distance: u32,
     last_player_chunk: Option<ChunkPos>,
+    last_update_pos: Option<glam::Vec3>,
 }
 
 impl App {
@@ -125,6 +126,7 @@ impl App {
             last_frame_time: Instant::now(),
             render_distance: 8,
             last_player_chunk: None,
+            last_update_pos: None,
         }
     }
 }
@@ -300,10 +302,19 @@ impl winit::application::ApplicationHandler for App {
         );
         self.input.update();
 
-        // 2. Lazy chunk loading and unloading based on player position (gated on chunk boundary crossing)
-        let player_chunk =
-            ChunkPos::from_world(self.camera.position.x as i32, self.camera.position.z as i32);
-        if self.last_player_chunk != Some(player_chunk) {
+        // 2. Lazy chunk loading and unloading based on player position (gated on chunk boundary crossing + hysteresis)
+        let player_pos = self.camera.position;
+        let should_update = if let Some(last_pos) = self.last_update_pos {
+            let dx = player_pos.x - last_pos.x;
+            let dz = player_pos.z - last_pos.z;
+            (dx * dx + dz * dz) > 64.0 // 8.0 blocks squared (half a chunk distance threshold)
+        } else {
+            true
+        };
+
+        if should_update {
+            let player_chunk =
+                ChunkPos::from_world(player_pos.x as i32, player_pos.z as i32);
             let required = self
                 .world
                 .get_required_chunks(player_chunk, self.render_distance);
@@ -320,6 +331,7 @@ impl winit::application::ApplicationHandler for App {
             }
 
             self.last_player_chunk = Some(player_chunk);
+            self.last_update_pos = Some(player_pos);
         }
 
         // Submit chunk gen requests to background workers (non-blocking, throttled per frame)
