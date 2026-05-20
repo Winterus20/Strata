@@ -50,36 +50,27 @@ impl TextureManager {
         let texture_size: u32 = 16;
         let tex_dir = std::path::Path::new("assets/textures");
 
-        // Block ID → texture filename mapping
-        let texture_files: [(u16, &str); 9] = [
-            (1, "stone.png"),
-            (2, "dirt.png"),
-            (3, "grass_top.png"),
-            (4, "bedrock.png"),
-            (5, "wood.png"),
-            (6, "leaves.png"),
-            (7, "sand.png"),
-            (8, "water.png"),
-            (9, "grass_side.png"),
+        // Block ID → texture filename mapping with fallback color.
+        // Layer order MUST match get_texture_id() in classic_greedy.rs
+        const TEXTURE_ENTRIES: &[(u16, &str, [u8; 3])] = &[
+            (1,  "stone.png",       [120, 120, 120]), // layer 0 — STONE
+            (2,  "dirt.png",        [134, 96, 67]),   // layer 1 — DIRT
+            (3,  "grass_top.png",   [100, 160, 70]),  // layer 2 — GRASS top
+            (4,  "bedrock.png",     [50, 50, 55]),    // layer 3 — BEDROCK
+            (5,  "wood.png",        [160, 120, 70]),  // layer 4 — WOOD
+            (6,  "leaves.png",      [60, 140, 50]),   // layer 5 — LEAVES
+            (7,  "sand.png",        [210, 195, 140]), // layer 6 — SAND
+            (9,  "water.png",       [30, 80, 170]),   // layer 7 — WATER
+            (3,  "grass_side.png",  [130, 110, 70]),  // layer 8 — GRASS sides
+            (8,  "gravel.png",      [140, 135, 125]), // layer 9 — GRAVEL
+            (10, "snow.png",        [235, 238, 245]), // layer 10 — SNOW
         ];
 
         // Load or generate each texture
         let mut layers: Vec<Vec<u8>> = Vec::new();
         let mut block_to_layer: HashMap<u16, u32> = HashMap::new();
 
-        let fallback_colors: [&[u8; 3]; 9] = [
-            &[128, 128, 128], // 1: stone
-            &[139, 90, 43],   // 2: dirt
-            &[90, 180, 60],   // 3: grass
-            &[60, 60, 60],    // 4: bedrock
-            &[180, 140, 80],  // 5: wood
-            &[50, 130, 50],   // 6: leaves
-            &[220, 210, 120], // 7: sand
-            &[40, 80, 180],   // 8: water
-            &[120, 150, 70],  // 9: grass_side
-        ];
-
-        for (block_id, filename) in &texture_files {
+        for (block_id, filename, fallback) in TEXTURE_ENTRIES {
             let filepath = tex_dir.join(filename);
             let pixels: Vec<u8> = if filepath.exists() {
                 match image::open(&filepath) {
@@ -100,11 +91,11 @@ impl TextureManager {
                         }
                     }
                     Err(_) => {
-                        generate_placeholder(texture_size, fallback_colors[*block_id as usize - 1])
+                        generate_placeholder(texture_size, fallback)
                     }
                 }
             } else {
-                generate_placeholder(texture_size, fallback_colors[*block_id as usize - 1])
+                generate_placeholder(texture_size, fallback)
             };
 
             block_to_layer.insert(*block_id, layers.len() as u32);

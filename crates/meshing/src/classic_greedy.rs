@@ -1,7 +1,7 @@
 use crate::mesher::{BoundingBox, MeshData, Mesher, Vertex};
 use glam::Vec3;
 use hashbrown::HashMap;
-use strata_core::{BlockFace, CHUNK_HEIGHT, CHUNK_WIDTH, Chunk};
+use strata_core::{BlockFace, BlockId, CHUNK_HEIGHT, CHUNK_WIDTH, Chunk};
 
 /// Classic greedy meshing algorithm.
 ///
@@ -12,7 +12,14 @@ pub struct ClassicGreedyMesher;
 
 impl ClassicGreedyMesher {
     /// Returns `true` if the face of the block at `(x, y, z)` on the given
-    /// `axis`/`dir` side should be rendered (i.e. the neighbor is air or OOB).
+    /// `axis`/`dir` side should be rendered.
+    ///
+    /// - Water blocks render faces when adjacent to non-water blocks
+    ///   (water surface against air, water walls against stone).
+    /// - Solid blocks render faces when adjacent to air (visible surface).
+    /// - At horizontal chunk boundaries water NEVER renders its side faces
+    ///   — the adjacent chunk's blocks render their own faces instead,
+    ///   eliminating visible seams at chunk edges.
     #[inline]
     fn should_render_face(
         chunk: &Chunk,
@@ -32,12 +39,28 @@ impl ClassicGreedyMesher {
             _ => unreachable!(),
         };
 
-        if nx >= CHUNK_WIDTH || ny >= CHUNK_HEIGHT || nz >= CHUNK_WIDTH {
+        // wrapping_sub(0) → usize::MAX for boundary detection
+        let is_oob = nx >= CHUNK_WIDTH || ny >= CHUNK_HEIGHT || nz >= CHUNK_WIDTH;
+
+        if is_oob {
+            // Horizontal chunk boundary: water never renders its side face.
+            // The adjacent chunk's solid blocks render their own faces at
+            // the same position, so the player sees the correct block type.
+            // Y-boundary (top/bottom of world) always renders for water.
+            if axis != 1 && chunk.get_block(x, y, z) == BlockId::WATER {
+                return false;
+            }
             return true;
         }
 
+        let block = chunk.get_block(x, y, z);
         let neighbor = chunk.get_block(nx, ny, nz);
-        neighbor.is_air()
+
+        if block == BlockId::WATER {
+            neighbor != BlockId::WATER
+        } else {
+            neighbor.is_air()
+        }
     }
 
     /// Greedy-merges a 2D boolean mask into a minimal set of rectangles.
@@ -101,14 +124,9 @@ impl Mesher for ClassicGreedyMesher {
             return MeshData::empty();
         }
 
-        let y_start = chunk
-            .heightmap_bottom
-            .iter()
-            .filter(|&&h| h > 0)
-            .min()
-            .copied()
-            .unwrap_or(0) as usize;
-        let y_end = chunk.heightmap_top.iter().max().copied().unwrap_or(0) as usize;
+        // Heightmap-based slice skipping disabled — it caused "only edges render"
+        // bugs when heightmap data was stale for disk-loaded chunks.
+        // Processing all 256 Y-slices is ~5% overhead, acceptable for Phase 1.
 
         for axis in 0..3 {
             for dir in [-1i32, 1] {
@@ -125,10 +143,6 @@ impl Mesher for ClassicGreedyMesher {
 
                 // Iterate every slice along the main axis.
                 for d in 0..dim_main {
-                    // Heightmap optimization: skip empty Y slices
-                    if axis == 1 && (d < y_start || d > y_end) {
-                        continue;
-                    }
                     // Key: (block_id, face_id) so each face gets its own texture
                 let mut masks: HashMap<(u16, u8), Vec<Vec<bool>>> = HashMap::new();
 
@@ -251,43 +265,29 @@ impl Mesher for ClassicGreedyMesher {
                                 _padding: 0,
                             });
 
-                            // Y-axis (axis 1) winding is reversed because the vertex
-                            // order in the XZ plane (X right, Z down) is CW when it
-                            // needs to be CCW from above.  Axes 0 (YZ plane) and
-                            // 2 (XY plane) use standard winding.
-                            let rev = axis == 1;
-                            if dir == 1 {
-                                if rev {
-                                    indices.push(vertex_offset);
-                                    indices.push(vertex_offset + 2);
-                                    indices.push(vertex_offset + 1);
-                                    indices.push(vertex_offset);
-                                    indices.push(vertex_offset + 3);
-                                    indices.push(vertex_offset + 2);
-                                } else {
-                                    indices.push(vertex_offset);
-                                    indices.push(vertex_offset + 1);
-                                    indices.push(vertex_offset + 2);
-                                    indices.push(vertex_offset);
-                                    indices.push(vertex_offset + 2);
-                                    indices.push(vertex_offset + 3);
-                                }
+                            let mut is_ccw = dir == 1;
+                            if axis == 1 || axis == 2 {
+                                // For Y and Z axes, the cross product of the current p0..p3 
+                                // mappings produces a normal opposite to the intended direction.
+                                // We flip the winding rule to correct the geometric normal 
+                                // for backface culling without rotating textures.
+                                is_ccw = dir == -1;
+                            }
+
+                            if is_ccw {
+                                indices.push(vertex_offset);
+                                indices.push(vertex_offset + 1);
+                                indices.push(vertex_offset + 2);
+                                indices.push(vertex_offset);
+                                indices.push(vertex_offset + 2);
+                                indices.push(vertex_offset + 3);
                             } else {
-                                if rev {
-                                    indices.push(vertex_offset);
-                                    indices.push(vertex_offset + 1);
-                                    indices.push(vertex_offset + 2);
-                                    indices.push(vertex_offset);
-                                    indices.push(vertex_offset + 2);
-                                    indices.push(vertex_offset + 3);
-                                } else {
-                                    indices.push(vertex_offset);
-                                    indices.push(vertex_offset + 2);
-                                    indices.push(vertex_offset + 1);
-                                    indices.push(vertex_offset);
-                                    indices.push(vertex_offset + 3);
-                                    indices.push(vertex_offset + 2);
-                                }
+                                indices.push(vertex_offset);
+                                indices.push(vertex_offset + 2);
+                                indices.push(vertex_offset + 1);
+                                indices.push(vertex_offset);
+                                indices.push(vertex_offset + 3);
+                                indices.push(vertex_offset + 2);
                             }
 
                             vertex_offset += 4;
@@ -335,6 +335,10 @@ fn get_texture_id(block_id: u16, face_id: u8) -> u16 {
         4 => 3, // BEDROCK -> bedrock.png (layer 3)
         5 => 4, // WOOD -> wood.png (layer 4)
         6 => 5, // LEAVES -> leaves.png (layer 5)
+        7 => 6, // SAND -> sand.png (layer 6)
+        8 => 9, // GRAVEL -> gravel.png (layer 9)
+        9 => 7, // WATER -> water.png (layer 7)
+        10 => 10, // SNOW -> snow.png (layer 10)
         _ => 0,
     }
 }

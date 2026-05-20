@@ -1,7 +1,10 @@
 use glam::{IVec3, Vec3};
 use hashbrown::{HashMap, HashSet};
 use std::collections::VecDeque;
-use strata_core::{BlockId, BlockPos, Chunk, ChunkPos};
+use strata_core::{
+    border_face, BlockId, BlockPos, Chunk, ChunkPos, BORDER_SLICE_SIZE, CHUNK_DEPTH, CHUNK_HEIGHT,
+    CHUNK_WIDTH,
+};
 use strata_lighting::propagate_all;
 use strata_meshing::{ChunkMeshBuilder, ClassicGreedyMesher, GpuComputeMesher, MeshData};
 use strata_storage::RegionManager;
@@ -95,6 +98,22 @@ impl WorldManager {
                 self.chunks.insert(pos, chunk);
                 let _ = self.region.save_chunk(&self.chunks[&pos]);
             }
+
+            // Fill border slices from existing neighbors
+            self.fill_borders(pos);
+            // Also update neighbors' borders and remesh them
+            for neighbor_pos in &[
+                ChunkPos(glam::IVec2::new(pos.0.x - 1, pos.0.y)),
+                ChunkPos(glam::IVec2::new(pos.0.x + 1, pos.0.y)),
+                ChunkPos(glam::IVec2::new(pos.0.x, pos.0.y - 1)),
+                ChunkPos(glam::IVec2::new(pos.0.x, pos.0.y + 1)),
+            ] {
+                if self.chunks.contains_key(neighbor_pos) {
+                    self.fill_borders(*neighbor_pos);
+                    self.rebuild_mesh(*neighbor_pos);
+                }
+            }
+
             self.chunk_keys_dirty = true;
 
             // Register light-dirty status
@@ -124,10 +143,25 @@ impl WorldManager {
     /// Does NOT trigger mesh generation (mesh is provided by the worker).
     pub fn insert_generated_chunk(&mut self, pos: ChunkPos, chunk: Chunk) {
         if !self.chunks.contains_key(&pos) {
-            if chunk.light_dirty && self.light_dirty_set.insert(pos) {
+            let light_dirty = chunk.light_dirty;
+            self.chunks.insert(pos, chunk);
+            // Fill border slices from existing neighbors
+            self.fill_borders(pos);
+            // Update neighbors' borders and trigger remesh
+            for neighbor_pos in &[
+                ChunkPos(glam::IVec2::new(pos.0.x - 1, pos.0.y)),
+                ChunkPos(glam::IVec2::new(pos.0.x + 1, pos.0.y)),
+                ChunkPos(glam::IVec2::new(pos.0.x, pos.0.y - 1)),
+                ChunkPos(glam::IVec2::new(pos.0.x, pos.0.y + 1)),
+            ] {
+                if self.chunks.contains_key(neighbor_pos) {
+                    self.fill_borders(*neighbor_pos);
+                    self.rebuild_mesh(*neighbor_pos);
+                }
+            }
+            if light_dirty && self.light_dirty_set.insert(pos) {
                 self.light_dirty_queue.push_back(pos);
             }
-            self.chunks.insert(pos, chunk);
             self.chunk_keys_dirty = true;
         }
     }
@@ -229,11 +263,86 @@ impl WorldManager {
         self.meshes.get(&pos)
     }
 
+    /// Returns `true` if the block at the given world position is water.
+    pub fn is_water_at(&self, x: i32, y: i32, z: i32) -> bool {
+        if y < 0 || y >= 256 {
+            return false;
+        }
+        let Some((chunk_pos, lx, ly, lz)) = BlockPos(IVec3::new(x, y, z)).to_chunk_local() else {
+            return false;
+        };
+        self.chunks
+            .get(&chunk_pos)
+            .map_or(false, |chunk| chunk.get_block(lx, ly, lz) == BlockId::WATER)
+    }
+
     pub fn terrain_height_at(&self, x: i32, z: i32) -> f32 {
         self.terrain_gen.height_at(x, z)
     }
 
+        /// Fill the border slices of `pos` from its loaded neighbors.
+    pub fn fill_borders(&mut self, pos: ChunkPos) {
+        // Collect neighbor positions first (avoids borrowing conflicts)
+        let neighbor_positions = [
+            ChunkPos(glam::IVec2::new(pos.0.x - 1, pos.0.y)),
+            ChunkPos(glam::IVec2::new(pos.0.x + 1, pos.0.y)),
+            ChunkPos(glam::IVec2::new(pos.0.x, pos.0.y - 1)),
+            ChunkPos(glam::IVec2::new(pos.0.x, pos.0.y + 1)),
+        ];
+        let faces = [
+            border_face::NEG_X,
+            border_face::POS_X,
+            border_face::NEG_Z,
+            border_face::POS_Z,
+        ];
+
+        for i in 0..4 {
+            let neighbor_pos = neighbor_positions[i];
+            let face = faces[i];
+            // Copy neighbor's edge into a temporary vec to avoid borrow conflicts
+            let border_slice = {
+                let neighbor = self.chunks.get(&neighbor_pos);
+                match neighbor {
+                    Some(n) => {
+                        let mut slice = vec![0u16; BORDER_SLICE_SIZE];
+                        match face {
+                            border_face::NEG_X | border_face::POS_X => {
+                                let src_x = if face == border_face::NEG_X { CHUNK_WIDTH - 1 } else { 0 };
+                                for z in 0..CHUNK_WIDTH {
+                                    for y in 0..CHUNK_HEIGHT {
+                                        slice[z + y * CHUNK_WIDTH] = n.get_block(src_x, y, z).0;
+                                    }
+                                }
+                            }
+                            _ => {
+                                let src_z = if face == border_face::NEG_Z { CHUNK_DEPTH - 1 } else { 0 };
+                                for x in 0..CHUNK_WIDTH {
+                                    for y in 0..CHUNK_HEIGHT {
+                                        slice[x + y * CHUNK_WIDTH] = n.get_block(x, y, src_z).0;
+                                    }
+                                }
+                            }
+                        }
+                        slice
+                    }
+                    None => continue,
+                }
+            };
+
+            // Now write the border data into the target chunk
+            if let Some(chunk) = self.chunks.get_mut(&pos) {
+                for u in 0..CHUNK_WIDTH {
+                    for y in 0..CHUNK_HEIGHT {
+                        let idx = face * BORDER_SLICE_SIZE + u + y * CHUNK_WIDTH;
+                        chunk.border_blocks[idx] = border_slice[u + y * CHUNK_WIDTH];
+                    }
+                }
+            }
+        }
+    }
+
     /// Check if an AABB overlaps any solid block in loaded chunks.
+    /// Liquid blocks (water) are excluded — the player can pass through them.
     pub fn is_colliding(&self, aabb_min: Vec3, aabb_max: Vec3) -> bool {
         let min_x = aabb_min.x.floor() as i32;
         let min_y = aabb_min.y.floor() as i32;
@@ -252,10 +361,10 @@ impl WorldManager {
                     let Some((chunk_pos, lx, ly, lz)) = world_pos.to_chunk_local() else {
                         continue;
                     };
-                    if let Some(chunk) = self.chunks.get(&chunk_pos)
-                        && !chunk.get_block(lx, ly, lz).is_air()
-                    {
-                        if aabb_min.x < (bx + 1) as f32
+                    if let Some(chunk) = self.chunks.get(&chunk_pos) {
+                        let block = chunk.get_block(lx, ly, lz);
+                        if !block.is_air() && !block.is_liquid()
+                            && aabb_min.x < (bx + 1) as f32
                             && aabb_max.x > bx as f32
                             && aabb_min.y < (by + 1) as f32
                             && aabb_max.y > by as f32
@@ -297,14 +406,15 @@ impl WorldManager {
                 continue;
             };
 
-            if let Some(chunk) = self.chunks.get(&chunk_pos)
-                && !chunk.get_block(lx, ly, lz).is_air()
-            {
-                let normal = match prev_bpos {
-                    Some(p) => IVec3::new(bx - p.x, by - p.y, bz - p.z).signum(),
-                    None => -dir.as_ivec3().signum(),
-                };
-                return Some((world_pos, normal));
+            if let Some(chunk) = self.chunks.get(&chunk_pos) {
+                let block = chunk.get_block(lx, ly, lz);
+                if !block.is_air() && !block.is_liquid() {
+                    let normal = match prev_bpos {
+                        Some(p) => IVec3::new(bx - p.x, by - p.y, bz - p.z).signum(),
+                        None => -dir.as_ivec3().signum(),
+                    };
+                    return Some((world_pos, normal));
+                }
             }
 
             prev_bpos = Some(IVec3::new(bx, by, bz));

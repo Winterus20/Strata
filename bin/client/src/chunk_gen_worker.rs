@@ -1,82 +1,81 @@
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::collections::VecDeque;
+use std::sync::mpsc::{self, Receiver};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use strata_core::{Chunk, ChunkPos};
-use strata_meshing::{ChunkMeshBuilder, ClassicGreedyMesher, MeshData};
 use strata_storage::RegionManager;
 use strata_world_gen::TerrainGenerator;
 
-/// Request to generate or load a chunk on the background thread.
-struct GenRequest {
-    pos: ChunkPos,
+/// Shared work queue — all threads compete for work from the same queue.
+/// No per-thread channels, no lost work when a thread dies.
+struct SharedState {
+    queue: Mutex<VecDeque<ChunkPos>>,
+    condvar: Condvar,
 }
 
-/// Result from the background thread: generated chunk + mesh.
+/// Result from a background thread: generated chunk (not yet meshed).
+/// Meshing happens after borders are filled from neighbors.
 pub struct GenResult {
     pub pos: ChunkPos,
     pub chunk: Chunk,
-    pub mesh: MeshData,
 }
 
-/// Background worker that handles the entire chunk pipeline off the main thread:
-/// disk load → terrain generation → disk save → mesh generation.
+/// Background worker pool with a **shared work queue** and `Condvar`.
 ///
-/// This prevents FPS drops caused by synchronous terrain gen and disk I/O
-/// blocking the render loop.
+/// - All threads pull from one `Mutex<VecDeque>` – no work gets stranded.
+/// - `Condvar` wakes one thread when new work arrives.
+/// - If a thread panics, surviving threads continue processing the queue.
+///   The lost chunk will be re-requested on the next `should_update`.
 pub struct ChunkGenWorker {
-    sender: Sender<GenRequest>,
+    shared: Arc<SharedState>,
     receiver: Receiver<GenResult>,
     _handles: Vec<thread::JoinHandle<()>>,
 }
 
 impl ChunkGenWorker {
-    /// Creates a new worker with `thread_count` background threads.
+    /// Creates a new worker pool with `thread_count` background threads.
     pub fn new(seed: u32, world_data_path: &str, thread_count: usize) -> Self {
-        let (send_req, recv_req) = mpsc::channel::<GenRequest>();
-        let recv_req = std::sync::Arc::new(std::sync::Mutex::new(recv_req));
-        let (send_res, recv_res) = mpsc::channel::<GenResult>();
+        let shared = Arc::new(SharedState {
+            queue: Mutex::new(VecDeque::new()),
+            condvar: Condvar::new(),
+        });
 
+        let (send_res, recv_res) = mpsc::channel::<GenResult>();
         let mut handles = Vec::with_capacity(thread_count);
 
         for i in 0..thread_count {
-            let recv = std::sync::Arc::clone(&recv_req);
+            let shared_clone = Arc::clone(&shared);
             let sender = send_res.clone();
             let path = world_data_path.to_string();
 
             let handle = thread::Builder::new()
                 .name(format!("chunk-gen-{}", i))
                 .spawn(move || {
-                    let terrain_gen = TerrainGenerator::new(seed);
+                    let mut terrain_gen = TerrainGenerator::new(seed);
                     let region = RegionManager::new(&path);
-                    let mesh_builder = ChunkMeshBuilder::new(ClassicGreedyMesher);
 
                     loop {
-                        // Steal work from the shared queue
-                        let req = {
-                            let lock = recv.lock().unwrap();
-                            lock.recv()
+                        // Pop work from the shared queue (block with condvar)
+                        let pos = {
+                            let mut queue = shared_clone.queue.lock().unwrap();
+                            loop {
+                                if let Some(pos) = queue.pop_front() {
+                                    break pos;
+                                }
+                                queue = shared_clone.condvar.wait(queue).unwrap();
+                            }
                         };
 
-                        let Ok(req) = req else {
-                            break; // Channel closed, exit thread
-                        };
-
-                        // 1. Try loading from disk
-                        let chunk = if let Ok(Some(chunk)) = region.load_chunk(req.pos) {
+                        let chunk = if let Ok(Some(chunk)) = region.load_chunk(pos) {
                             chunk
                         } else {
-                            // 2. Generate terrain
-                            let mut chunk = Chunk::new(req.pos);
+                            let mut chunk = Chunk::new(pos);
                             terrain_gen.generate(&mut chunk);
-                            // 3. Save to disk (non-critical, ignore errors)
                             let _ = region.save_chunk(&chunk);
                             chunk
                         };
 
-                        // 4. Build mesh
-                        let mesh = mesh_builder.build(&chunk);
-
-                        // 5. Send result back to main thread
-                        if sender.send(GenResult { pos: req.pos, chunk, mesh }).is_err() {
+                        if sender.send(GenResult { pos, chunk }).is_err() {
                             break;
                         }
                     }
@@ -87,15 +86,17 @@ impl ChunkGenWorker {
         }
 
         Self {
-            sender: send_req,
+            shared,
             receiver: recv_res,
             _handles: handles,
         }
     }
 
     /// Submit a chunk generation request (non-blocking).
-    pub fn submit(&self, pos: ChunkPos) {
-        let _ = self.sender.send(GenRequest { pos });
+    pub fn submit(&mut self, pos: ChunkPos) {
+        let mut queue = self.shared.queue.lock().unwrap();
+        queue.push_back(pos);
+        self.shared.condvar.notify_one();
     }
 
     /// Poll for completed chunks. Returns all finished results.

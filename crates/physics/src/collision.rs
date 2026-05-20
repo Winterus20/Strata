@@ -1,10 +1,11 @@
 use glam::IVec3;
 use strata_core::{BlockPos, Chunk};
 
-/// Returns `true` if the block at `(x, y, z)` is not air.
+/// Returns `true` if the block at `(x, y, z)` is solid (has collision).
+/// Liquid blocks (e.g. water) are not solid — the player can enter them.
 pub fn is_block_solid(chunk: &Chunk, x: usize, y: usize, z: usize) -> bool {
     let block = chunk.get_block(x, y, z);
-    !block.is_air()
+    !block.is_air() && !block.is_liquid()
 }
 
 /// Steps along a ray in small increments and returns the first solid block hit.

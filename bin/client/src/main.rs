@@ -19,6 +19,11 @@ const PLAYER_JUMP_VELOCITY: f32 = 8.0;
 const PLAYER_HALF_WIDTH: f32 = 0.3;
 const PLAYER_HEIGHT: f32 = 1.8;
 
+// Water physics modifiers
+const WATER_SPEED_FACTOR: f32 = 0.4;
+const WATER_GRAVITY: f32 = -5.0;
+const WATER_SWIM_VELOCITY: f32 = 5.0;
+
 mod camera;
 mod chunk_gen_worker;
 mod debug_overlay;
@@ -58,6 +63,8 @@ struct App {
     last_update_pos: Option<glam::Vec3>,
     player_velocity: Vec3,
     grounded: bool,
+    in_water: bool,
+    selected_block: Option<glam::IVec3>,
 }
 
 impl App {
@@ -117,8 +124,35 @@ impl App {
             light_emission: 0,
             face_textures: [7, 7, 7, 7, 7, 7],
         });
+        registry.register(BlockProperties {
+            id: BlockId::SAND,
+            name: "sand",
+            transparent: false,
+            solid: true,
+            hardness: 0.5,
+            light_emission: 0,
+            face_textures: [6, 6, 6, 6, 6, 6],
+        });
+        registry.register(BlockProperties {
+            id: BlockId::GRAVEL,
+            name: "gravel",
+            transparent: false,
+            solid: true,
+            hardness: 0.6,
+            light_emission: 0,
+            face_textures: [6, 6, 6, 6, 6, 6], // reuse sand layer
+        });
+        registry.register(BlockProperties {
+            id: BlockId::WATER,
+            name: "water",
+            transparent: true,
+            solid: false,
+            hardness: 0.0,
+            light_emission: 0,
+            face_textures: [7, 7, 7, 7, 7, 7],
+        });
 
-        let mut world = WorldManager::new(42);
+        let mut world = WorldManager::new(9001);
 
         // Generate initial chunks synchronously (needed for spawn height)
         for x in -2..=2 {
@@ -129,7 +163,7 @@ impl App {
         }
 
         // Create background worker pool (4 threads for chunk gen + meshing)
-        let chunk_gen_worker = ChunkGenWorker::new(42, "world_data", 4);
+        let chunk_gen_worker = ChunkGenWorker::new(9001, "world_data", 4);
 
         let terrain_floor = world.terrain_height_at(0, 0).floor();
         let spawn_height = terrain_floor + 2.8; // surface + eye height (1.8)
@@ -158,6 +192,8 @@ impl App {
             last_update_pos: None,
             player_velocity: Vec3::ZERO,
             grounded: false,
+            in_water: false,
+            selected_block: None,
         }
     }
 }
@@ -180,7 +216,19 @@ impl winit::application::ApplicationHandler for App {
                 Ok(mut engine) => {
                     self.world.init_mesh_worker();
                     self.debug.init(&engine.device, engine.config.format);
-                    // Upload initial CPU-built meshes
+                    // Fill borders for all initial chunks (neighbors now exist)
+                    for x in -2..=2 {
+                        for z in -2..=2 {
+                            self.world.fill_borders(ChunkPos(glam::IVec2::new(x, z)));
+                        }
+                    }
+                    // Mark initial chunks dirty so they're remeshed with correct borders
+                    for x in -2..=2 {
+                        for z in -2..=2 {
+                            self.dirty_manager.mark_dirty(ChunkPos(glam::IVec2::new(x, z)));
+                        }
+                    }
+                    // Upload initial CPU-built meshes (will be replaced shortly)
                     for x in -2..=2 {
                         for z in -2..=2 {
                             let pos = ChunkPos(glam::IVec2::new(x, z));
@@ -321,7 +369,15 @@ impl winit::application::ApplicationHandler for App {
                 if let Some(render) = &mut self.render {
                     // Sync camera
                     render.camera = self.camera.clone();
+                    // Underwater fog
+                    if self.in_water {
+                        render.fog_density = 0.04;
+                        render.fog_color = glam::Vec3::new(0.05, 0.25, 0.45);
+                    } else {
+                        render.fog_density = 0.0;
+                    }
                     render.update_camera();
+                    render.selected_block = self.selected_block;
 
                     // Frustum culling (uses cached chunk keys)
                     render.chunk_renderer.cull(&render.frustum, self.world.get_chunk_keys());
@@ -386,15 +442,28 @@ impl winit::application::ApplicationHandler for App {
         let forward_dir = Vec3::new(cos_yaw, 0.0, sin_yaw).normalize();
         let right_dir = Vec3::new(sin_yaw, 0.0, -cos_yaw).normalize();
 
+        // Check if player's feet are in water
+        let feet_y = (self.camera.position.y - PLAYER_HEIGHT) as i32;
+        let in_water = self.world.is_water_at(
+            self.camera.position.x as i32,
+            feet_y,
+            self.camera.position.z as i32,
+        );
+
         let move_input = Vec3::new(
             self.input.strafe() as f32,
             0.0,
             self.input.forward() as f32,
         );
-        let move_speed = if self.input.sprint {
+        let base_speed = if self.input.sprint {
             PLAYER_SPRINT_SPEED
         } else {
             PLAYER_WALK_SPEED
+        };
+        let move_speed = if in_water {
+            base_speed * WATER_SPEED_FACTOR
+        } else {
+            base_speed
         };
 
         // Direct velocity from input (instant response, no acceleration lag)
@@ -426,16 +495,23 @@ impl winit::application::ApplicationHandler for App {
         let below_min = Vec3::new(cam.x - PLAYER_HALF_WIDTH, cam.y - PLAYER_HEIGHT - 0.01, cam.z - PLAYER_HALF_WIDTH);
         let below_max = Vec3::new(cam.x + PLAYER_HALF_WIDTH, cam.y - 0.01, cam.z + PLAYER_HALF_WIDTH);
         self.grounded = self.world.is_colliding(below_min, below_max);
+        self.in_water = in_water;
         self.debug.grounded = self.grounded;
+        self.debug.in_water = in_water;
         self.debug.space_pressed = self.input.jump;
 
-        // Jump (before gravity so constant jump height regardless of frame rate)
-        if self.input.jump && self.grounded {
-            self.player_velocity.y = PLAYER_JUMP_VELOCITY;
+        // Jump / swim up
+        if self.input.jump {
+            if self.grounded {
+                self.player_velocity.y = PLAYER_JUMP_VELOCITY;
+            } else if in_water {
+                self.player_velocity.y = WATER_SWIM_VELOCITY;
+            }
         }
 
-        // Gravity (applied to velocity, not position)
-        self.player_velocity.y += PLAYER_GRAVITY * dt;
+        // Gravity (reduced in water for buoyancy)
+        let gravity = if in_water { WATER_GRAVITY } else { PLAYER_GRAVITY };
+        self.player_velocity.y += gravity * dt;
 
         // Axis-by-axis collision resolution
         let dt = dt.min(0.05); // cap to avoid tunneling through blocks
@@ -463,6 +539,17 @@ impl winit::application::ApplicationHandler for App {
         }
 
         self.camera.position = new_pos;
+
+        // Raycast for block highlight
+        {
+            let (s, c) = self.camera.pitch.sin_cos();
+            let (sy, cy) = self.camera.yaw.sin_cos();
+            let fwd = glam::Vec3::new(cy * c, s, sy * c);
+            self.selected_block = self
+                .world
+                .raycast(self.camera.position, fwd, 6.0)
+                .map(|(pos, _)| pos.0);
+        }
 
         // 2. Lazy chunk loading and unloading based on player position (gated on chunk boundary crossing + hysteresis)
         let player_pos = self.camera.position;
@@ -497,16 +584,17 @@ impl winit::application::ApplicationHandler for App {
         }
 
         // Submit chunk gen requests to background workers (non-blocking, throttled per frame)
-        self.lazy_loader.process(&self.chunk_gen_worker);
+        self.lazy_loader.process(&mut self.chunk_gen_worker);
 
-        // 3. Poll for completed chunks from background workers and upload to GPU
+        // 3. Poll for completed chunks from background workers
         {
             let completed = self.chunk_gen_worker.poll();
             for result in completed {
                 self.lazy_loader.mark_completed(result.pos);
                 self.world.insert_generated_chunk(result.pos, result.chunk);
-                if let Some(render) = &mut self.render {
-                    render.chunk_renderer.upload_mesh(&render.device, result.pos, &result.mesh);
+                // Borders were filled inside insert_generated_chunk; queue mesh rebuild
+                if self.world.chunks.contains_key(&result.pos) {
+                    self.dirty_manager.mark_dirty(result.pos);
                 }
             }
         }
@@ -535,6 +623,13 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
+
+    // Clean old world data to prevent stale chunks from previous seeds
+    let world_data_path = std::path::Path::new("world_data");
+    if world_data_path.exists() {
+        std::fs::remove_dir_all(world_data_path).ok();
+        info!("Cleared old world_data directory");
+    }
 
     info!("Strata Phase 2 client starting...");
 

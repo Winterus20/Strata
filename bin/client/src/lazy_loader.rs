@@ -43,7 +43,7 @@ impl LazyChunkLoader {
 
     /// Process pending chunks — submits to background worker.
     /// Returns the number of newly submitted requests.
-    pub fn process(&mut self, worker: &ChunkGenWorker) -> usize {
+    pub fn process(&mut self, worker: &mut ChunkGenWorker) -> usize {
         self.frame_counter += 1;
         if !self.frame_counter.is_multiple_of(self.load_interval) {
             return 0;

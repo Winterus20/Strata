@@ -8,6 +8,7 @@ pub struct RenderOutput {
     pub encoder: wgpu::CommandEncoder,
     pub frame: wgpu::SurfaceTexture,
 }
+use crate::block_outline::BlockOutline;
 use crate::camera::Camera;
 use crate::chunk_renderer::ChunkRenderer;
 use crate::crosshair::Crosshair;
@@ -15,6 +16,16 @@ use crate::frustum::Frustum;
 use crate::pipeline::RenderPipelineManager;
 use crate::texture_manager::TextureManager;
 use strata_core::BlockRegistry;
+
+/// GPU uniform data: view-proj matrix + fog color/density + camera position.
+/// Must match `FrameUniforms` in chunk_textured.wgsl.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct ShaderUniforms {
+    pub view_proj: [[f32; 4]; 4],
+    pub fog_color_density: [f32; 4],
+    pub camera_pos: [f32; 4],
+}
 
 pub struct RenderEngine {
     pub surface: wgpu::Surface<'static>,
@@ -30,6 +41,12 @@ pub struct RenderEngine {
     pub uniform_bind_group: wgpu::BindGroup,
     pub depth_texture: wgpu::TextureView,
     pub crosshair: Crosshair,
+    pub block_outline: BlockOutline,
+    pub selected_block: Option<glam::IVec3>,
+    /// Fog density (0 = no fog). Set from main loop based on camera position.
+    pub fog_density: f32,
+    /// Fog colour (RGB).
+    pub fog_color: glam::Vec3,
 }
 
 impl RenderEngine {
@@ -116,7 +133,7 @@ impl RenderEngine {
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Uniform Buffer"),
-            size: std::mem::size_of::<[f32; 16]>() as u64,
+            size: std::mem::size_of::<ShaderUniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -135,6 +152,7 @@ impl RenderEngine {
         let frustum = Frustum::from_view_projection(camera.view_projection_matrix());
         let chunk_renderer = ChunkRenderer::new();
         let crosshair = Crosshair::new(&device, &queue, format);
+        let block_outline = BlockOutline::new(&device, &queue, format);
 
         Ok(Self {
             surface,
@@ -150,6 +168,10 @@ impl RenderEngine {
             uniform_bind_group,
             depth_texture,
             crosshair,
+            block_outline,
+            selected_block: None,
+            fog_density: 0.0,
+            fog_color: glam::Vec3::new(0.1, 0.4, 0.7),
         })
     }
 
@@ -163,11 +185,25 @@ impl RenderEngine {
 
     pub fn update_camera(&mut self) {
         self.frustum = Frustum::from_view_projection(self.camera.view_projection_matrix());
-        let vp = self.camera.view_projection_matrix();
+        let uniforms = ShaderUniforms {
+            view_proj: self.camera.view_projection_matrix().to_cols_array_2d(),
+            fog_color_density: [
+                self.fog_color.x,
+                self.fog_color.y,
+                self.fog_color.z,
+                self.fog_density,
+            ],
+            camera_pos: [
+                self.camera.position.x,
+                self.camera.position.y,
+                self.camera.position.z,
+                0.0,
+            ],
+        };
         self.queue.write_buffer(
             &self.uniform_buffer,
             0,
-            bytemuck::cast_slice(&vp.to_cols_array()),
+            bytemuck::cast_slice(&[uniforms]),
         );
     }
 
@@ -242,6 +278,17 @@ impl RenderEngine {
             render_pass.set_bind_group(0, Some(&self.uniform_bind_group), &[]);
             render_pass.set_bind_group(1, Some(&self.texture_manager.bind_group), &[]);
             self.chunk_renderer.render(&mut render_pass);
+
+            // Block outline overlay (depth-tested, black line list)
+            if let Some(block_pos) = self.selected_block {
+                let vp = self.camera.view_projection_matrix();
+                self.block_outline.render(
+                    &self.queue,
+                    &mut render_pass,
+                    vp,
+                    block_pos,
+                );
+            }
         }
 
         // Crosshair overlay (no depth, alpha blended)

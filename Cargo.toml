@@ -15,6 +15,7 @@ members = [
     "crates/network",
     "crates/plugin-api",
     "crates/modding",
+    "crates/fluid",
     "bin/client",
     "bin/server",
 ]
@@ -77,6 +78,9 @@ hashbrown = "0.15"
 
 # RNG
 rand = "0.8"
+
+# Parallelism
+rayon = "1.10"
 
 # Input
 bevy_input = "0.18"

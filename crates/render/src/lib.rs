@@ -3,6 +3,7 @@
 //! Provides GPU abstractions over wgpu: [`RenderEngine`] for window management
 //! and frame submission, texture arrays, frustum culling, and chunk mesh management.
 
+pub mod block_outline;
 pub mod camera;
 pub mod chunk_renderer;
 pub mod crosshair;

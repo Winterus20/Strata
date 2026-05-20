@@ -79,11 +79,31 @@ impl BlockId {
     pub const WOOD: Self = Self(5);
     /// Leaves block (transparent).
     pub const LEAVES: Self = Self(6);
+    /// Sand block.
+    pub const SAND: Self = Self(7);
+    /// Gravel block.
+    pub const GRAVEL: Self = Self(8);
+    /// Water block (fluid).
+    pub const WATER: Self = Self(9);
+    /// Snow block.
+    pub const SNOW: Self = Self(10);
 
     /// Returns `true` if this block is air.
     #[inline]
     pub fn is_air(self) -> bool {
         self == Self::AIR
+    }
+
+    /// Returns `true` if this block is a liquid (enterable fluid).
+    #[inline]
+    pub fn is_liquid(self) -> bool {
+        self == Self::WATER
+    }
+
+    /// Creates a `BlockId` from a raw u16 value.
+    #[inline]
+    pub const fn from_raw(id: u16) -> Self {
+        Self(id)
     }
 }
 

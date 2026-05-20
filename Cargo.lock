@@ -6029,6 +6029,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "strata-fluid"
+version = "0.1.0"
+dependencies = [
+ "bevy_app",
+ "bevy_ecs",
+ "bevy_time",
+ "glam 0.30.10",
+ "hashbrown 0.15.5",
+ "strata-core",
+ "strata-ecs",
+]
+
+[[package]]
 name = "strata-inventory"
 version = "0.1.0"
 dependencies = [
@@ -6083,7 +6096,7 @@ dependencies = [
  "strata-core",
  "strata-ecs",
  "strata-plugin-api",
- "toml",
+ "toml 0.8.23",
  "tracing",
  "wasmtime",
 ]
@@ -6210,7 +6223,11 @@ dependencies = [
  "fastnoise2",
  "glam 0.30.10",
  "rand 0.8.6",
+ "rayon",
+ "serde",
+ "serde_json",
  "strata-core",
+ "toml 0.7.8",
 ]
 
 [[package]]
@@ -6456,6 +6473,18 @@ dependencies = [
 
 [[package]]
 name = "toml"
+version = "0.7.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dd79e69d3b627db300ff956027cc6c3798cef26d22526befdfcd12feeb6d2257"
+dependencies = [
+ "serde",
+ "serde_spanned",
+ "toml_datetime 0.6.11",
+ "toml_edit 0.19.15",
+]
+
+[[package]]
+name = "toml"
 version = "0.8.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
@@ -6491,6 +6520,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
 dependencies = [
  "serde_core",
+]
+
+[[package]]
+name = "toml_edit"
+version = "0.19.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b5bb770da30e5cbfde35a2d7b9b8a2c4b8ef89548a7a6aeab5c9a576e3e7421"
+dependencies = [
+ "indexmap",
+ "serde",
+ "serde_spanned",
+ "toml_datetime 0.6.11",
+ "winnow 0.5.40",
 ]
 
 [[package]]
@@ -7042,7 +7084,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "sha2",
- "toml",
+ "toml 0.8.23",
  "windows-sys 0.59.0",
  "zstd",
 ]
@@ -7860,6 +7902,15 @@ dependencies = [
  "x11-dl",
  "x11rb",
  "xkbcommon-dl",
+]
+
+[[package]]
+name = "winnow"
+version = "0.5.40"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f593a95398737aeed53e489c785df13f3618e41dbcd6718c6addbf1395aa6876"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]
