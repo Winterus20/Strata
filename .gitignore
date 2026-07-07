@@ -1,5 +1,11 @@
+# Build artifacts
 /target
-*.pdb
-/world_data
-/.openclaude
-/.opencode
+
+# Local AI-tool / editor config (not part of the project)
+.commandcode/
+.cursor/
+.kilo/
+
+# OS / misc
+Thumbs.db
+.DS_Store

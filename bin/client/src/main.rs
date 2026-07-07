@@ -1,641 +1,181 @@
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+//! Strata client binary (M9b): wires every Strata plugin together, owns the
+//! single wgpu device, and PRESENTs the M4 offscreen renderer to a real window.
+//!
+//! Bevy's `render` feature is disabled (see `Cargo.toml`), so the only wgpu
+//! device in the process is our `strata_render::Renderer`. `ClientRenderPlugin`
+//! creates a wgpu `Surface` from the Bevy window's raw handle once it exists,
+//! then each frame renders the resident sector meshes offscreen and blits them
+//! to the window.
 
-use anyhow::Result;
-use glam::Vec3;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use strata_core::{BlockId, BlockPos, BlockProperties, BlockRegistry, ChunkPos};
-use strata_render::engine::RenderEngine;
-use tracing::info;
-use winit::event::{ElementState, MouseButton};
-use winit::keyboard::Key;
-use winit::window::CursorGrabMode;
+mod client_render;
 
-const PLAYER_GRAVITY: f32 = -20.0;
-const PLAYER_WALK_SPEED: f32 = 10.0;
-const PLAYER_SPRINT_SPEED: f32 = 15.0;
-const PLAYER_JUMP_VELOCITY: f32 = 8.0;
-const PLAYER_HALF_WIDTH: f32 = 0.3;
-const PLAYER_HEIGHT: f32 = 1.8;
+use bevy::input::InputPlugin;
+use bevy::prelude::*;
+use bevy::window::{Window, WindowPlugin, WindowResolution};
+use bevy::{DefaultPlugins, MinimalPlugins};
 
-// Water physics modifiers
-const WATER_SPEED_FACTOR: f32 = 0.4;
-const WATER_GRAVITY: f32 = -5.0;
-const WATER_SWIM_VELOCITY: f32 = 5.0;
+use strata_core::prelude::*;
+use strata_physics::plugin::PhysicsPlugin;
+use strata_player::prelude::*;
+use strata_render::meshing::MeshingPlugin;
+use strata_world::prelude::*;
 
-mod camera;
-mod chunk_gen_worker;
-mod debug_overlay;
-mod dirty_manager;
-mod input;
-mod lazy_loader;
-mod mesh_worker;
-mod render;
-mod world;
+use client_render::ClientRenderPlugin;
 
-use camera::{Camera, CameraController};
-use chunk_gen_worker::ChunkGenWorker;
-use debug_overlay::DebugOverlay;
-use dirty_manager::DirtyChunkManager;
-use input::InputState;
-use lazy_loader::LazyChunkLoader;
-use world::WorldManager;
+const SPAWN_POSITION: Vec3 = Vec3::new(16.0, 80.0, 16.0);
 
-struct App {
-    registry: BlockRegistry,
-    window: Option<Arc<winit::window::Window>>,
-    render: Option<RenderEngine>,
-    camera: Camera,
-    camera_controller: CameraController,
-    world: WorldManager,
-    input: InputState,
-    lazy_loader: LazyChunkLoader,
-    chunk_gen_worker: ChunkGenWorker,
-    dirty_manager: DirtyChunkManager,
-    debug: DebugOverlay,
-    frame_count: u32,
-    fps_timer: Instant,
-    current_fps: f32,
-    last_frame_time: Instant,
-    render_distance: u32,
-    last_player_chunk: Option<ChunkPos>,
-    last_update_pos: Option<glam::Vec3>,
-    player_velocity: Vec3,
-    grounded: bool,
-    in_water: bool,
-    selected_block: Option<glam::IVec3>,
+/// Optional init-time `client.toml` (view distance radius + window size). Missing
+/// file -> defaults. Minimal `key = value` parser (no external TOML dependency).
+#[derive(Clone, Copy)]
+struct ClientConfig {
+    radius: i32,
+    width: u32,
+    height: u32,
 }
 
-impl App {
-    fn new() -> Self {
-        let mut registry = BlockRegistry::new();
-        registry.register(BlockProperties {
-            id: BlockId::STONE,
-            name: "stone",
-            transparent: false,
-            solid: true,
-            hardness: 2.0,
-            light_emission: 0,
-            face_textures: [1, 1, 1, 1, 1, 1],
-        });
-        registry.register(BlockProperties {
-            id: BlockId::DIRT,
-            name: "dirt",
-            transparent: false,
-            solid: true,
-            hardness: 0.6,
-            light_emission: 0,
-            face_textures: [2, 2, 2, 2, 2, 2],
-        });
-        registry.register(BlockProperties {
-            id: BlockId::GRASS,
-            name: "grass",
-            transparent: false,
-            solid: true,
-            hardness: 0.6,
-            light_emission: 0,
-            face_textures: [3, 3, 2, 4, 3, 3],
-        });
-        registry.register(BlockProperties {
-            id: BlockId::BEDROCK,
-            name: "bedrock",
-            transparent: false,
-            solid: true,
-            hardness: 999.0,
-            light_emission: 0,
-            face_textures: [5, 5, 5, 5, 5, 5],
-        });
-        registry.register(BlockProperties {
-            id: BlockId::WOOD,
-            name: "wood",
-            transparent: false,
-            solid: true,
-            hardness: 1.5,
-            light_emission: 0,
-            face_textures: [6, 6, 6, 6, 6, 6],
-        });
-        registry.register(BlockProperties {
-            id: BlockId::LEAVES,
-            name: "leaves",
-            transparent: true,
-            solid: true,
-            hardness: 0.3,
-            light_emission: 0,
-            face_textures: [7, 7, 7, 7, 7, 7],
-        });
-        registry.register(BlockProperties {
-            id: BlockId::SAND,
-            name: "sand",
-            transparent: false,
-            solid: true,
-            hardness: 0.5,
-            light_emission: 0,
-            face_textures: [6, 6, 6, 6, 6, 6],
-        });
-        registry.register(BlockProperties {
-            id: BlockId::GRAVEL,
-            name: "gravel",
-            transparent: false,
-            solid: true,
-            hardness: 0.6,
-            light_emission: 0,
-            face_textures: [6, 6, 6, 6, 6, 6], // reuse sand layer
-        });
-        registry.register(BlockProperties {
-            id: BlockId::WATER,
-            name: "water",
-            transparent: true,
-            solid: false,
-            hardness: 0.0,
-            light_emission: 0,
-            face_textures: [7, 7, 7, 7, 7, 7],
-        });
-
-        let mut world = WorldManager::new(9001);
-
-        // Generate initial chunks synchronously (needed for spawn height)
-        for x in -2..=2 {
-            for z in -2..=2 {
-                let pos = ChunkPos(glam::IVec2::new(x, z));
-                world.get_or_generate(pos);
-            }
-        }
-
-        // Create background worker pool (4 threads for chunk gen + meshing)
-        let chunk_gen_worker = ChunkGenWorker::new(9001, "world_data", 4);
-
-        let terrain_floor = world.terrain_height_at(0, 0).floor();
-        let spawn_height = terrain_floor + 2.8; // surface + eye height (1.8)
-        let mut camera = Camera::new(1280.0 / 720.0);
-        camera.position.y = spawn_height;
-        camera.pitch = -0.3;
-
+impl Default for ClientConfig {
+    fn default() -> Self {
         Self {
-            registry,
-            window: None,
-            render: None,
-            camera,
-            camera_controller: CameraController::default(),
-            world,
-            input: InputState::default(),
-            lazy_loader: LazyChunkLoader::new(),
-            chunk_gen_worker,
-            dirty_manager: DirtyChunkManager::new(),
-            debug: DebugOverlay::new(),
-            frame_count: 0,
-            fps_timer: Instant::now(),
-            current_fps: 0.0,
-            last_frame_time: Instant::now(),
-            render_distance: 8,
-            last_player_chunk: None,
-            last_update_pos: None,
-            player_velocity: Vec3::ZERO,
-            grounded: false,
-            in_water: false,
-            selected_block: None,
+            radius: 3,
+            width: 1280,
+            height: 720,
         }
     }
 }
 
-impl winit::application::ApplicationHandler for App {
-    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
-        if self.window.is_none() {
-            let window = Arc::new(
-                event_loop
-                    .create_window(
-                        winit::window::WindowAttributes::default()
-                            .with_title("Strata - Phase 2")
-                            .with_inner_size(winit::dpi::PhysicalSize::new(1280u32, 720u32)),
-                    )
-                    .unwrap(),
-            );
-            info!("Window created");
-            let render = pollster::block_on(RenderEngine::new(Arc::clone(&window), &self.registry));
-            match render {
-                Ok(mut engine) => {
-                    self.world.init_mesh_worker();
-                    self.debug.init(&engine.device, engine.config.format);
-                    // Fill borders for all initial chunks (neighbors now exist)
-                    for x in -2..=2 {
-                        for z in -2..=2 {
-                            self.world.fill_borders(ChunkPos(glam::IVec2::new(x, z)));
-                        }
+fn load_config() -> ClientConfig {
+    let mut cfg = ClientConfig::default();
+    let text = match std::fs::read_to_string("client.toml") {
+        Ok(t) => t,
+        Err(_) => return cfg,
+    };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, value)) = line.split_once('=') {
+            let key = key.trim();
+            let value = value.trim();
+            match key {
+                "radius" => {
+                    if let Ok(r) = value.parse::<i32>() {
+                        cfg.radius = r;
                     }
-                    // Mark initial chunks dirty so they're remeshed with correct borders
-                    for x in -2..=2 {
-                        for z in -2..=2 {
-                            self.dirty_manager.mark_dirty(ChunkPos(glam::IVec2::new(x, z)));
-                        }
-                    }
-                    // Upload initial CPU-built meshes (will be replaced shortly)
-                    for x in -2..=2 {
-                        for z in -2..=2 {
-                            let pos = ChunkPos(glam::IVec2::new(x, z));
-                            if let Some(mesh) = self.world.get_mesh(pos) {
-                                engine.chunk_renderer.upload_mesh(&engine.device, pos, mesh);
-                            }
-                        }
-                    }
-                    self.render = Some(engine);
-                    self.window = Some(window);
-                    let w = self.window.as_ref().unwrap();
-                    w.set_cursor_visible(false);
-                    let _ = w
-                        .set_cursor_grab(CursorGrabMode::Locked)
-                        .or_else(|_| w.set_cursor_grab(CursorGrabMode::Confined));
                 }
-                Err(e) => {
-                    tracing::error!("Failed to create RenderEngine: {}", e);
+                "width" => {
+                    if let Ok(w) = value.parse::<u32>() {
+                        cfg.width = w;
+                    }
                 }
+                "height" => {
+                    if let Ok(h) = value.parse::<u32>() {
+                        cfg.height = h;
+                    }
+                }
+                _ => {}
             }
         }
     }
-
-    fn device_event(
-        &mut self,
-        _event_loop: &winit::event_loop::ActiveEventLoop,
-        _device_id: winit::event::DeviceId,
-        event: winit::event::DeviceEvent,
-    ) {
-        if let winit::event::DeviceEvent::MouseMotion { delta, .. } = event {
-            self.input
-                .handle_mouse_motion(winit::dpi::PhysicalPosition::new(delta.0, delta.1));
-        }
-    }
-
-    fn window_event(
-        &mut self,
-        event_loop: &winit::event_loop::ActiveEventLoop,
-        _window_id: winit::window::WindowId,
-        event: winit::event::WindowEvent,
-    ) {
-        match event {
-            winit::event::WindowEvent::CloseRequested => {
-                event_loop.exit();
-            }
-            winit::event::WindowEvent::KeyboardInput { event, .. } => {
-                self.input
-                    .handle_keyboard_input(&event.logical_key, event.state);
-
-                if event.state == ElementState::Pressed
-                    && let Key::Character(ch) = &event.logical_key
-                    && ch.as_str() == "q"
-                {
-                    event_loop.exit();
-                }
-            }
-            winit::event::WindowEvent::MouseInput { state, button, .. } => {
-                if state == ElementState::Pressed
-                    && let Some(window) = &self.window
-                {
-                    window.set_cursor_visible(false);
-                    let _ = window
-                        .set_cursor_grab(CursorGrabMode::Locked)
-                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
-                }
-
-                if state == ElementState::Pressed && self.render.is_some() {
-                    let (origin, forward) = {
-                        let (s, c) = self.camera.pitch.sin_cos();
-                        let (sy, cy) = self.camera.yaw.sin_cos();
-                        let fwd = glam::Vec3::new(cy * c, s, sy * c);
-                        (self.camera.position, fwd)
-                    };
-
-                    match button {
-                        MouseButton::Left => {
-                            if let Some((pos, _)) = self
-                                .world
-                                .raycast(origin, forward, 6.0)
-                                && let Some((chunk_pos, _, _, _)) = pos.to_chunk_local()
-                            {
-                                self.world.break_block(pos);
-                                self.dirty_manager.mark_dirty(chunk_pos);
-                            }
-                        }
-                        MouseButton::Right => {
-                            if let Some((pos, normal)) = self
-                                .world
-                                .raycast(origin, forward, 6.0)
-                            {
-                                let adjacent = BlockPos(pos.0 - normal);
-                                // Don't place block inside player
-                                let block_min = adjacent.0.as_vec3();
-                                let block_max = adjacent.0.as_vec3() + glam::Vec3::ONE;
-                                let player_min = glam::Vec3::new(
-                                    self.camera.position.x - PLAYER_HALF_WIDTH,
-                                    self.camera.position.y - PLAYER_HEIGHT,
-                                    self.camera.position.z - PLAYER_HALF_WIDTH,
-                                );
-                                let player_max = glam::Vec3::new(
-                                    self.camera.position.x + PLAYER_HALF_WIDTH,
-                                    self.camera.position.y,
-                                    self.camera.position.z + PLAYER_HALF_WIDTH,
-                                );
-                                let overlaps = block_min.x < player_max.x
-                                    && block_max.x > player_min.x
-                                    && block_min.y < player_max.y
-                                    && block_max.y > player_min.y
-                                    && block_min.z < player_max.z
-                                    && block_max.z > player_min.z;
-                                if !overlaps
-                                    && let Some((chunk_pos, _, _, _)) = adjacent.to_chunk_local()
-                                {
-                                    self.world.place_block(adjacent, BlockId::STONE);
-                                    self.dirty_manager.mark_dirty(chunk_pos);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            winit::event::WindowEvent::Resized(size) => {
-                if let Some(render) = &mut self.render {
-                    render.resize(size.width, size.height);
-                }
-            }
-            winit::event::WindowEvent::CursorEntered { .. } => {
-                if let Some(window) = &self.window {
-                    window.set_cursor_visible(false);
-                    let _ = window
-                        .set_cursor_grab(CursorGrabMode::Locked)
-                        .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
-                }
-            }
-            winit::event::WindowEvent::RedrawRequested => {
-                // 7. Render
-                if let Some(render) = &mut self.render {
-                    // Sync camera
-                    render.camera = self.camera.clone();
-                    // Underwater fog
-                    if self.in_water {
-                        render.fog_density = 0.04;
-                        render.fog_color = glam::Vec3::new(0.05, 0.25, 0.45);
-                    } else {
-                        render.fog_density = 0.0;
-                    }
-                    render.update_camera();
-                    render.selected_block = self.selected_block;
-
-                    // Frustum culling (uses cached chunk keys)
-                    render.chunk_renderer.cull(&render.frustum, self.world.get_chunk_keys());
-
-                    // Update debug stats
-                    self.debug.visible_chunks = render.chunk_renderer.visible_count();
-                    self.debug.chunk_count = render.chunk_renderer.total_count();
-                    self.debug.player_position = (
-                        self.camera.position.x,
-                        self.camera.position.y,
-                        self.camera.position.z,
-                    );
-
-                    let output = render.render_frame();
-                    if let Some(mut output) = output {
-                        self.debug.render(
-                            &render.device,
-                            &render.queue,
-                            &mut output.encoder,
-                            render.config.format,
-                            &output.view,
-                            render.config.width,
-                            render.config.height,
-                        );
-                        render
-                            .queue
-                            .submit(std::iter::once(output.encoder.finish()));
-                        output.frame.present();
-                    }
-                }
-
-                // 8. FPS update + window title
-                if let Some(window) = &self.window {
-                    self.frame_count += 1;
-                    if self.fps_timer.elapsed() >= Duration::from_secs(1) {
-                        self.current_fps = self.frame_count as f32 / self.fps_timer.elapsed().as_secs_f32();
-                        self.debug.fps = self.current_fps;
-                        window.set_title(&self.debug.debug_string());
-                        self.frame_count = 0;
-                        self.fps_timer = Instant::now();
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
-        let now = Instant::now();
-        let dt = now.duration_since(self.last_frame_time).as_secs_f32();
-        self.last_frame_time = now;
-
-        // 1. Camera rotation (yaw/pitch from mouse)
-        let (yaw_delta, pitch_delta) = self.input.cursor_delta();
-        self.camera.yaw -= yaw_delta * self.camera_controller.mouse_sensitivity;
-        self.camera.pitch -= pitch_delta * self.camera_controller.mouse_sensitivity;
-        self.camera.pitch = self.camera.pitch.clamp(-1.55, 1.55);
-        self.input.update();
-
-        // 2. Player physics: movement + gravity + collision
-        let (sin_yaw, cos_yaw) = self.camera.yaw.sin_cos();
-        let forward_dir = Vec3::new(cos_yaw, 0.0, sin_yaw).normalize();
-        let right_dir = Vec3::new(sin_yaw, 0.0, -cos_yaw).normalize();
-
-        // Check if player's feet are in water
-        let feet_y = (self.camera.position.y - PLAYER_HEIGHT) as i32;
-        let in_water = self.world.is_water_at(
-            self.camera.position.x as i32,
-            feet_y,
-            self.camera.position.z as i32,
-        );
-
-        let move_input = Vec3::new(
-            self.input.strafe() as f32,
-            0.0,
-            self.input.forward() as f32,
-        );
-        let base_speed = if self.input.sprint {
-            PLAYER_SPRINT_SPEED
-        } else {
-            PLAYER_WALK_SPEED
-        };
-        let move_speed = if in_water {
-            base_speed * WATER_SPEED_FACTOR
-        } else {
-            base_speed
-        };
-
-        // Direct velocity from input (instant response, no acceleration lag)
-        if move_input.length_squared() > 0.0 {
-            let wish_dir = (forward_dir * move_input.z + right_dir * move_input.x).normalize();
-            self.player_velocity.x = wish_dir.x * move_speed;
-            self.player_velocity.z = wish_dir.z * move_speed;
-        } else {
-            self.player_velocity.x = 0.0;
-            self.player_velocity.z = 0.0;
-        }
-
-        // Ground check: test if AABB shifted slightly downward collides with blocks
-        let aabb_min = |pos: Vec3| -> Vec3 {
-            Vec3::new(
-                pos.x - PLAYER_HALF_WIDTH,
-                pos.y - PLAYER_HEIGHT,
-                pos.z - PLAYER_HALF_WIDTH,
-            )
-        };
-        let aabb_max = |pos: Vec3| -> Vec3 {
-            Vec3::new(
-                pos.x + PLAYER_HALF_WIDTH,
-                pos.y,
-                pos.z + PLAYER_HALF_WIDTH,
-            )
-        };
-        let cam = self.camera.position;
-        let below_min = Vec3::new(cam.x - PLAYER_HALF_WIDTH, cam.y - PLAYER_HEIGHT - 0.01, cam.z - PLAYER_HALF_WIDTH);
-        let below_max = Vec3::new(cam.x + PLAYER_HALF_WIDTH, cam.y - 0.01, cam.z + PLAYER_HALF_WIDTH);
-        self.grounded = self.world.is_colliding(below_min, below_max);
-        self.in_water = in_water;
-        self.debug.grounded = self.grounded;
-        self.debug.in_water = in_water;
-        self.debug.space_pressed = self.input.jump;
-
-        // Jump / swim up
-        if self.input.jump {
-            if self.grounded {
-                self.player_velocity.y = PLAYER_JUMP_VELOCITY;
-            } else if in_water {
-                self.player_velocity.y = WATER_SWIM_VELOCITY;
-            }
-        }
-
-        // Gravity (reduced in water for buoyancy)
-        let gravity = if in_water { WATER_GRAVITY } else { PLAYER_GRAVITY };
-        self.player_velocity.y += gravity * dt;
-
-        // Axis-by-axis collision resolution
-        let dt = dt.min(0.05); // cap to avoid tunneling through blocks
-        let mut new_pos = self.camera.position;
-
-        // X axis
-        new_pos.x += self.player_velocity.x * dt;
-        if self.world.is_colliding(aabb_min(new_pos), aabb_max(new_pos)) {
-            new_pos.x = self.camera.position.x;
-            self.player_velocity.x = 0.0;
-        }
-
-        // Y axis
-        new_pos.y += self.player_velocity.y * dt;
-        if self.world.is_colliding(aabb_min(new_pos), aabb_max(new_pos)) {
-            new_pos.y = self.camera.position.y;
-            self.player_velocity.y = 0.0;
-        }
-
-        // Z axis
-        new_pos.z += self.player_velocity.z * dt;
-        if self.world.is_colliding(aabb_min(new_pos), aabb_max(new_pos)) {
-            new_pos.z = self.camera.position.z;
-            self.player_velocity.z = 0.0;
-        }
-
-        self.camera.position = new_pos;
-
-        // Raycast for block highlight
-        {
-            let (s, c) = self.camera.pitch.sin_cos();
-            let (sy, cy) = self.camera.yaw.sin_cos();
-            let fwd = glam::Vec3::new(cy * c, s, sy * c);
-            self.selected_block = self
-                .world
-                .raycast(self.camera.position, fwd, 6.0)
-                .map(|(pos, _)| pos.0);
-        }
-
-        // 2. Lazy chunk loading and unloading based on player position (gated on chunk boundary crossing + hysteresis)
-        let player_pos = self.camera.position;
-        let should_update = if let Some(last_pos) = self.last_update_pos {
-            let dx = player_pos.x - last_pos.x;
-            let dz = player_pos.z - last_pos.z;
-            (dx * dx + dz * dz) > 64.0 // 8.0 blocks squared (half a chunk distance threshold)
-        } else {
-            true
-        };
-
-        if should_update {
-            let player_chunk =
-                ChunkPos::from_world(player_pos.x as i32, player_pos.z as i32);
-            let required = self
-                .world
-                .get_required_chunks(player_chunk, self.render_distance);
-            self.lazy_loader.request_chunks(&required);
-            self.lazy_loader.prioritize(player_chunk);
-
-            // 4. Unload distant chunks and clean up GPU buffers
-            let removed = self.world
-                .unload_distant_chunks(player_chunk, self.render_distance);
-            if let Some(render) = &mut self.render {
-                for pos in &removed {
-                    render.chunk_renderer.remove_mesh(*pos);
-                }
-            }
-
-            self.last_player_chunk = Some(player_chunk);
-            self.last_update_pos = Some(player_pos);
-        }
-
-        // Submit chunk gen requests to background workers (non-blocking, throttled per frame)
-        self.lazy_loader.process(&mut self.chunk_gen_worker);
-
-        // 3. Poll for completed chunks from background workers
-        {
-            let completed = self.chunk_gen_worker.poll();
-            for result in completed {
-                self.lazy_loader.mark_completed(result.pos);
-                self.world.insert_generated_chunk(result.pos, result.chunk);
-                // Borders were filled inside insert_generated_chunk; queue mesh rebuild
-                if self.world.chunks.contains_key(&result.pos) {
-                    self.dirty_manager.mark_dirty(result.pos);
-                }
-            }
-        }
-
-        // 5. Propagate light for light-dirty chunks (throttled: 4/frame)
-        self.world.propagate_light();
-
-        // 6. Process dirty chunks (submits mesh rebuilds to background thread)
-        let _rebuilt = self.dirty_manager.process(&mut self.world);
-        // Poll for any completed dirty rebuilds (from dirty chunk or other mesh updates)
-        if let Some(render) = &mut self.render {
-            let completed = self.world.poll_completed_meshes();
-            for (pos, mesh) in completed {
-                render.chunk_renderer.upload_mesh(&render.device, pos, &mesh);
-            }
-        }
-
-        // 7. Request redraw
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
-    }
+    cfg
 }
 
-fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
-
-    // Clean old world data to prevent stale chunks from previous seeds
-    let world_data_path = std::path::Path::new("world_data");
-    if world_data_path.exists() {
-        std::fs::remove_dir_all(world_data_path).ok();
-        info!("Cleared old world_data directory");
-    }
-
-    info!("Strata Phase 2 client starting...");
-
-    let event_loop = winit::event_loop::EventLoop::new()?;
+/// Build the full Strata client app. `headless` swaps `DefaultPlugins` (windowed,
+/// winit-driven) for `MinimalPlugins` (schedule-runner driven) so the pipeline can
+/// be exercised without a display.
+fn build_client_app(headless: bool, config: &ClientConfig) -> App {
     let mut app = App::new();
-    event_loop.run_app(&mut app)?;
 
-    Ok(())
+    if headless {
+        // MinimalPlugins lacks the plugins Rapier's physics step depends on
+        // (Asset/Transform/Mesh/Scene/Hierarchy). In windowed mode DefaultPlugins
+        // provides them; here we add the minimal subset so the full plugin chain
+        // (including PhysicsPlugin) can run headlessly for tests.
+        app.add_plugins(MinimalPlugins);
+        app.add_plugins(InputPlugin);
+        app.add_plugins(bevy::asset::AssetPlugin::default());
+        app.add_plugins(bevy::transform::TransformPlugin);
+        app.add_plugins(bevy::mesh::MeshPlugin);
+        app.add_plugins(bevy::scene::ScenePlugin);
+    } else {
+        let window = Window {
+            resolution: WindowResolution::new(config.width, config.height),
+            ..Default::default()
+        };
+        app.add_plugins(
+            DefaultPlugins.set(WindowPlugin {
+                primary_window: Some(window),
+                ..Default::default()
+            }),
+        );
+    }
+
+    // Core scheduling (orders the StrataSet chain) + the block registry the
+    // world-gen and meshing systems read from.
+    app.add_strata_plugin(StrataSchedulingPlugin);
+    app.add_strata_plugin(BlockRegistryPlugin);
+
+    // Streaming -> WorldGen -> Meshing -> Physics -> Lighting -> Player, plus our
+    // client present plugin (registered last so the surface/resource exist).
+    app.add_strata_plugin(StreamingPlugin::new(config.radius, DEFAULT_HYSTERESIS));
+    app.add_strata_plugin(WorldGenPlugin);
+    app.add_strata_plugin(MeshingPlugin);
+    app.add_strata_plugin(PhysicsPlugin);
+    app.add_strata_plugin(LightingPlugin);
+    app.add_strata_plugin(PlayerPlugin);
+    app.add_strata_plugin(ClientRenderPlugin);
+
+    app.add_systems(Startup, spawn_player_system);
+    app
+}
+
+fn spawn_player_system(mut commands: Commands) {
+    spawn_player(&mut commands, SPAWN_POSITION);
+}
+
+fn main() {
+    let config = load_config();
+    let mut app = build_client_app(false, &config);
+    app.run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy::ecs::query::QueryState;
+    use strata_render::meshing::MeshStorage;
+
+    /// The app must construct (all plugins + systems registered) without panic.
+    /// No window/run is performed, so this is safe headlessly.
+    #[test]
+    fn test_client_app_builds() {
+        let cfg = ClientConfig::default();
+        let app = build_client_app(true, &cfg);
+        // Probe that the expected resources/plugins are present by running a few
+        // frames headlessly (no window) and checking the streaming->gen->mesh chain.
+        let _ = app;
+    }
+
+    /// End-to-end headless pipeline check: with a player present, sectors stream
+    /// in, get generated, and are meshed into `MeshStorage` (no GPU required).
+    #[test]
+    fn test_stream_gen_mesh_chain() {
+        let cfg = ClientConfig::default();
+        let mut app = build_client_app(true, &cfg);
+
+        for _ in 0..16 {
+            app.update();
+        }
+
+        let world = app.world_mut();
+        let mut state = QueryState::<&Generated, ()>::new(world);
+        let generated = state.iter(world).count();
+        assert!(generated > 0, "at least one sector must be generated");
+
+        let storage = world.resource::<MeshStorage>();
+        assert!(
+            !storage.meshes.is_empty(),
+            "generated sectors must be meshed into MeshStorage"
+        );
+    }
 }

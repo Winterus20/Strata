@@ -1,0 +1,23 @@
+[package]
+name = "strata_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# `bevy_ecs`, `bevy_app`, `bevy_reflect` and `bevy_derive` are non-optional
+# dependencies of `bevy_internal`, so `App`/`Component`/`Resource`/`SystemSet`
+# and their derive macros are always available without opting into them. Only
+# `bevy_log` (optional) is enabled for the `info!`/`warn!` macros.
+bevy = { workspace = true, default-features = false, features = ["bevy_log"] }
+
+# Block registry: bitmask flags + TOML data-driven definitions (plan 04/05).
+bitflags = "2"
+toml = "0.8"
+
+# XBrickMap: global heap-fragmentation-free brick pool (plan 06/39).
+slotmap = "1"
+
+# Serialization for CompressedChunkData snapshots (plan 40/41: postcard).
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1.1", features = ["alloc"] }

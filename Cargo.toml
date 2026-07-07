@@ -1,110 +1,39 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/core",
-    "crates/ecs",
-    "crates/world-gen",
-    "crates/meshing",
-    "crates/storage",
-    "crates/physics",
-    "crates/render",
-    "crates/lighting",
-    "crates/player",
-    "crates/entity",
-    "crates/inventory",
-    "crates/network",
-    "crates/plugin-api",
-    "crates/modding",
-    "crates/fluid",
+    "crates/strata_core",
+    "crates/strata_world",
+    "crates/strata_physics",
+    "crates/strata_render",
+    "crates/strata_player",
     "bin/client",
-    "bin/server",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
-license = "MIT"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Kilo-Org/strata"
 
 [workspace.dependencies]
-# ECS
-bevy_ecs = "0.18"
-bevy_app = "0.18"
-bevy_math = "0.18"
-bevy_transform = "0.18"
-bevy_time = "0.18"
-
-# Math
-glam = { version = "0.30", features = ["serde"] }
-
-# Async
-tokio = { version = "1", features = ["full"] }
-
-# Serialization
-rkyv = { version = "0.8" }
-postcard = { version = "1.1", features = ["alloc"] }
-serde = { version = "1", features = ["derive"] }
-
-# Network
-bevy_renet2 = "0.13"
-bevy_replicon = "0.39"
-bevy_replicon_renet2 = "0.14"
-
-# CLI
-clap = { version = "4", features = ["derive"] }
-
-# Noise
-fastnoise2 = "0.4"
-
-# Compression
-zstd = "0.13"
-
-# Physics
-bevy_rapier3d = { version = "0.33", features = ["enhanced-determinism"] }
-
-# Window / Render
-winit = "0.30"
-wgpu = "27"
-
-# Logging
-tracing = "0.1"
-tracing-subscriber = "0.3"
-
-# Error handling
-thiserror = "2"
-anyhow = "1"
-
-# Collections
-hashbrown = "0.15"
-
-# RNG
-rand = "0.8"
-
-# Parallelism
-rayon = "1.10"
-
-# Input
-bevy_input = "0.18"
-bevy_window = "0.18"
-
-# Modding & Plugins
-semver = "1.0"
-wasmtime = { version = "30.0", features = ["component-model"] }
-libloading = "0.8"
-notify = "6.1.1"
-
-# Phase 6 Optimization & Storage
-fjall = "3.0"
-mimalloc = "0.1"
-dhat = "0.3"
-divan = "0.1"
+bevy = { version = "0.18", default-features = false }
+bevy_rapier3d = { version = "0.34", default-features = false, features = [
+    "enhanced-determinism",
+    "dim3",
+] }
 
 [profile.dev]
 opt-level = 1
+debug = 1
+split-debuginfo = "unpacked"
+incremental = true
+codegen-units = 256
+lto = false
 
 [profile.dev.package."*"]
 opt-level = 3
 
 [profile.release]
-lto = "thin"
-codegen-units = 1
 opt-level = 3
+lto = "thin"
+codegen-units = 16

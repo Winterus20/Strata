@@ -1,0 +1,9 @@
+[package]
+name = "strata_world"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+strata_core = { path = "../strata_core" }

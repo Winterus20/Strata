@@ -1,0 +1,147 @@
+# Strata prototype block definitions (plan 04 / 05).
+# AIR (id 0) MUST be first and is transparent + non-solid.
+# Flags are a subset of: SOLID, TRANSPARENT, AIR, LIGHT_SRC, LIQUID.
+
+[[block]]
+name = "air"
+id = 0
+flags = ["AIR", "TRANSPARENT"]
+solid = false
+transparent = true
+light_emission = 0
+base_color = [0, 0, 0]
+
+[[block]]
+name = "stone"
+id = 1
+flags = ["SOLID"]
+solid = true
+transparent = false
+light_emission = 0
+base_color = [128, 128, 128]
+
+[[block]]
+name = "dirt"
+id = 2
+flags = ["SOLID"]
+solid = true
+transparent = false
+light_emission = 0
+base_color = [134, 96, 67]
+
+[[block]]
+name = "grass"
+id = 3
+flags = ["SOLID"]
+solid = true
+transparent = false
+light_emission = 0
+base_color = [95, 159, 53]
+
+[[block]]
+name = "wood"
+id = 4
+flags = ["SOLID"]
+solid = true
+transparent = false
+light_emission = 0
+base_color = [160, 120, 80]
+
+[[block]]
+name = "leaf"
+id = 5
+flags = ["SOLID", "TRANSPARENT"]
+solid = true
+transparent = true
+light_emission = 0
+base_color = [50, 120, 40]
+
+[[block]]
+name = "sand"
+id = 6
+flags = ["SOLID"]
+solid = true
+transparent = false
+light_emission = 0
+base_color = [219, 205, 152]
+
+[[block]]
+name = "water"
+id = 7
+flags = ["TRANSPARENT", "LIQUID"]
+solid = false
+transparent = true
+light_emission = 0
+base_color = [40, 90, 200]
+
+[[block]]
+name = "log"
+id = 8
+flags = ["SOLID"]
+solid = true
+transparent = false
+light_emission = 0
+base_color = [102, 76, 48]
+
+[[block]]
+name = "plank"
+id = 9
+flags = ["SOLID"]
+solid = true
+transparent = false
+light_emission = 0
+base_color = [180, 150, 100]
+
+[[block]]
+name = "cobble"
+id = 10
+flags = ["SOLID"]
+solid = true
+transparent = false
+light_emission = 0
+base_color = [120, 120, 120]
+
+[[block]]
+name = "glass"
+id = 11
+flags = ["TRANSPARENT"]
+solid = true
+transparent = true
+light_emission = 0
+base_color = [200, 230, 235]
+
+[[block]]
+name = "glowstone"
+id = 12
+flags = ["SOLID", "LIGHT_SRC"]
+solid = true
+transparent = false
+light_emission = 15
+base_color = [255, 255, 200]
+
+[[block]]
+name = "metal"
+id = 13
+flags = ["SOLID"]
+solid = true
+transparent = false
+light_emission = 0
+base_color = [180, 180, 190]
+
+[[block]]
+name = "ice"
+id = 14
+flags = ["SOLID", "TRANSPARENT"]
+solid = true
+transparent = true
+light_emission = 0
+base_color = [180, 220, 235]
+
+[[block]]
+name = "lava"
+id = 15
+flags = ["LIQUID", "LIGHT_SRC"]
+solid = false
+transparent = false
+light_emission = 15
+base_color = [200, 80, 20]

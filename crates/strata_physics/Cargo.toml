@@ -1,0 +1,11 @@
+[package]
+name = "strata_physics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy = { workspace = true }
+bevy_rapier3d = { workspace = true }
+strata_core = { path = "../strata_core" }
+strata_world = { path = "../strata_world" }

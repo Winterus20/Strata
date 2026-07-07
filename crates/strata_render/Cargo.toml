@@ -1,0 +1,20 @@
+[package]
+name = "strata_render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bevy = { workspace = true, default-features = true }
+strata_core = { path = "../strata_core" }
+strata_world = { path = "../strata_world" }
+
+# GPU bootstrap for M4 (wgpu bootstrap + headless offscreen clear).
+# Pinned to 27.x to match the wgpu version pulled in by Bevy 0.18, avoiding a
+# second wgpu build. bytemuck kept in lockstep with the workspace's 1.x line.
+wgpu = "27"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Tiny executor used only by the #[cfg(test)] GPU test to drive async
+# request_adapter / request_device on the test thread.
+pollster = "0.4"
