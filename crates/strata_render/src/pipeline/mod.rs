@@ -138,7 +138,9 @@ impl Renderer {
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: TextureFormat::Rgba16Float,
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            usage: TextureUsages::RENDER_ATTACHMENT
+                | TextureUsages::COPY_SRC
+                | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         let offscreen_view = offscreen.create_view(&TextureViewDescriptor::default());
@@ -667,7 +669,9 @@ impl Renderer {
             sample_count: 1,
             dimension: TextureDimension::D2,
             format: TextureFormat::Rgba16Float,
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            usage: TextureUsages::RENDER_ATTACHMENT
+                | TextureUsages::COPY_SRC
+                | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
         self.offscreen_view = self.offscreen.create_view(&TextureViewDescriptor::default());

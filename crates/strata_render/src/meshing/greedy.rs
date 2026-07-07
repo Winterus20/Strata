@@ -275,10 +275,6 @@ impl GreedyMesher {
                     } else {
                         out.opaque.push(quad);
                     }
-                    eprintln!(
-                        "  PUSH d={d} s={s} n={back_layer} i={i} j={j} base={:?} w={w} h={h} face={face_idx}",
-                        base
-                    );
 
                     for dj in 0..h {
                         for di in 0..w {
