@@ -40,9 +40,16 @@ impl StrataPlugin for StrataSchedulingPlugin {
                 stub_meshing.in_set(StrataSet::Meshing),
                 stub_physics.in_set(StrataSet::Physics),
                 stub_lighting.in_set(StrataSet::Lighting),
-                hello_system.in_set(StrataSet::RenderUpdate),
             ),
         );
+        app.add_systems(Update, clear_dirty_markers.after(StrataSet::Lighting));
+        app.add_systems(Startup, hello_system);
+    }
+}
+
+fn clear_dirty_markers(mut commands: Commands, dirty: Query<Entity, With<ChunkDirty>>) {
+    for entity in &dirty {
+        commands.entity(entity).remove::<ChunkDirty>();
     }
 }
 

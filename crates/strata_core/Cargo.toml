@@ -18,6 +18,11 @@ toml = "0.8"
 # XBrickMap: global heap-fragmentation-free brick pool (plan 06/39).
 slotmap = "1"
 
+# Thread-safe pool: `GlobalBrickPool` is shared (Arc) with background meshing
+# threads, so brick reads take a shared `RwLock` (parking_lot gives ergonomic
+# `try_map` guard mapping on stable Rust; std's is nightly-only).
+parking_lot = "0.12"
+
 # Serialization for CompressedChunkData snapshots (plan 40/41: postcard).
 serde = { version = "1", features = ["derive"] }
 postcard = { version = "1.1", features = ["alloc"] }

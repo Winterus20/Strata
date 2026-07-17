@@ -23,7 +23,8 @@ use wgpu::*;
 use crate::meshing::MeshData;
 use crate::pipeline::cull::aabb_of_mesh;
 use crate::pipeline::prepass::{
-    PREPASS_COLOR_FORMAT, make_quad_buffer, prepass_bind_group_layout, prepass_pipeline,
+    PREPASS_COLOR_FORMAT, make_origins_buffer, make_quad_buffer, prepass_bind_group_layout,
+    prepass_pipeline,
 };
 use crate::pipeline::resolve::{ResolveParams, resolve_bind_group_layout, resolve_pipeline};
 
@@ -35,7 +36,6 @@ const BYTES_PER_PIXEL: u32 = 8;
 /// the surface format performs the final encoding conversion.
 const BLIT_WGSL: &str = r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
-@group(0) @binding(1) var samp: sampler;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -56,16 +56,21 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
+// Filtering-independent blit: `src` is rgba16float which is non-filterable on
+// adapters without FLOAT16_FILTERABLE, so sampling with a filtering sampler
+// fails validation and the pass is silently skipped (black screen). textureLoad
+// needs no sampler and works unconditionally.
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
-    return textureSample(src, samp, in.uv);
+    let coord = vec2<i32>(i32(in.pos.x), i32(in.pos.y));
+    return textureLoad(src, coord, 0);
 }
 "#;
 
 /// Device features required to build/run the depth pre-pass (`u64` types and
 /// `atomicMax` on `u64`). Native-only; the pre-pass is skipped on devices that
 /// lack them (M4a offscreen clear still works).
-fn prepass_features() -> Features {
+pub fn prepass_features() -> Features {
     Features::SHADER_INT64 | Features::SHADER_INT64_ATOMIC_MIN_MAX
 }
 
@@ -83,7 +88,24 @@ pub struct Renderer {
     offscreen_view: TextureView,
     staging: Buffer,
     bytes_per_row: u32,
+    /// When true the resolve pass colors each voxel face by its direction
+    /// (+X red, +Y green, ...) instead of Lambert shading — a debug aid for
+    /// spotting missing/wrong faces.
+    debug_faces: bool,
     prepass: Option<Prepass>,
+    /// Staging buffers for batched quad/origin uploads (see `upload_quad_region`
+    /// / `flush_quad_uploads`). Each sector is staged at its own SSBO offset so a
+    /// single `write_buffer` moves the whole frame's batch. Only the written
+    /// range (`upload_range_*`) is copied to the GPU, not the full SSBO-sized
+    /// staging vec, so a 8-sector update stays ~sub-ms instead of re-copying
+    /// tens of MB. Reused across frames (sized to SSBO capacity) to avoid reallocs.
+    quad_upload_staging: Vec<u8>,
+    origin_upload_staging: Vec<[f32; 4]>,
+    /// Inclusive [start, end) byte range written this frame in `quad_upload_staging`.
+    upload_range_quad: Option<(usize, usize)>,
+    /// Inclusive [start, end) float range written this frame in `origin_upload_staging`.
+    upload_range_origin: Option<(usize, usize)>,
+    pending_upload: bool,
     /// Lazily-built fullscreen blit used to present the offscreen HDR target to a
     /// window surface (M9b). One per surface format.
     blit: Option<Blit>,
@@ -106,6 +128,9 @@ struct Prepass {
     camera_buffer: Buffer,
     quad_buffer: Arc<Buffer>,
     quad_capacity: usize,
+    /// Per-quad world origins (sector_coord * 32), parallel to `quad_buffer` and
+    /// grown alongside it. `.xyz` = offset, `.w` = padding.
+    origins_buffer: Arc<Buffer>,
     bind_group: BindGroup,
     visbuf: Buffer,
     visbuf_pixels: u32,
@@ -163,8 +188,14 @@ impl Renderer {
             offscreen_view,
             staging,
             bytes_per_row,
+            debug_faces: false,
             prepass: None,
             blit: None,
+            quad_upload_staging: Vec::new(),
+            origin_upload_staging: Vec::new(),
+            upload_range_quad: None,
+            upload_range_origin: None,
+            pending_upload: false,
         }
     }
 
@@ -226,8 +257,15 @@ impl Renderer {
 
         let quad_capacity = 0usize;
         let quad_buffer = make_quad_buffer(&self.device, quad_capacity);
-        let bind_group =
-            Self::make_bind_group(&self.device, &bgl, &camera_buffer, &quad_buffer, &visbuf);
+        let origins_buffer = make_origins_buffer(&self.device, quad_capacity);
+        let bind_group = Self::make_bind_group(
+            &self.device,
+            &bgl,
+            &camera_buffer,
+            &quad_buffer,
+            &visbuf,
+            &origins_buffer,
+        );
 
         // M4d color-resolve resources.
         let resolve_bgl = resolve_bind_group_layout(&self.device);
@@ -257,7 +295,10 @@ impl Renderer {
         self.queue.write_buffer(
             &resolve_params,
             0,
-            bytemuck::bytes_of(&ResolveParams::new(self.width, self.height)),
+            bytemuck::bytes_of(&ResolveParams {
+                debug_faces: self.debug_faces as u32,
+                ..ResolveParams::new(self.width, self.height)
+            }),
         );
 
         self.prepass = Some(Prepass {
@@ -266,6 +307,7 @@ impl Renderer {
             camera_buffer,
             quad_buffer,
             quad_capacity,
+            origins_buffer,
             bind_group,
             visbuf,
             visbuf_pixels,
@@ -284,6 +326,7 @@ impl Renderer {
         camera_buffer: &Buffer,
         quad_buffer: &Buffer,
         visbuf: &Buffer,
+        origins_buffer: &Buffer,
     ) -> BindGroup {
         device.create_bind_group(&BindGroupDescriptor {
             label: Some("strata_prepass_bg"),
@@ -300,6 +343,10 @@ impl Renderer {
                 BindGroupEntry {
                     binding: 2,
                     resource: visbuf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: origins_buffer.as_entire_binding(),
                 },
             ],
         })
@@ -349,30 +396,41 @@ impl Renderer {
     /// features required by the pre-pass.
     pub fn render_prepass(&mut self, meshes: &[MeshData], camera: &CameraView) {
         let refs: Vec<&MeshData> = meshes.iter().collect();
-        self.run_prepass(&refs, camera);
+        // Single-sector / test path: every mesh is treated as living at world
+        // origin (0,0,0).
+        let origins = vec![[0.0f32; 3]; refs.len()];
+        self.run_prepass(&refs, &origins, camera);
     }
 
     /// Shared pre-pass body used by both [`Renderer::render_prepass`] and
     /// [`Renderer::render_frame`]: flatten the opaque quads, upload them +
-    /// camera, record the vertex-pulling pass into `encoder`, and submit.
-    fn run_prepass(&mut self, meshes: &[&MeshData], camera: &CameraView) {
+    /// per-quad world origins + camera, record the vertex-pulling pass into
+    /// `encoder`, and submit. `origins[i]` is the world offset of `meshes[i]`.
+    fn run_prepass(&mut self, meshes: &[&MeshData], origins: &[[f32; 3]], camera: &CameraView) {
         self.ensure_prepass();
         let prepass = match self.prepass.as_mut() {
             Some(p) => p,
             None => return,
         };
 
-        // Flatten opaque quads across all meshes into one byte buffer.
+        // Flatten opaque quads across all meshes into one byte buffer, building
+        // the parallel per-quad world-origin buffer as we go.
         let mut bytes: Vec<u8> = Vec::new();
-        for m in meshes {
-            let (opaque, _transparent) = meshdata_to_gpu_bytes(m);
-            bytes.extend_from_slice(&opaque);
+        let mut origin_data: Vec<[f32; 4]> = Vec::new();
+        for (m, o) in meshes.iter().zip(origins) {
+            // Reuse the worker-thread pre-flattened opaque bytes (`mesh_sector_snapshot`
+            // fills `opaque_gpu`) instead of re-packing every frame.
+            let opaque = &m.opaque_gpu;
+            let n = opaque.len() / std::mem::size_of::<PackedQuadGpu>();
+            bytes.extend_from_slice(opaque);
+            origin_data.extend(std::iter::repeat_n([o[0], o[1], o[2], 0.0], n));
         }
         let quad_count = bytes.len() / std::mem::size_of::<PackedQuadGpu>();
 
-        // Grow the quad SSBO + bind group if the batch no longer fits.
+        // Grow the quad + origins SSBOs (and bind group) if the batch no longer fits.
         if quad_count > prepass.quad_capacity {
             prepass.quad_buffer = make_quad_buffer(&self.device, quad_count);
+            prepass.origins_buffer = make_origins_buffer(&self.device, quad_count);
             prepass.quad_capacity = quad_count;
             prepass.bind_group = Self::make_bind_group(
                 &self.device,
@@ -380,20 +438,25 @@ impl Renderer {
                 &prepass.camera_buffer,
                 &prepass.quad_buffer,
                 &prepass.visbuf,
+                &prepass.origins_buffer,
             );
         }
 
         if quad_count > 0 {
             self.queue.write_buffer(&prepass.quad_buffer, 0, &bytes);
+            self.queue.write_buffer(
+                &prepass.origins_buffer,
+                0,
+                bytemuck::cast_slice(&origin_data),
+            );
         }
 
         // Clear the visbuf to the smallest stored value (0) under reversed-Z, where
         // a nearer fragment carries a LARGER value. With `atomicMax` this makes the
         // nearest fragment win every pixel. `VisBufEntry::empty()` (max-depth) is the
         // CPU-side far sentinel and is intentionally NOT the GPU clear value here.
-        let clear: Vec<u64> = vec![VisBufEntry(0).raw(); prepass.visbuf_pixels as usize];
-        self.queue
-            .write_buffer(&prepass.visbuf, 0, bytemuck::cast_slice(&clear));
+        // Cleared GPU-side (no per-frame CPU allocation / PCIe upload of the
+        // full framebuffer-sized buffer); the visbuf carries COPY_DST.
 
         // Upload the camera uniform.
         self.queue
@@ -404,6 +467,8 @@ impl Renderer {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("strata_prepass"),
             });
+
+        encoder.clear_buffer(&prepass.visbuf, 0, None);
 
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -440,7 +505,7 @@ impl Renderer {
     /// No-op (sky-only clear) when the device lacks the `u64`-atomic features the
     /// pre-pass needs; `render_frame` still resolves to the sky gradient in that
     /// case so the pipeline stays headless-capable.
-    pub fn render_frame(&mut self, meshes: &[MeshData], camera: &CameraView) {
+    pub fn render_frame(&mut self, meshes: &[MeshData], origins: &[[f32; 3]], camera: &CameraView) {
         self.ensure_prepass();
         let prepass = match self.prepass.as_ref() {
             Some(p) => p,
@@ -453,26 +518,37 @@ impl Renderer {
         };
         let _ = prepass;
 
-        // Frustum-cull whole meshes (per-sector AABBs); render visible only, but
-        // fall back to all meshes if culling drops everything (defensive).
-        let boxes: Vec<Aabb> = meshes.iter().map(aabb_of_mesh).collect();
+        // Frustum-cull whole meshes (per-sector AABBs, translated to world space
+        // by each sector's origin); render visible only, but fall back to all
+        // meshes if culling drops everything (defensive).
+        let boxes: Vec<Aabb> = meshes
+            .iter()
+            .zip(origins)
+            .map(|(m, o)| aabb_of_mesh(m).translated(*o))
+            .collect();
         let visible = cull_visible(&boxes, camera);
-        let to_render: Vec<&MeshData> = if visible.is_empty() {
-            meshes.iter().collect()
+        let to_render: Vec<usize> = if visible.is_empty() {
+            (0..meshes.len()).collect()
         } else {
-            visible.iter().map(|&i| &meshes[i]).collect()
+            visible
         };
 
-        // Flatten + upload prepass data (visbuf clear, quad SSBO, camera).
+        // Flatten + upload prepass data (visbuf clear, quad SSBO, per-quad world
+        // origins, camera).
         let prepass = self.prepass.as_mut().expect("prepass ensured above");
         let mut bytes: Vec<u8> = Vec::new();
-        for m in &to_render {
-            let (opaque, _transparent) = meshdata_to_gpu_bytes(m);
-            bytes.extend_from_slice(&opaque);
+        let mut origin_data: Vec<[f32; 4]> = Vec::new();
+        for &i in &to_render {
+            let opaque = &meshes[i].opaque_gpu;
+            let n = opaque.len() / std::mem::size_of::<PackedQuadGpu>();
+            bytes.extend_from_slice(opaque);
+            let o = origins[i];
+            origin_data.extend(std::iter::repeat_n([o[0], o[1], o[2], 0.0], n));
         }
         let quad_count = bytes.len() / std::mem::size_of::<PackedQuadGpu>();
         if quad_count > prepass.quad_capacity {
             prepass.quad_buffer = make_quad_buffer(&self.device, quad_count);
+            prepass.origins_buffer = make_origins_buffer(&self.device, quad_count);
             prepass.quad_capacity = quad_count;
             prepass.bind_group = Self::make_bind_group(
                 &self.device,
@@ -480,24 +556,31 @@ impl Renderer {
                 &prepass.camera_buffer,
                 &prepass.quad_buffer,
                 &prepass.visbuf,
+                &prepass.origins_buffer,
             );
         }
         if quad_count > 0 {
             self.queue.write_buffer(&prepass.quad_buffer, 0, &bytes);
+            self.queue.write_buffer(
+                &prepass.origins_buffer,
+                0,
+                bytemuck::cast_slice(&origin_data),
+            );
         }
-        let clear: Vec<u64> = vec![VisBufEntry(0).raw(); prepass.visbuf_pixels as usize];
-        self.queue
-            .write_buffer(&prepass.visbuf, 0, bytemuck::cast_slice(&clear));
         self.queue
             .write_buffer(&prepass.camera_buffer, 0, bytemuck::bytes_of(camera));
 
         // Single encoder: pre-pass writes visbuf, resolve reads it (WebGPU
-        // inserts the storage barrier between the two passes).
+        // inserts the storage barrier between the two passes). The visbuf is
+        // cleared GPU-side below (no per-frame CPU allocation / PCIe upload of the
+        // full framebuffer-sized buffer); the buffer carries COPY_DST.
         let mut encoder = self
             .device
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("strata_frame"),
             });
+
+        encoder.clear_buffer(&prepass.visbuf, 0, None);
 
         {
             let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -548,6 +631,281 @@ impl Renderer {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Upload a pre-flattened opaque-quad batch (and its parallel per-quad world
+    /// origins) into the GPU SSBOs, growing/rebinding the buffers if needed. No
+    /// camera or visbuf clear is touched — callers drive those separately so the
+    /// renderer can cache the buffer across frames and only re-upload on change.
+    ///
+    /// `origins` must be parallel to `bytes` (`quad_count` entries of `[f32;4]`,
+    /// `.xyz` = sector world offset).
+    /// Grow the quad + origins SSBOs to hold at least `needed` quads, rebuilding
+    /// the bind group. Call before [`Renderer::upload_quad_region`] when the
+    /// per-sector slot allocator needs more room; growing invalidates existing
+    /// slot contents, so the caller must re-upload all live sectors afterwards.
+    pub fn ensure_quad_capacity(&mut self, needed: u32) {
+        let needed = needed as usize;
+        let old_cap = self.prepass.as_ref().map(|p| p.quad_capacity).unwrap_or(0);
+        if needed <= old_cap {
+            return;
+        }
+        self.ensure_prepass();
+        let prepass = self.prepass.as_mut().unwrap();
+        let new_cap = needed.max(old_cap * 2).max(1);
+
+        let new_quad_buffer = make_quad_buffer(&self.device, new_cap);
+        let new_origins_buffer = make_origins_buffer(&self.device, new_cap);
+
+        if old_cap > 0 {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("strata_grow_copy"),
+                });
+            encoder.copy_buffer_to_buffer(
+                &prepass.quad_buffer,
+                0,
+                &new_quad_buffer,
+                0,
+                (old_cap as u64) * 8,
+            );
+            encoder.copy_buffer_to_buffer(
+                &prepass.origins_buffer,
+                0,
+                &new_origins_buffer,
+                0,
+                (old_cap as u64) * std::mem::size_of::<[f32; 4]>() as u64,
+            );
+            self.queue.submit(std::iter::once(encoder.finish()));
+        }
+
+        prepass.quad_buffer = new_quad_buffer;
+        prepass.origins_buffer = new_origins_buffer;
+        prepass.quad_capacity = new_cap;
+        // Staging vecs mirror the SSBO capacity so `upload_quad_region` can stage
+        // each sector at its own offset; grow them in lockstep with the buffers.
+        self.quad_upload_staging.resize((new_cap as usize) * 8, 0);
+        self.origin_upload_staging
+            .resize(new_cap as usize, [0.0; 4]);
+        prepass.bind_group = Self::make_bind_group(
+            &self.device,
+            &prepass.bgl,
+            &prepass.camera_buffer,
+            &prepass.quad_buffer,
+            &prepass.visbuf,
+            &prepass.origins_buffer,
+        );
+    }
+
+    /// Upload one sector's quads into the SSBO at quad offset `base`. Called by the
+    /// client's per-sector slot allocator so only changed/new sectors are written,
+    /// never the whole visible set.
+    pub fn upload_quad_region(&mut self, base: u32, bytes: &[u8], origins: &[[f32; 4]]) {
+        self.ensure_prepass();
+        let n = bytes.len() / 8;
+        if n == 0 {
+            return;
+        }
+        // Stage each sector at its OWN SSBO offset inside a shared scratch vec, so
+        // the whole batch becomes ONE `write_buffer` per buffer (quad + origins)
+        // instead of 2 calls per sector (~686 submissions for a 343-sector burst).
+        // The scratch is sized to the full SSBO quad capacity so offsets line up
+        // 1:1 with the destination buffer; it is reused (not reallocated) across
+        // frames.
+        let quad_off = (base as usize) * 8;
+        // `origin_upload_staging` is a float vec with ONE `[f32;4]` entry per quad,
+        // indexed by quad number (same as `base`). So the staging index is just
+        // `base`, and the slice length is `origins.len()` quads — both in quad
+        // units, matching the SSBO's `base` quad offset. The SSBO byte offset in
+        // `flush` is `o_start * 16` (4 floats × 4 bytes).
+        let origin_idx = base as usize;
+        let origin_len = origins.len();
+        debug_assert!(self.quad_upload_staging.len() >= quad_off + n * 8);
+        debug_assert!(self.origin_upload_staging.len() >= origin_idx + origin_len);
+        self.quad_upload_staging[quad_off..quad_off + n * 8].copy_from_slice(&bytes[..n * 8]);
+        self.origin_upload_staging[origin_idx..origin_idx + origin_len].copy_from_slice(origins);
+        // Track the minimal written range so `flush` copies only what changed,
+        // not the entire SSBO-sized staging vec.
+        let q_end = quad_off + n * 8;
+        let o_end = origin_idx + origin_len;
+        self.upload_range_quad = Some(match self.upload_range_quad {
+            Some((s, e)) => (s.min(quad_off), e.max(q_end)),
+            None => (quad_off, q_end),
+        });
+        self.upload_range_origin = Some(match self.upload_range_origin {
+            Some((s, e)) => (s.min(origin_idx), e.max(o_end)),
+            None => (origin_idx, o_end),
+        });
+        self.pending_upload = true;
+    }
+
+    /// Flush all queued `upload_quad_region` calls as ONE `write_buffer` per
+    /// buffer (quad + origins) — each sector was staged at its own SSBO offset
+    /// inside the shared staging vec, so only the written range is copied (not
+    /// the full SSBO-sized vec). This turns the 343-sector burst from ~686
+    /// queue submissions into 2, and keeps each flush to the changed bytes only.
+    pub fn flush_quad_uploads(&mut self) {
+        if !self.pending_upload {
+            return;
+        }
+        self.ensure_prepass();
+        let prepass = self.prepass.as_ref().unwrap();
+        if let Some((q_start, q_end)) = self.upload_range_quad {
+            self.queue.write_buffer(
+                &prepass.quad_buffer,
+                q_start as u64,
+                &self.quad_upload_staging[q_start..q_end],
+            );
+        }
+        if let Some((o_start, o_end)) = self.upload_range_origin {
+            // `o_start`/`o_end` are quad (float) indices; the SSBO byte offset is
+            // `o_start * 16` (4 floats × 4 bytes).
+            self.queue.write_buffer(
+                &prepass.origins_buffer,
+                (o_start * 16) as u64,
+                bytemuck::cast_slice(&self.origin_upload_staging[o_start..o_end]),
+            );
+        }
+        self.pending_upload = false;
+        self.upload_range_quad = None;
+        self.upload_range_origin = None;
+    }
+
+    /// Upload the camera uniform (cheap; call once per frame).
+    pub fn set_camera(&mut self, camera: &CameraView) {
+        self.ensure_prepass();
+        let prepass = match self.prepass.as_mut() {
+            Some(p) => p,
+            None => return,
+        };
+        self.queue
+            .write_buffer(&prepass.camera_buffer, 0, bytemuck::bytes_of(camera));
+    }
+
+    /// Re-upload the resolve params so a debug-faces toggle is live. Only call
+    /// when `debug_faces` actually changed (it is otherwise constant across
+    /// frames), so the per-frame path never re-writes 32 static bytes.
+    pub fn set_debug_faces(&mut self, on: bool) {
+        if on == self.debug_faces {
+            return;
+        }
+        self.debug_faces = on;
+        self.ensure_prepass();
+        let prepass = match self.prepass.as_mut() {
+            Some(p) => p,
+            None => return,
+        };
+        self.queue.write_buffer(
+            &prepass.resolve_params,
+            0,
+            bytemuck::bytes_of(&ResolveParams {
+                debug_faces: self.debug_faces as u32,
+                ..ResolveParams::new(self.width, self.height)
+            }),
+        );
+    }
+
+    /// Clear the visibility buffer and run the depth pre-pass + color-resolve
+    /// passes, drawing the resident sectors. The `ranges` (base, count in quads)
+    /// are the per-sector SSBO slot spans produced by the client's slot
+    /// allocator. Because quads live in one shared SSBO and each quad carries its
+    /// own world origin (see `PREPASS_WGSL`), adjacent spans are merged into
+    /// contiguous runs and drawn with a single `draw` per run — collapsing the
+    /// handful-of-runs result into a few draw calls instead of one-per-sector
+    /// (the prior 343 draws/frame dominated `us_draw`). Call after
+    /// [`Renderer::upload_quad_region`] / [`Renderer::set_camera`].
+    /// Returns the number of draw calls issued (one per merged run) for stats.
+    pub fn draw_quad_ranges(&mut self, ranges: &[(u32, u32)]) -> usize {
+        let prepass = match self.prepass.as_mut() {
+            Some(p) => p,
+            None => return 0,
+        };
+
+        // Merge contiguous slot spans into a minimal set of runs so the GPU
+        // issues one draw per run, not one per sector. Spans are sorted by base;
+        // bit-adjacent spans (start == prev_end) fuse into one.
+        let mut sorted = ranges.to_vec();
+        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut runs: Vec<(u32, u32)> = Vec::with_capacity(sorted.len());
+        for &(base, count) in &sorted {
+            if count == 0 {
+                continue;
+            }
+            if let Some(last) = runs.last_mut() {
+                let prev_end = last.0 + last.1;
+                if base == prev_end {
+                    last.1 += count;
+                    continue;
+                }
+            }
+            runs.push((base, count));
+        }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("strata_frame"),
+            });
+
+        // Clear the visbuf GPU-side (no per-frame CPU allocation / PCIe upload of
+        // the full framebuffer-sized buffer); the visbuf carries COPY_DST.
+        encoder.clear_buffer(&prepass.visbuf, 0, None);
+
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("strata_prepass_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &prepass.dummy_color,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        }),
+                        store: StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&prepass.pipeline);
+            pass.set_bind_group(0, &prepass.bind_group, &[]);
+            for (base, count) in &runs {
+                if *count > 0 {
+                    pass.draw(0..6, *base..*base + *count);
+                }
+            }
+        }
+
+        {
+            let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("strata_resolve_pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &self.offscreen_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Color {
+                            r: 0.0,
+                            g: 0.0,
+                            b: 0.0,
+                            a: 1.0,
+                        }),
+                        store: StoreOp::Store,
+                    },
+                })],
+                ..Default::default()
+            });
+            pass.set_pipeline(&prepass.resolve_pipeline);
+            pass.set_bind_group(0, &prepass.resolve_bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        self.queue.submit(std::iter::once(encoder.finish()));
+        runs.len()
     }
 
     /// Copy the visibility buffer into the staging buffer, map it, and return
@@ -654,7 +1012,10 @@ impl Renderer {
         if width == self.width && height == self.height {
             return;
         }
-        assert!(width > 0 && height > 0, "offscreen target must be non-empty");
+        assert!(
+            width > 0 && height > 0,
+            "offscreen target must be non-empty"
+        );
         self.width = width;
         self.height = height;
 
@@ -674,7 +1035,9 @@ impl Renderer {
                 | TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        self.offscreen_view = self.offscreen.create_view(&TextureViewDescriptor::default());
+        self.offscreen_view = self
+            .offscreen
+            .create_view(&TextureViewDescriptor::default());
 
         self.bytes_per_row = (width * BYTES_PER_PIXEL).div_ceil(256) * 256;
         self.staging = self.device.create_buffer(&BufferDescriptor {
@@ -717,12 +1080,7 @@ impl Renderer {
                     resolve_target: None,
                     depth_slice: None,
                     ops: Operations {
-                        load: LoadOp::Clear(Color {
-                            r: 0.0,
-                            g: 0.0,
-                            b: 0.0,
-                            a: 1.0,
-                        }),
+                        load: LoadOp::Load,
                         store: StoreOp::Store,
                     },
                 })],
@@ -739,90 +1097,73 @@ impl Renderer {
     /// group samples our own `offscreen_view`, so it must be rebuilt whenever the
     /// offscreen texture is recreated (resize).
     fn build_blit(&self, surface_format: TextureFormat) -> Blit {
-        let layout = self.device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("strata_present_bgl"),
-            entries: &[
-                BindGroupLayoutEntry {
+        let layout = self
+            .device
+            .create_bind_group_layout(&BindGroupLayoutDescriptor {
+                label: Some("strata_present_bgl"),
+                entries: &[BindGroupLayoutEntry {
                     binding: 0,
                     visibility: ShaderStages::FRAGMENT,
                     ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
+                        sample_type: TextureSampleType::Float { filterable: false },
                         view_dimension: TextureViewDimension::D2,
                         multisampled: false,
                     },
                     count: None,
-                },
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+                }],
+            });
 
-        let pipeline_layout =
-            self.device
-                .create_pipeline_layout(&PipelineLayoutDescriptor {
-                    label: Some("strata_present_pl"),
-                    bind_group_layouts: &[&layout],
-                    push_constant_ranges: &[],
-                });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some("strata_present_pl"),
+                bind_group_layouts: &[&layout],
+                push_constant_ranges: &[],
+            });
 
         let module = self.device.create_shader_module(ShaderModuleDescriptor {
             label: Some("strata_present"),
             source: ShaderSource::Wgsl(BLIT_WGSL.into()),
         });
 
-        let pipeline = self.device.create_render_pipeline(&RenderPipelineDescriptor {
-            label: Some("strata_present_pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: VertexState {
-                module: &module,
-                entry_point: Some("vs"),
-                buffers: &[],
-                compilation_options: Default::default(),
-            },
-            fragment: Some(FragmentState {
-                module: &module,
-                entry_point: Some("fs"),
-                targets: &[Some(ColorTargetState {
-                    format: surface_format,
-                    blend: None,
-                    write_mask: ColorWrites::ALL,
-                })],
-                compilation_options: Default::default(),
-            }),
-            primitive: PrimitiveState {
-                topology: PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
-
-        let sampler = self.device.create_sampler(&SamplerDescriptor {
-            label: Some("strata_present_sampler"),
-            mag_filter: FilterMode::Linear,
-            min_filter: FilterMode::Linear,
-            ..Default::default()
-        });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("strata_present_pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: VertexState {
+                    module: &module,
+                    entry_point: Some("vs"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(FragmentState {
+                    module: &module,
+                    entry_point: Some("fs"),
+                    targets: &[Some(ColorTargetState {
+                        format: surface_format,
+                        blend: None,
+                        write_mask: ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
 
         let bind_group = self.device.create_bind_group(&BindGroupDescriptor {
             label: Some("strata_present_bg"),
             layout: &layout,
-            entries: &[
-                BindGroupEntry {
-                    binding: 0,
-                    resource: BindingResource::TextureView(&self.offscreen_view),
-                },
-                BindGroupEntry {
-                    binding: 1,
-                    resource: BindingResource::Sampler(&sampler),
-                },
-            ],
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::TextureView(&self.offscreen_view),
+            }],
         });
 
         Blit {
@@ -1099,7 +1440,7 @@ mod tests {
         let view = look_at_rh(eye, [17.0, 17.0, 17.0], [0.0, 1.0, 0.0]);
         let cam = CameraView::new(eye, view, proj, W, H);
 
-        renderer.render_frame(std::slice::from_ref(&mesh), &cam);
+        renderer.render_frame(std::slice::from_ref(&mesh), &[[0.0; 3]], &cam);
 
         let pixels = renderer.readback();
         let row_bytes = (W * BYTES_PER_PIXEL) as usize;
@@ -1131,6 +1472,107 @@ mod tests {
             non_sky > 0,
             "frame must contain geometry pixels distinct from the sky gradient \
                (terrain must be visible); non_sky={non_sky}, sky=({sky_r},{sky_g},{sky_b})"
+        );
+    }
+
+    /// Regression for the "every sector stacked at the world origin" bug: a
+    /// sector rendered with a non-zero world origin must rasterize at that WORLD
+    /// position, not at the sector-local 0..31 cube. Uses the same camera (aimed
+    /// at the local cube's world position, 17,17,17) for both origins and counts
+    /// rasterized visbuf fragments: with origin 0 the geometry is in view; with a
+    /// large origin it moves out of view. If `render_frame` ignored the origin
+    /// (the old bug) both counts would be equal and non-zero.
+    #[test]
+    fn test_render_frame_applies_sector_origin() {
+        let instance = Instance::new(&InstanceDescriptor {
+            backends: Backends::all(),
+            ..Default::default()
+        });
+
+        let adapter = match instance
+            .enumerate_adapters(Backends::all())
+            .into_iter()
+            .find(|a| a.features().contains(prepass_features()))
+        {
+            Some(a) => a,
+            None => {
+                eprintln!(
+                    "test_render_frame_applies_sector_origin IGNORED: no wgpu adapter with \
+                       SHADER_INT64 + SHADER_INT64_ATOMIC_MIN_MAX available"
+                );
+                return;
+            }
+        };
+
+        let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
+            label: Some("strata_origin_test_device"),
+            required_features: prepass_features(),
+            ..Default::default()
+        }))
+        .expect("request_device failed");
+
+        const W: u32 = 64;
+        const H: u32 = 64;
+        let mut renderer = Renderer::new(device, queue, W, H);
+
+        // 2x2x2 block at sector-local (16..18) in a sector whose world origin is
+        // (64,64,64) — i.e. real world center ~ (81,81,81).
+        let mut pool = GlobalBrickPool::new();
+        let mut palette = SectorPalette::new();
+        let mut map = XBrickMap::new(SectorCoord(2, 2, 2));
+        for dx in 0..2u32 {
+            for dy in 0..2u32 {
+                for dz in 0..2u32 {
+                    map.set_block(
+                        &mut pool,
+                        &mut palette,
+                        VoxelCoord::new(16 + dx, 16 + dy, 16 + dz),
+                        BlockId(1),
+                    );
+                }
+            }
+        }
+
+        let registry = load_block_registry();
+        let mesher = GreedyMesher::new(&registry);
+        let none_nv = NeighborView {
+            sector: None,
+            palette: None,
+            pool: &pool,
+        };
+        let neighbors = [none_nv; 6];
+        let mesh = mesher.mesh_sector(&map, &palette, &pool, &registry, &neighbors);
+        assert!(!mesh.opaque.is_empty(), "2x2x2 block must produce quads");
+
+        let aspect = W as f32 / H as f32;
+        let proj = perspective_rh_zo(std::f32::consts::FRAC_PI_4, aspect, 0.1, 200.0);
+
+        // Camera aimed at the sector-LOCAL cube position in world space (17,17,17).
+        let eye = [36.0f32, 36.0, 36.0];
+        let view = look_at_rh(eye, [17.0, 17.0, 17.0], [0.0, 1.0, 0.0]);
+        let cam = CameraView::new(eye, view, proj, W, H);
+
+        // Rasterized fragments = non-zero visbuf entries (unambiguous, no color heuristic).
+        let rasterized = |renderer: &Renderer| -> usize {
+            renderer.read_visbuf().iter().filter(|&&e| e != 0).count()
+        };
+
+        // origin (0,0,0): geometry sits at world 16..18, squarely in view.
+        renderer.render_frame(std::slice::from_ref(&mesh), &[[0.0; 3]], &cam);
+        let at_origin = rasterized(&renderer);
+        assert!(
+            at_origin > 0,
+            "control: geometry at origin 0 must be in view; at_origin={at_origin}"
+        );
+
+        // origin (64,64,64): the SAME camera now looks at empty space (geometry
+        // moved to world ~81, behind/out of view) — so far fewer fragments.
+        renderer.render_frame(std::slice::from_ref(&mesh), &[[64.0, 64.0, 64.0]], &cam);
+        let offset = rasterized(&renderer);
+        assert!(
+            offset < at_origin,
+            "geometry must move with its sector origin (was stacked at local 0..31); \
+               at_origin={at_origin}, offset={offset}"
         );
     }
 }

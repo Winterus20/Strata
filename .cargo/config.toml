@@ -1,10 +1,13 @@
-# Windows: use the bundled rust-lld (lld-link) for fast linking.
-# On stable Rust, `linker-features=+lld` is unstable, so we point the linker
-# directly at the rust-lld.exe shipped inside the toolchain's rustlib dir.
-# (rust-lld is not placed on PATH by default; `rustup component add llvm-tools`
-# installs it here.) Keep this path in sync with your active toolchain.
-[target.x86_64-pc-windows-msvc]
-linker = "C:\\Users\\Yigit\\.rustup\\toolchains\\stable-x86_64-pc-windows-msvc\\lib\\rustlib\\x86_64-pc-windows-msvc\\bin\\rust-lld.exe"
+# Windows fast linking (opt-in, disabled by default for portability).
+# `rust-lld` ships inside the toolchain but is NOT on PATH, and on stable Rust
+# there is no clean portable one-liner to select it. A hardcoded absolute path
+# to `rust-lld.exe` (the previous config) only worked on one machine/toolchain
+# and broke on CI and for other developers, so it is removed: the build now uses
+# the MSVC `link.exe` (always present with the `*-msvc` toolchain).
+#
+# To re-enable faster local linking, uncomment and point at YOUR toolchain path:
+# [target.x86_64-pc-windows-msvc]
+# linker = "C:\\Users\\<you>\\.rustup\\toolchains\\<toolchain>\\lib\\rustlib\\x86_64-pc-windows-msvc\\bin\\rust-lld.exe"
 
 # Linux (kept for reference; mold is faster than the default GNU linker):
 # [target.x86_64-unknown-linux-gnu]

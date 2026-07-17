@@ -65,33 +65,51 @@ impl BlockRegistry {
             .map(|i| self.id[i])
     }
 
+    /// Debug-only guard: a looked-up id must fall inside the registered range.
+    /// The SoA arrays are indexed by `BlockId.0`, so an unregistered id would
+    /// otherwise index out of bounds (panic) or read a neighbour's data.
+    #[inline]
+    fn debug_check(&self, id: BlockId) {
+        debug_assert!(
+            (id.0 as usize) < self.id.len(),
+            "BlockId {} out of range (registry has {} blocks)",
+            id.0,
+            self.id.len()
+        );
+    }
+
     /// Property flags for a block. Hot path.
     #[inline]
     pub fn flags(&self, id: BlockId) -> BlockFlags {
+        self.debug_check(id);
         self.flags[id.0 as usize]
     }
 
     /// Is the block a full solid (non-passable) cube?
     #[inline]
     pub fn is_solid(&self, id: BlockId) -> bool {
+        self.debug_check(id);
         self.solid[id.0 as usize]
     }
 
     /// Is the block transparent (face culling / light pass-through)?
     #[inline]
     pub fn is_transparent(&self, id: BlockId) -> bool {
+        self.debug_check(id);
         self.transparent[id.0 as usize]
     }
 
     /// Emitted light level 0..=15.
     #[inline]
     pub fn light_emission(&self, id: BlockId) -> u8 {
+        self.debug_check(id);
         self.light_emission[id.0 as usize]
     }
 
     /// Base RGB color used by meshing / vertex coloring.
     #[inline]
     pub fn base_color(&self, id: BlockId) -> [u8; 3] {
+        self.debug_check(id);
         self.base_color[id.0 as usize]
     }
 }
@@ -123,7 +141,10 @@ fn flags_from_strs(flags: &[String]) -> BlockFlags {
             "AIR" => BlockFlags::AIR,
             "LIGHT_SRC" => BlockFlags::LIGHT_SRC,
             "LIQUID" => BlockFlags::LIQUID,
-            _ => BlockFlags::empty(),
+            other => {
+                warn!("unknown block flag '{other}' ignored (typo in blocks.toml?)");
+                BlockFlags::empty()
+            }
         };
     }
     f
@@ -147,6 +168,16 @@ pub fn load_block_registry() -> BlockRegistry {
         reg.transparent.push(d.transparent);
         reg.light_emission.push(d.light_emission);
         reg.base_color.push(d.base_color);
+    }
+    // Invariant: SoA arrays are indexed by BlockId.0, so ids must be contiguous
+    // and ordered (id N stored at slot N). A gap or reorder in the TOML would
+    // make every accessor silently return a neighbouring block's data.
+    for (i, id) in reg.id.iter().enumerate() {
+        assert_eq!(
+            id.0 as usize, i,
+            "block id {} at slot {i}: ids must be 0, 1, 2, ... in order",
+            id.0
+        );
     }
     // Invariant: AIR is id 0 and is transparent + non-solid.
     assert_eq!(
@@ -185,10 +216,19 @@ impl crate::plugin::StrataPlugin for BlockRegistryPlugin {
 /// In the full constitution this resolves to `(block_type, variant)`, but the
 /// prototype stores only the block type (variant = 0). `get_or_insert` is the
 /// single chokepoint used by `XBrickMap::set_block`.
-#[derive(Debug, Clone, Default, Component)]
+#[derive(Debug, Clone, Component)]
 pub struct SectorPalette {
     entries: Vec<BlockId>,
     reverse: HashMap<BlockId, u8>,
+}
+
+impl Default for SectorPalette {
+    /// A default palette is a valid one: index 0 is AIR. The derived `Default`
+    /// would produce an empty `entries`, so `resolve(0)` (and every voxel read
+    /// on an untouched sector) would index out of bounds — always use `new()`.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SectorPalette {
@@ -215,11 +255,18 @@ impl SectorPalette {
 
     /// Find (or create) the local index for `block`. Returns the `u8` index that
     /// gets written into the XBrickMap. AIR always maps to 0.
+    ///
+    /// Fails fast if the sector ever exceeds 255 distinct block types (plan 05 §20:
+    /// no truncation, no LRU — silent corruption of `resolve` is unacceptable).
     #[inline]
     pub fn get_or_insert(&mut self, block: BlockId) -> u8 {
         if let Some(&idx) = self.reverse.get(&block) {
             return idx;
         }
+        assert!(
+            self.entries.len() < 256,
+            "SectorPalette full: >255 distinct block types in one 32³ sector (plan 05 §20)"
+        );
         let idx = self.entries.len() as u8;
         self.entries.push(block);
         self.reverse.insert(block, idx);
@@ -235,6 +282,10 @@ impl SectorPalette {
     /// Build a palette from a previously captured entry list (used by
     /// `CompressedChunkData::unpack`). Index 0 must be AIR.
     pub fn from_entries(entries: Vec<BlockId>) -> Self {
+        debug_assert!(
+            entries.first() == Some(&BlockId::AIR),
+            "SectorPalette index 0 must be AIR (corrupt snapshot / bad network data)"
+        );
         let reverse = entries
             .iter()
             .enumerate()

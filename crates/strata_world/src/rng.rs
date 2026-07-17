@@ -1,7 +1,8 @@
 //! Deterministic RNG for world generation (plan 11 §1 / 08 §1).
 //!
 //! `Pcg32` is the standard PCG32 permutation (cheap, well-distributed, 64-bit
-//! state) and `wyhash` is used as a finalizer/hash to derive a stable per-column
+//! state) and `hash64` is a splitmix64-style finalizer used to derive a stable
+//! per-column
 //! or per-sector seed from coordinates. Generation is therefore fully
 //! reproducible and chunk-independent: the same seed + `SectorCoord` always
 //! yields byte-identical output.
@@ -56,10 +57,12 @@ impl Pcg32 {
     }
 }
 
-/// wyhash finalizer (wangxor-style mix). Used as a deterministic hash to fold
-/// coordinate values into a seed; `x` is mixed against `seed`.
+/// Splitmix64-style finalizer used as a deterministic coordinate hash: `x` is
+/// mixed against `seed` to derive a stable per-column / per-sector value. NOTE:
+/// this is *not* the real wyhash (no 128-bit `wymum` fold); it only borrows
+/// wyhash's `P0` constant. Named `hash64` so the name does not imply wyhash.
 #[inline]
-pub fn wyhash(x: u64, seed: u64) -> u64 {
+pub fn hash64(x: u64, seed: u64) -> u64 {
     const P0: u64 = 0xa0_76_1d_64_78_bd_64_2f;
     let mut r = x.wrapping_add(seed);
     r = (r ^ (r >> 30)).wrapping_mul(P0);
@@ -92,8 +95,8 @@ mod tests {
     }
 
     #[test]
-    fn wyhash_is_stable() {
-        assert_eq!(wyhash(42, WORLD_SEED), wyhash(42, WORLD_SEED));
-        assert_ne!(wyhash(1, WORLD_SEED), wyhash(2, WORLD_SEED));
+    fn hash64_is_stable() {
+        assert_eq!(hash64(42, WORLD_SEED), hash64(42, WORLD_SEED));
+        assert_ne!(hash64(1, WORLD_SEED), hash64(2, WORLD_SEED));
     }
 }

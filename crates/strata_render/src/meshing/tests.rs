@@ -13,6 +13,24 @@ fn none_neighbors(pool: &GlobalBrickPool) -> [NeighborView<'_>; 6] {
     }; 6]
 }
 
+/// Build neighbor views with `idx` (0=+X..5=-Z) pointing at `nmap`, the rest
+/// unloaded. Used to exercise the cross-sector sampling path (AO at edges can
+/// push a *second* axis out of range, which previously overflowed).
+fn one_neighbor<'a>(
+    pool: &'a GlobalBrickPool,
+    nmap: &'a XBrickMap,
+    npal: &'a SectorPalette,
+    idx: usize,
+) -> [NeighborView<'a>; 6] {
+    let mut v = none_neighbors(pool);
+    v[idx] = NeighborView {
+        sector: Some(nmap),
+        palette: Some(npal),
+        pool,
+    };
+    v
+}
+
 #[test]
 fn packed_quad_round_trips() {
     let q = PackedQuad::new(
@@ -92,6 +110,102 @@ fn single_block_emits_six_quads() {
 }
 
 #[test]
+fn mesh_with_loaded_neighbor_does_not_panic() {
+    // Regression: AO sampling at a sector edge pushes a second axis out of range
+    // (depth sd==32 plus a tangent offset of -1/32). With a *loaded* neighbor the
+    // greedy mesher samples into the neighbour XBrickMap; the coord must be
+    // wrapped into 0..31 or `get_block` overflows (`brick_index` shift panic).
+    let reg = load_block_registry();
+    let stone = stone();
+    let mut pool = GlobalBrickPool::new();
+    let mut palette = SectorPalette::new();
+    let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+    for x in 0..32u32 {
+        for y in 0..32u32 {
+            for z in 0..32u32 {
+                map.set_block(&mut pool, &mut palette, VoxelCoord::new(x, y, z), stone);
+            }
+        }
+    }
+
+    // +X neighbour fully solid too, so the shared boundary faces cull.
+    let mut npool = GlobalBrickPool::new();
+    let mut npal = SectorPalette::new();
+    let mut nmap = XBrickMap::new(SectorCoord(1, 0, 0));
+    for x in 0..32u32 {
+        for y in 0..32u32 {
+            for z in 0..32u32 {
+                nmap.set_block(&mut npool, &mut npal, VoxelCoord::new(x, y, z), stone);
+            }
+        }
+    }
+
+    let mesher = GreedyMesher::new(&reg);
+    // Exercise every neighbour direction (each can be the "second oob axis" case).
+    for idx in 0..6 {
+        let views = one_neighbor(&pool, &nmap, &npal, idx);
+        let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &views);
+        // Boundary faces between two solid sectors are culled; the 6 outer
+        // faces facing the other (unloaded) neighbours are still emitted.
+        assert!(
+            mesh.total_quads() >= 5 && mesh.total_quads() <= 6,
+            "loaded +X neighbour: expected 5-6 boundary faces, got {}",
+            mesh.total_quads()
+        );
+    }
+}
+
+#[test]
+fn face_quad_sits_on_correct_boundary() {
+    // Regression: a +Y (top) face must sit on the +Y boundary of its voxel
+    // (y = bottom + 1), not at the voxel's bottom. A bug placed +d faces one
+    // voxel too low, hiding top faces behind the block body.
+    let reg = load_block_registry();
+    let stone = stone();
+    let mut pool = GlobalBrickPool::new();
+    let mut palette = SectorPalette::new();
+    let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+    map.set_block(&mut pool, &mut palette, VoxelCoord::new(5, 5, 5), stone);
+
+    let mesher = GreedyMesher::new(&reg);
+    let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &none_neighbors(&pool));
+
+    let get = |face: u8| -> &PackedQuad {
+        mesh.opaque
+            .iter()
+            .find(|q| q.face() as u8 == face)
+            .unwrap_or_else(|| panic!("missing face {face}"))
+    };
+
+    // The CPU packs the *owning voxel* (local 5), keeping the 5-bit position
+    // field from overflowing at the sector boundary (a +d plane would be 32).
+    // +d faces (even index) are advanced by one voxel in the vertex shader, so
+    // their true plane is `packed + 1`; -d faces (odd index) sit at the packed
+    // voxel. A block at local (5,5,5) therefore packs all faces at coordinate 5.
+    assert_eq!(
+        get(2).y(),
+        5,
+        "+Y owns voxel y=5 (shader places plane at 6)"
+    );
+    assert_eq!(get(2).x(), 5);
+    assert_eq!(get(2).z(), 5);
+
+    assert_eq!(get(3).y(), 5, "-Y owns voxel y=5 (plane at 5)");
+    assert_eq!(
+        get(0).x(),
+        5,
+        "+X owns voxel x=5 (shader places plane at 6)"
+    );
+    assert_eq!(get(1).x(), 5, "-X owns voxel x=5");
+    assert_eq!(
+        get(4).z(),
+        5,
+        "+Z owns voxel z=5 (shader places plane at 6)"
+    );
+    assert_eq!(get(5).z(), 5, "-Z owns voxel z=5");
+}
+
+#[test]
 fn fully_filled_sector_emits_no_quads() {
     let reg = load_block_registry();
     let stone = stone();
@@ -107,9 +221,14 @@ fn fully_filled_sector_emits_no_quads() {
     }
 
     let mesher = GreedyMesher::new(&reg);
-    // Neighbors unloaded => conservative solid => all internal faces culled.
+    // Unloaded neighbors are treated as AIR (not conservative-solid), so the 6
+    // outer boundary faces are emitted; all internal faces are still culled.
     let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &none_neighbors(&pool));
-    assert_eq!(mesh.total_quads(), 0, "a full sector has no exposed faces");
+    assert_eq!(
+        mesh.total_quads(),
+        6,
+        "a full sector exposes only its 6 boundary faces"
+    );
 }
 
 #[test]
@@ -129,9 +248,13 @@ fn greedy_merges_far_below_naive() {
     let mesher = GreedyMesher::new(&reg);
     let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &none_neighbors(&pool));
 
-    // Greedy collapses the 32x32 top surface into a single quad.
+    // With unloaded neighbors treated as AIR, the layer exposes: its 32x32 top
+    // surface (1 merged quad, +Y), its bottom (1), and its 4 side walls (1 each)
+    // = 6. Greedy must still collapse the top into a single quad.
+    let top = mesh.opaque.iter().filter(|q| q.face() as u8 == 2).count();
+    assert_eq!(top, 1, "flat top surface must merge to one quad");
+    assert_eq!(mesh.total_quads(), 6, "layer exposes top+bottom+4 sides");
     let naive = 6 * 32 * 32; // worst-case per-voxel face count
-    assert_eq!(mesh.total_quads(), 1, "flat layer merges to one quad");
     assert!(
         mesh.total_quads() * 1000 < naive,
         "greedy must be far below naive"
@@ -244,6 +367,20 @@ fn needs_remesh_system_meshes_and_clears() {
     app.world_mut().spawn((SectorCoord(1, 0, 0), nmap, npal));
 
     app.update();
+
+    // Meshing is async (background thread); drive the app until the spawned
+    // task finishes and `apply_mesh_tasks` stores the result.
+    for _ in 0..100 {
+        if app
+            .world()
+            .resource::<MeshStorage>()
+            .meshes
+            .contains_key(&SectorCoord(0, 0, 0))
+        {
+            break;
+        }
+        app.update();
+    }
 
     let storage = app.world().resource::<MeshStorage>();
     assert!(

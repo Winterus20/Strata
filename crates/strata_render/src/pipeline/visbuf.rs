@@ -5,9 +5,9 @@
 //! buffer from these values. All packing is branchless bit arithmetic so the same
 //! shifts can be mirrored verbatim in the shader.
 //!
-//! Bit layout (63 bits used, bit 36 reserved as a 1-bit gap):
+//! Bit layout (all 64 bits used, no reserved gap — plan 10 §1):
 //! * `bit[0:23]`   voxel_pos  (24 bits, 0 .. 2^24-1)
-//! * `bit[24:35]`  sector_id  (12 bits, 0 .. 2^12-1)
+//! * `bit[24:36]`  sector_id  (13 bits, 0 .. 2^13-1)
 //! * `bit[37:39]`  normal     (3 bits, 0 .. 7)
 //! * `bit[40:63]`  depth      (24 bits, reversed-Z; clear = max)
 
@@ -17,9 +17,9 @@ use crate::meshing::{MeshData, PackedQuad};
 
 /// `voxel_pos` occupies the low 24 bits.
 pub const VOXEL_POS_MASK: u64 = (1u64 << 24) - 1;
-/// `sector_id` occupies 12 bits starting at bit 24.
-pub const SECTOR_ID_MASK: u64 = (1u64 << 12) - 1;
-/// `normal` occupies 3 bits starting at bit 36.
+/// `sector_id` occupies 13 bits starting at bit 24 (plan 10 §1: 2^13 sectors).
+pub const SECTOR_ID_MASK: u64 = (1u64 << 13) - 1;
+/// `normal` occupies 3 bits starting at bit 37.
 pub const NORMAL_MASK: u64 = 0x7;
 /// `depth` occupies the high 24 bits starting at bit 40 (reversed-Z).
 pub const DEPTH_MASK: u64 = (1u64 << 24) - 1;
@@ -123,7 +123,7 @@ mod tests {
     use super::*;
 
     const MAX_VOXEL_POS: u32 = (1u32 << 24) - 1;
-    const MAX_SECTOR_ID: u32 = (1u32 << 12) - 1;
+    const MAX_SECTOR_ID: u32 = (1u32 << 13) - 1;
     const MAX_NORMAL: u8 = 0x7;
     const MAX_DEPTH: u32 = (1u32 << 24) - 1;
 
@@ -134,9 +134,8 @@ mod tests {
         assert_eq!(e.sector_id(), MAX_SECTOR_ID);
         assert_eq!(e.normal(), MAX_NORMAL);
         assert_eq!(e.depth(), MAX_DEPTH);
-        // Reserved bit 36 must stay clear (1-bit gap between sector_id and
-        // normal; depth ends at bit 63, so no other bits are reserved).
-        assert_eq!(e.raw() & (1u64 << 36), 0, "reserved bit 36 must be clear");
+        // sector_id is now 13 bits (24..=36) and normal starts at 37, so the
+        // packed max entry uses all 64 bits with no reserved gap.
     }
 
     #[test]

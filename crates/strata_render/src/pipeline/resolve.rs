@@ -25,7 +25,8 @@ pub const ZENITH: [f32; 4] = [0.18, 0.42, 0.92, 1.0];
 /// Offsets (std140-friendly, 16-byte aligned):
 /// * `0`  — `width`  : `u32`
 /// * `4`  — `height` : `u32`
-/// * `8`  — `_pad`   : `u32` x2
+/// * `8`  — `debug_faces`: `u32` (0 = normal Lambert shading, 1 = per-face-direction color)
+/// * `12` — `_pad`
 /// * `16` — `horizon`: `vec4<f32>`
 /// * `32` — `zenith` : `vec4<f32>`
 #[repr(C)]
@@ -33,7 +34,8 @@ pub const ZENITH: [f32; 4] = [0.18, 0.42, 0.92, 1.0];
 pub struct ResolveParams {
     pub width: u32,
     pub height: u32,
-    pub _pad: [u32; 2],
+    pub debug_faces: u32,
+    pub _pad: u32,
     pub horizon: [f32; 4],
     pub zenith: [f32; 4],
 }
@@ -45,7 +47,8 @@ impl ResolveParams {
         Self {
             width,
             height,
-            _pad: [0; 2],
+            debug_faces: 0,
+            _pad: 0,
             horizon: HORIZON,
             zenith: ZENITH,
         }
@@ -57,7 +60,7 @@ pub const RESOLVE_WGSL: &str = r#"
 struct ResolveParams {
   width: u32,
   height: u32,
-  _pad0: u32,
+  debug_faces: u32,
   _pad1: u32,
   horizon: vec4<f32>,
   zenith: vec4<f32>,
@@ -140,8 +143,23 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   let lit = albedo * (ambient + (1.0 - ambient) * lambert);
   let color = aces(lit);
 
+  // Debug face-direction coloring: each of the 6 face normals gets a distinct,
+  // recognizable color so missing/wrong faces are obvious. Branchless via the
+  // same normal array. +X red, -X orange, +Y green, -Y blue, +Z cyan, -Z magenta.
+  var face_colors = array<vec3<f32>, 6>(
+    vec3<f32>(1.0, 0.20, 0.15),
+    vec3<f32>(1.0, 0.55, 0.10),
+    vec3<f32>(0.25, 0.95, 0.30),
+    vec3<f32>(0.20, 0.45, 1.0),
+    vec3<f32>(0.15, 0.95, 0.95),
+    vec3<f32>(0.95, 0.30, 0.95)
+  );
+  let debug_color = face_colors[n_idx];
+  let dbg = params.debug_faces != 0u;
+  let out_color = select(color, debug_color, dbg);
+
   // Branchless blend: geometry where present, sky elsewhere.
-  let rgb = mix(color, sky, is_empty);
+  let rgb = mix(out_color, sky, is_empty);
   return vec4<f32>(rgb, 1.0);
 }
 "#;

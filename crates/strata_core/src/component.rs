@@ -40,13 +40,24 @@ pub struct ChunkDirty;
 #[component(storage = "SparseSet")]
 pub struct NeedsRemesh;
 
+/// Marker: sector mesh has been built and cached.
+#[derive(Debug, Component)]
+#[component(storage = "SparseSet")]
+pub struct Meshed;
+
 /// Marker: sector needs an SVDAG bake.
 #[derive(Debug, Component)]
 #[component(storage = "SparseSet")]
 pub struct NeedsBake;
 
+/// Marker for the entity whose `Transform` drives streaming (the local player
+/// or camera). The streaming system filters on this so an unrelated
+/// `Transform` entity (debug gizmo, prop) is never mistaken for the player.
+#[derive(Debug, Clone, Copy, Component)]
+pub struct StreamingAnchor;
+
 /// Diagnostic counter written by the filter-first demo system.
-#[derive(Debug, Resource, Default)]
+#[derive(Debug, Resource, Default, PartialEq)]
 pub struct DirtySectorCount(pub u32);
 
 /// Internal test component used to prove the change-detection guard.
@@ -62,5 +73,5 @@ pub fn count_dirty_sectors(
     dirty: Query<&SectorCoord, With<ChunkDirty>>,
     mut count: ResMut<DirtySectorCount>,
 ) {
-    count.0 = dirty.iter().count() as u32;
+    count.set_if_neq(DirtySectorCount(dirty.iter().count() as u32));
 }

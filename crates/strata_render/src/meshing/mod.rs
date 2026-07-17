@@ -17,14 +17,26 @@ pub use packed_quad::{FaceDir, PackedQuad, PackedVertex4};
 use bevy::prelude::*;
 use strata_core::prelude::*;
 
+use crate::pipeline::cull::Aabb;
+
 /// Mesh output: separate opaque / transparent quad batches (plan 05 §18, 09 §3).
 ///
 /// The `Vec<PackedQuad>` buffers are *result* buffers (per-sector live voxel
 /// data never lives in a `Vec` — that ban is about storage, not outputs).
+///
+/// `opaque_gpu`/`transparent_gpu` are the pre-flattened packed-vertex byte
+/// buffers (computed on the worker thread so the render frame only clones them),
+/// and `aabb` is the precomputed sector-local bounding box for frustum culling.
+/// `generation` is bumped by `MeshStorage` so the renderer can tell when a
+/// cached sector's GPU buffer must be rebuilt (plan 09 §3, incremental upload).
 #[derive(Debug, Clone, Default)]
 pub struct MeshData {
     pub opaque: Vec<PackedQuad>,
     pub transparent: Vec<PackedQuad>,
+    pub opaque_gpu: Vec<u8>,
+    pub transparent_gpu: Vec<u8>,
+    pub aabb: Aabb,
+    pub generation: u64,
 }
 
 impl MeshData {

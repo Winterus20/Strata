@@ -25,6 +25,23 @@ impl Aabb {
         }
     }
 
+    /// Translate the box by `offset` (world-space sector origin). Used to lift a
+    /// sector-local mesh AABB into world space before frustum culling.
+    pub fn translated(&self, offset: [f32; 3]) -> Aabb {
+        Aabb {
+            min: [
+                self.min[0] + offset[0],
+                self.min[1] + offset[1],
+                self.min[2] + offset[2],
+            ],
+            max: [
+                self.max[0] + offset[0],
+                self.max[1] + offset[1],
+                self.max[2] + offset[2],
+            ],
+        }
+    }
+
     /// Merge `other` into this box (union). Used to fold a mesh's quads.
     pub fn union(&self, other: &Aabb) -> Aabb {
         Aabb {

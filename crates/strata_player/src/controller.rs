@@ -14,9 +14,13 @@ use strata_core::prelude::*;
 use crate::input::PlayerInput;
 
 /// Half the player capsule height in world units (feet sit at `center.y - HALF`).
+/// The body is therefore `2 * PLAYER_HALF_HEIGHT` = 2 blocks tall (matches the
+/// Rapier `capsule_y(0.5, 0.5)` collider).
 pub const PLAYER_HALF_HEIGHT: f32 = 1.0;
-/// Eye height above the player's center.
-pub const EYE_HEIGHT: f32 = 1.6;
+/// Eye height above the player's center. Equal to `PLAYER_HALF_HEIGHT` so the
+/// eye sits at the top of the 2-block body — i.e. eye-above-feet == body height
+/// (both 2 blocks).
+pub const EYE_HEIGHT: f32 = PLAYER_HALF_HEIGHT;
 /// Horizontal half-extent used for block-placement overlap rejection.
 pub const PLAYER_RADIUS: f32 = 0.3;
 
@@ -67,19 +71,134 @@ pub struct PlayerStepResult {
     pub vy: f32,
 }
 
+/// Small skin so the resolved AABB rests just outside the blocking voxel face
+/// (avoids re-colliding on the next frame from floating-point exactness).
+const COLLIDE_SKIN: f32 = 1.0e-3;
+/// How far below the feet the ground probe looks when deciding `grounded`.
+const GROUND_PROBE: f32 = 0.05;
+
+/// The player's axis-aligned bounding box for a given capsule *center*.
+#[inline]
+fn player_aabb(center: Vec3) -> (Vec3, Vec3) {
+    let half = Vec3::new(PLAYER_RADIUS, PLAYER_HALF_HEIGHT, PLAYER_RADIUS);
+    (center - half, center + half)
+}
+
+/// Inclusive integer voxel range spanned by `[min, max)` on one axis. The tiny
+/// `COLLIDE_SKIN` bias keeps an AABB that merely *touches* a voxel face (max on an
+/// integer boundary) from spuriously counting that neighbouring voxel.
+#[inline]
+fn voxel_span(min: f32, max: f32) -> (i64, i64) {
+    (min.floor() as i64, (max - COLLIDE_SKIN).floor() as i64)
+}
+
+/// Does the player AABB centered at `center` overlap any solid voxel?
+fn aabb_hits_solid(is_solid: &impl Fn(i64, i64, i64) -> bool, center: Vec3) -> bool {
+    let (min, max) = player_aabb(center);
+    let (x0, x1) = voxel_span(min.x, max.x);
+    let (y0, y1) = voxel_span(min.y, max.y);
+    let (z0, z1) = voxel_span(min.z, max.z);
+    for vx in x0..=x1 {
+        for vy in y0..=y1 {
+            for vz in z0..=z1 {
+                if is_solid(vx, vy, vz) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Move the capsule center along a single axis by `delta`, resolving voxel
+/// collisions by snapping the AABB to the blocking face. Returns the new center
+/// and whether a collision stopped the motion on that axis.
+///
+/// `axis`: 0 = X, 1 = Y, 2 = Z.
+fn move_axis(
+    is_solid: &impl Fn(i64, i64, i64) -> bool,
+    center: Vec3,
+    axis: usize,
+    delta: f32,
+) -> (Vec3, bool) {
+    if delta == 0.0 {
+        return (center, false);
+    }
+    let mut moved = center;
+    moved[axis] += delta;
+    if !aabb_hits_solid(is_solid, moved) {
+        return (moved, false);
+    }
+
+    // Collision: snap to the face of the nearest blocking voxel along this axis.
+    let (min, max) = player_aabb(moved);
+    let (x0, x1) = voxel_span(min.x, max.x);
+    let (y0, y1) = voxel_span(min.y, max.y);
+    let (z0, z1) = voxel_span(min.z, max.z);
+    let half = if axis == 1 {
+        PLAYER_HALF_HEIGHT
+    } else {
+        PLAYER_RADIUS
+    };
+
+    let mut snapped = moved[axis];
+    let mut hit = false;
+    for vx in x0..=x1 {
+        for vy in y0..=y1 {
+            for vz in z0..=z1 {
+                if !is_solid(vx, vy, vz) {
+                    continue;
+                }
+                hit = true;
+                let cell = [vx, vy, vz][axis] as f32;
+                if delta > 0.0 {
+                    // Moving +: rest the AABB max face against the voxel's min face.
+                    snapped = snapped.min(cell - half - COLLIDE_SKIN);
+                } else {
+                    // Moving -: rest the AABB min face against the voxel's max face.
+                    snapped = snapped.max(cell + 1.0 + half + COLLIDE_SKIN);
+                }
+            }
+        }
+    }
+    if hit {
+        moved[axis] = snapped;
+    }
+    (moved, hit)
+}
+
+/// Is a solid voxel directly beneath the feet (within `GROUND_PROBE`)?
+fn grounded_below(is_solid: &impl Fn(i64, i64, i64) -> bool, center: Vec3) -> bool {
+    let (min, max) = player_aabb(center);
+    let (x0, x1) = voxel_span(min.x, max.x);
+    let (z0, z1) = voxel_span(min.z, max.z);
+    let fy = (min.y - GROUND_PROBE).floor() as i64;
+    for vx in x0..=x1 {
+        for vz in z0..=z1 {
+            if is_solid(vx, fy, vz) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Integrate one movement step. Pure: no ECS access, fully unit-testable.
 ///
-/// * Grounded: horizontal wish-dir from yaw + gravity + jump, then a `ground_below`
-///   snap so the player rests on the voxel surface.
-/// * Flying: free 3D movement along the look direction, gravity disabled.
+/// `is_solid(wx, wy, wz)` reports whether the world-space voxel at integer
+/// coordinates is solid; the caller wires this to (possibly several) sector
+/// `XBrickMap`s so collision works seamlessly across sector boundaries.
+///
+/// * Grounded: horizontal wish-dir from yaw + gravity + jump, with full
+///   axis-separated AABB collision (walls, floors, ceilings).
+/// * Flying: free 3D movement along the look direction, gravity/collision off.
 #[allow(clippy::too_many_arguments)]
 pub fn integrate_player(
     ctrl: &PlayerController,
     state: &PlayerState,
     input: &PlayerInput,
     look: &PlayerLook,
-    xbrick: &XBrickMap,
-    pool: &GlobalBrickPool,
+    is_solid: impl Fn(i64, i64, i64) -> bool,
     position: Vec3,
     dt: f32,
 ) -> PlayerStepResult {
@@ -94,15 +213,8 @@ pub fn integrate_player(
         speed *= ctrl.sneak_mul;
     }
 
-    let wish_horizontal = (forward * input.move_z + right * input.move_x).normalize_or_zero();
-
-    let feet_current = position - Vec3::new(0.0, PLAYER_HALF_HEIGHT, 0.0);
-    let grounded_now = is_grounded(xbrick, pool, feet_current);
-
-    let mut vy = state.vy;
-    let delta;
-
     if state.flying {
+        // Noclip-style free flight: no gravity, no collision.
         let pitch = look.pitch;
         let dir3 = Vec3::new(
             -pitch.cos() * look.yaw.sin(),
@@ -113,84 +225,60 @@ pub fn integrate_player(
         if input.jump {
             move3.y += 1.0;
         }
-        delta = move3.normalize_or_zero() * ctrl.fly_speed * dt;
+        let delta = move3.normalize_or_zero() * ctrl.fly_speed * dt;
+        return PlayerStepResult {
+            new_position: position + delta,
+            grounded: false,
+            vy: 0.0,
+        };
+    }
+
+    let grounded_now = grounded_below(&is_solid, position);
+
+    // Vertical velocity: gravity, then jump (only from the ground).
+    let mut vy = state.vy - ctrl.gravity * dt;
+    if grounded_now && vy < 0.0 {
         vy = 0.0;
-    } else {
-        // Horizontal displacement.
-        let horiz = wish_horizontal * speed * dt;
-        // Vertical: gravity + jump (jump is only allowed when already grounded).
-        vy -= ctrl.gravity * dt;
-        if input.jump && grounded_now {
-            vy = ctrl.jump_speed;
-        }
-        // Resting on the ground: don't accumulate downward velocity.
-        if grounded_now && vy < 0.0 {
-            vy = 0.0;
-        }
-        delta = Vec3::new(horiz.x, vy * dt, horiz.z);
+    }
+    if input.jump && grounded_now {
+        vy = ctrl.jump_speed;
     }
 
-    let mut new_position = position + delta;
+    let horiz = (forward * input.move_z + right * input.move_x).normalize_or_zero() * speed * dt;
 
-    // Ground snap: if grounded and the step would sink the feet below the current
-    // surface, clamp vertically so the player rests on top of the supporting voxel.
-    if !state.flying && grounded_now {
-        let new_feet = new_position - Vec3::new(0.0, PLAYER_HALF_HEIGHT, 0.0);
-        if new_feet.y < feet_current.y {
-            new_position.y = position.y;
-            vy = 0.0;
-        }
+    // Axis-separated sweep: resolve X, then Z, then Y independently so the player
+    // slides along walls instead of sticking, and lands cleanly on floors.
+    let mut pos = position;
+    let (p, _) = move_axis(&is_solid, pos, 0, horiz.x);
+    pos = p;
+    let (p, _) = move_axis(&is_solid, pos, 2, horiz.z);
+    pos = p;
+    let (p, hit_y) = move_axis(&is_solid, pos, 1, vy * dt);
+    pos = p;
+
+    // A vertical collision cancels vertical velocity (floor or ceiling).
+    if hit_y {
+        vy = 0.0;
     }
 
-    let grounded = if state.flying {
-        false
-    } else {
-        let new_feet = new_position - Vec3::new(0.0, PLAYER_HALF_HEIGHT, 0.0);
-        is_grounded(xbrick, pool, new_feet)
-    };
+    let grounded = grounded_below(&is_solid, pos);
 
     PlayerStepResult {
-        new_position,
+        new_position: pos,
         grounded,
         vy,
     }
-}
-
-/// Grounded test: the feet voxel (or the voxel directly below it) is solid.
-/// Extends physics' `ground_below` to also catch the frame where gravity has
-/// pushed the feet slightly into the supporting voxel.
-fn is_grounded(xbrick: &XBrickMap, pool: &GlobalBrickPool, feet: Vec3) -> bool {
-    let wx = feet.x.floor() as i64;
-    let wy = feet.y.floor() as i64;
-    let wz = feet.z.floor() as i64;
-    let ox = xbrick.coord.0 as i64 * 32;
-    let oz = xbrick.coord.2 as i64 * 32;
-    let lx = wx - ox;
-    let lz = wz - oz;
-    if !(0..32).contains(&lx) || !(0..32).contains(&lz) {
-        return false;
-    }
-    if (0..32).contains(&wy)
-        && xbrick.is_occupied(pool, VoxelCoord::new(lx as u32, wy as u32, lz as u32))
-    {
-        return true;
-    }
-    let wyb = wy - 1;
-    if (0..32).contains(&wyb)
-        && xbrick.is_occupied(pool, VoxelCoord::new(lx as u32, wyb as u32, lz as u32))
-    {
-        return true;
-    }
-    false
 }
 
 /// ECS system: apply [`integrate_player`] to the player entity and write back the
 /// new `Transform` with a change-detection guard on [`PlayerState`].
 #[allow(clippy::type_complexity)]
 pub fn player_controller_system(
+    time: Res<Time<Fixed>>,
     input: Res<PlayerInput>,
     pool: Res<GlobalBrickPool>,
-    sectors: Query<(&SectorCoord, &XBrickMap)>,
+    registry: Res<BlockRegistry>,
+    sectors: Query<(&SectorCoord, &XBrickMap, &SectorPalette)>,
     mut player: Query<(
         &mut Transform,
         &PlayerController,
@@ -198,32 +286,70 @@ pub fn player_controller_system(
         &PlayerLook,
     )>,
 ) {
-    for (mut tf, ctrl, mut st, look) in &mut player {
-        let feet = tf.translation - Vec3::new(0.0, PLAYER_HALF_HEIGHT, 0.0);
-        let sc = SectorCoord(
-            (feet.x / 32.0).floor() as i32,
-            (feet.y / 32.0).floor() as i32,
-            (feet.z / 32.0).floor() as i32,
-        );
-        let xbrick = sectors.iter().find(|(c, _)| **c == sc).map(|(_, m)| m);
+    // Index the loaded sectors so the collision probe can look up any world-space
+    // voxel, including across sector boundaries (the player straddles up to two
+    // sectors per axis). Unloaded sectors report empty => never block.
+    let sector_index: std::collections::HashMap<SectorCoord, (&XBrickMap, &SectorPalette)> =
+        sectors.iter().map(|(c, m, p)| (*c, (m, p))).collect();
 
-        let result = match xbrick {
-            Some(m) => integrate_player(
-                ctrl,
-                &st,
-                &input,
-                look,
-                m,
-                &pool,
-                tf.translation,
-                1.0 / 60.0,
-            ),
-            None => PlayerStepResult {
-                new_position: tf.translation,
-                grounded: false,
-                vy: st.vy,
-            },
-        };
+    // Collision is against *solid* blocks only — liquids (water) and other
+    // non-solid voxels must not stop the player, otherwise it stands on the sea
+    // surface everywhere (a single flat Y level) and never touches real terrain.
+    let is_solid = |wx: i64, wy: i64, wz: i64| -> bool {
+        let sc = SectorCoord(
+            wx.div_euclid(32) as i32,
+            wy.div_euclid(32) as i32,
+            wz.div_euclid(32) as i32,
+        );
+        match sector_index.get(&sc) {
+            Some((m, palette)) => {
+                let lx = wx.rem_euclid(32) as u32;
+                let ly = wy.rem_euclid(32) as u32;
+                let lz = wz.rem_euclid(32) as u32;
+                let id = m.get_block(&pool, palette, VoxelCoord::new(lx, ly, lz));
+                id != BlockId::AIR && registry.is_solid(id)
+            }
+            None => false,
+        }
+    };
+
+    for (mut tf, ctrl, mut st, look) in &mut player {
+        // Don't free-fall through terrain that hasn't streamed in yet. On spawn
+        // (and during heavy initial load) the sector under the player may not be
+        // generated for several frames; falling meanwhile would drop the player
+        // below the surface and bury it once the sector finally loads. While the
+        // ground sector (just below the feet) is not resident, hold position and
+        // resume the moment it appears — so the player always lands on the
+        // surface. Flying ignores this (no gravity / no ground needed).
+        if !st.flying {
+            let feet_y = tf.translation.y - PLAYER_HALF_HEIGHT;
+            let ground_sec = SectorCoord(
+                (tf.translation.x / 32.0).floor() as i32,
+                ((feet_y - 1.0) / 32.0).floor() as i32,
+                (tf.translation.z / 32.0).floor() as i32,
+            );
+            if !sector_index.contains_key(&ground_sec) {
+                st.set_if_neq(PlayerState {
+                    grounded: false,
+                    flying: st.flying,
+                    vy: 0.0,
+                });
+                continue;
+            }
+        }
+
+        let result = integrate_player(
+            ctrl,
+            &st,
+            &input,
+            look,
+            &is_solid,
+            tf.translation,
+            // Fixed timestep (default 64 Hz): movement is framerate-independent
+            // and deterministic (plan 14 §D3), so tunneling/jitter that a
+            // variable render dt would cause is avoided.
+            time.delta_secs(),
+        );
 
         tf.translation = result.new_position;
         st.set_if_neq(PlayerState {
@@ -258,24 +384,80 @@ mod tests {
         (map, pool, palette)
     }
 
+    /// Build a world-space occupancy probe from a single sector `XBrickMap`
+    /// (mirrors the cross-sector closure used by `player_controller_system`).
+    fn world_solid<'a>(
+        map: &'a XBrickMap,
+        pool: &'a GlobalBrickPool,
+    ) -> impl Fn(i64, i64, i64) -> bool + 'a {
+        let ox = map.coord.0 as i64 * 32;
+        let oy = map.coord.1 as i64 * 32;
+        let oz = map.coord.2 as i64 * 32;
+        move |wx, wy, wz| {
+            let lx = wx - ox;
+            let ly = wy - oy;
+            let lz = wz - oz;
+            if (0..32).contains(&lx) && (0..32).contains(&ly) && (0..32).contains(&lz) {
+                map.is_occupied(pool, VoxelCoord::new(lx as u32, ly as u32, lz as u32))
+            } else {
+                false
+            }
+        }
+    }
+
     #[test]
     fn grounded_true_when_floor_below() {
         let (map, pool, _) = floor_sector();
         let ctrl = PlayerController::default();
         let state = PlayerState::default();
         let look = PlayerLook::default();
+        // Feet rest on the top face of the floor voxel (y=1): center at y=2.
         let o = sector_world_origin(SectorCoord(0, 0, 0)) + Vec3::new(5.0, 2.0, 5.0);
         let r = integrate_player(
             &ctrl,
             &state,
             &PlayerInput::default(),
             &look,
-            &map,
-            &pool,
+            world_solid(&map, &pool),
             o,
             1.0 / 60.0,
         );
         assert!(r.grounded, "player should be grounded on the floor");
+    }
+
+    #[test]
+    fn grounded_true_in_nonzero_y_sector() {
+        // A floor in a sector with coord.1 != 0 must still register as ground.
+        let mut pool = GlobalBrickPool::new();
+        let mut palette = SectorPalette::new();
+        let mut map = XBrickMap::new(SectorCoord(0, 1, 0));
+        for x in 0..32u32 {
+            for z in 0..32u32 {
+                map.set_block(
+                    &mut pool,
+                    &mut palette,
+                    VoxelCoord::new(x, 0, z),
+                    BlockId(1),
+                );
+            }
+        }
+        let ctrl = PlayerController::default();
+        let state = PlayerState::default();
+        let look = PlayerLook::default();
+        let o = sector_world_origin(SectorCoord(0, 1, 0)) + Vec3::new(5.0, 2.0, 5.0);
+        let r = integrate_player(
+            &ctrl,
+            &state,
+            &PlayerInput::default(),
+            &look,
+            world_solid(&map, &pool),
+            o,
+            1.0 / 60.0,
+        );
+        assert!(
+            r.grounded,
+            "player must be grounded on a floor in a Y=1 sector"
+        );
     }
 
     #[test]
@@ -292,8 +474,7 @@ mod tests {
             &state,
             &PlayerInput::default(),
             &look,
-            &map,
-            &pool,
+            world_solid(&map, &pool),
             o,
             1.0 / 60.0,
         );
@@ -311,12 +492,118 @@ mod tests {
             vy: 0.0,
         };
         let look = PlayerLook::default();
-        let o = sector_world_origin(SectorCoord(0, 0, 0)) + Vec3::new(5.0, 1.0, 5.0);
+        // Resting on top of the floor (feet at y=1, center at y=2).
+        let o = sector_world_origin(SectorCoord(0, 0, 0)) + Vec3::new(5.0, 2.0, 5.0);
         let jump = PlayerInput {
             jump: true,
             ..Default::default()
         };
-        let r = integrate_player(&ctrl, &state, &jump, &look, &map, &pool, o, 1.0 / 60.0);
+        let r = integrate_player(
+            &ctrl,
+            &state,
+            &jump,
+            &look,
+            world_solid(&map, &pool),
+            o,
+            1.0 / 60.0,
+        );
         assert!(r.vy > 0.0, "jump should impart upward velocity");
+        assert!(
+            r.new_position.y > o.y,
+            "jump should lift the player this frame"
+        );
+    }
+
+    #[test]
+    fn falls_and_rests_on_floor_surface() {
+        // Drop the player from mid-air and integrate many frames; it must settle
+        // resting exactly on top of the floor voxel (feet.y == 1) instead of
+        // bouncing at a single level or sinking through.
+        let (map, pool, _) = floor_sector();
+        let is_solid = world_solid(&map, &pool);
+        let ctrl = PlayerController::default();
+        let look = PlayerLook::default();
+        let mut state = PlayerState::default();
+        let mut pos = sector_world_origin(SectorCoord(0, 0, 0)) + Vec3::new(5.0, 20.0, 5.0);
+        for _ in 0..600 {
+            let r = integrate_player(
+                &ctrl,
+                &state,
+                &PlayerInput::default(),
+                &look,
+                &is_solid,
+                pos,
+                1.0 / 60.0,
+            );
+            pos = r.new_position;
+            state.vy = r.vy;
+            state.grounded = r.grounded;
+        }
+        let feet = pos.y - PLAYER_HALF_HEIGHT;
+        assert!(state.grounded, "player must settle grounded on the floor");
+        assert!(
+            (feet - 1.0).abs() < 0.05,
+            "feet should rest on the floor top (y=1), got feet={feet}"
+        );
+    }
+
+    #[test]
+    fn horizontal_wall_blocks_movement() {
+        // Floor plus a solid wall column at x=8 across the full height. Walking
+        // +x into it must not let the player pass through the wall.
+        let mut pool = GlobalBrickPool::new();
+        let mut palette = SectorPalette::new();
+        let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+        for x in 0..32u32 {
+            for z in 0..32u32 {
+                map.set_block(
+                    &mut pool,
+                    &mut palette,
+                    VoxelCoord::new(x, 0, z),
+                    BlockId(1),
+                );
+            }
+        }
+        for y in 1..4u32 {
+            for z in 0..32u32 {
+                map.set_block(
+                    &mut pool,
+                    &mut palette,
+                    VoxelCoord::new(8, y, z),
+                    BlockId(1),
+                );
+            }
+        }
+        let is_solid = world_solid(&map, &pool);
+        let ctrl = PlayerController::default();
+        // Face +x (yaw so that forward = +x). forward = (-sin(yaw), 0, -cos(yaw));
+        // move_z=1 with yaw=-PI/2 gives forward=(+1,0,0).
+        let look = PlayerLook {
+            yaw: -std::f32::consts::FRAC_PI_2,
+            pitch: 0.0,
+        };
+        let input = PlayerInput {
+            move_z: 1.0,
+            ..Default::default()
+        };
+        let mut state = PlayerState {
+            grounded: true,
+            ..Default::default()
+        };
+        // Start standing on the floor at x=6, well left of the wall.
+        let mut pos = sector_world_origin(SectorCoord(0, 0, 0)) + Vec3::new(6.0, 2.0, 5.0);
+        for _ in 0..240 {
+            let r = integrate_player(&ctrl, &state, &input, &look, &is_solid, pos, 1.0 / 60.0);
+            pos = r.new_position;
+            state.vy = r.vy;
+            state.grounded = r.grounded;
+        }
+        // Wall occupies voxel x=8 (world [8,9)); the player's +x face (center + radius)
+        // must stop before x=8.
+        assert!(
+            pos.x + PLAYER_RADIUS <= 8.0 + 1.0e-2,
+            "player must be stopped by the wall, got x={}",
+            pos.x
+        );
     }
 }

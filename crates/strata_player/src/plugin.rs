@@ -25,18 +25,24 @@ impl StrataPlugin for PlayerPlugin {
         app.insert_resource(PlayerInput::default());
         app.add_message::<PlayerBreak>();
         app.add_message::<PlayerPlace>();
+        // Input sampling + block interaction stay at render rate in the `Input`
+        // set. Movement is intentionally NOT here (see FixedUpdate below).
         app.add_systems(
             Update,
             (
                 input_mapper_system,
                 hotbar_system,
-                player_controller_system,
                 player_break_system,
                 player_place_system,
             )
                 .chain()
                 .in_set(StrataSet::Input),
         );
+        // Movement integration runs on the fixed timestep (framerate-independent,
+        // deterministic — plan 14 §D3). It reads the `PlayerInput` sampled by the
+        // Update-rate input mapper and writes the player `Transform`; break/place
+        // (Update, after FixedMain) then raycast from the fresh position.
+        app.add_systems(FixedUpdate, player_controller_system);
     }
 }
 
@@ -52,6 +58,8 @@ pub fn spawn_player(commands: &mut Commands, position: Vec3) {
         PlayerState::default(),
         PlayerLook::default(),
         Inventory::default(),
+        // Drives sector streaming (only this entity's Transform is tracked).
+        StreamingAnchor,
         Transform::from_translation(position),
         GlobalTransform::from_translation(position),
         Name::new("player"),

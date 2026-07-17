@@ -32,6 +32,9 @@ struct PackedQuad {
 @group(0) @binding(0) var<uniform> cam: CameraView;
 @group(0) @binding(1) var<storage, read> quads: array<PackedQuad>;
 @group(0) @binding(2) var<storage, read_write> visbuf: array<atomic<u64>>;
+// Per-quad world origin (sector_coord * 32) so every sector's local 0..31 quad
+// geometry is placed at its real world position. `.xyz` used; `.w` is padding.
+@group(0) @binding(3) var<storage, read> origins: array<vec4<f32>>;
 
 struct VOut {
   @builtin(position) pos: vec4<f32>,
@@ -68,6 +71,13 @@ fn vs_main(@builtin(vertex_index) vi: u32,
   var p = vec3<f32>(f32(x), f32(y), f32(z));
   p[uaxis] = p[uaxis] + f32(du * w);
   p[vaxis] = p[vaxis] + f32(dv * h);
+  // The CPU packs the owning voxel (0..31) to keep the 5-bit position field from
+  // overflowing at the sector boundary (a +d face plane would be 32). Advance +d
+  // faces (even face index) by one voxel here, in float space, to reach the true
+  // plane. `-d` faces (odd index) stay at the owning voxel.
+  p[axis] = p[axis] + f32(1u - (face & 1u));
+  // Translate sector-local coords into world space by the per-quad origin.
+  p = p + origins[ii].xyz;
 
   let clip = cam.proj * cam.view * vec4<f32>(p, 1.0);
 
@@ -88,7 +98,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   let depth = u32(rev * 16777215.0); // 2^24 - 1, saturated by construction.
 
   let entry = (u64(in.voxel_pos) & u64(0xFFFFFFu))
-            | ((u64(in.sector_id) & u64(0xFFFu)) << 24u)
+            | ((u64(in.sector_id) & u64(0x1FFFu)) << 24u)
             | ((u64(in.normal) & u64(0x7u)) << 37u)
             | ((u64(depth) & u64(0xFFFFFFu)) << 40u);
 
@@ -134,6 +144,16 @@ pub fn prepass_bind_group_layout(device: &Device) -> BindGroupLayout {
                 visibility: ShaderStages::FRAGMENT,
                 ty: BindingType::Buffer {
                     ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
                     min_binding_size: None,
                 },
@@ -196,7 +216,25 @@ pub fn make_quad_buffer(device: &Device, quad_count: usize) -> Arc<Buffer> {
     Arc::new(device.create_buffer(&BufferDescriptor {
         label: Some("strata_prepass_quads"),
         size,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        // COPY_SRC is required so `Renderer::ensure_quad_capacity` can copy the
+        // old buffer into a larger one when the slot allocator grows the SSBO
+        // (streaming fragmentation bumps `next_base` past capacity). Without it
+        // wgpu rejects the grow copy with a validation error.
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
+        mapped_at_creation: false,
+    }))
+}
+
+/// Recreate the per-quad world-origin SSBO sized for `quad_count` `vec4<f32>`
+/// entries (16 bytes each, `.xyz` = sector world offset, `.w` = padding).
+pub fn make_origins_buffer(device: &Device, quad_count: usize) -> Arc<Buffer> {
+    let size = (quad_count.max(1) * std::mem::size_of::<[f32; 4]>()) as u64;
+    Arc::new(device.create_buffer(&BufferDescriptor {
+        label: Some("strata_prepass_origins"),
+        size,
+        // COPY_SRC: same reason as the quad buffer — the grow path copies the
+        // old origins buffer into the enlarged one.
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
         mapped_at_creation: false,
     }))
 }

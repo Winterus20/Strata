@@ -151,8 +151,12 @@ fn plugin_generates_sector_entity() {
     let e = app.world_mut().spawn(SectorCoord(0, 0, 0)).id();
 
     // Run enough frames for the async compute task to complete + apply.
-    for _ in 0..40 {
+    for _ in 0..2000 {
+        if app.world().entity(e).contains::<Generated>() {
+            break;
+        }
         app.update();
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
     let entity = app.world().entity(e);
@@ -173,8 +177,12 @@ fn plugin_generated_sector_is_solid_at_bedrock() {
     app.insert_resource(GlobalBrickPool::new());
     app.add_strata_plugin(WorldGenPlugin);
     let e = app.world_mut().spawn(SectorCoord(0, 0, 0)).id();
-    for _ in 0..40 {
+    for _ in 0..2000 {
+        if app.world().entity(e).contains::<Generated>() {
+            break;
+        }
         app.update();
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
     let world = app.world();

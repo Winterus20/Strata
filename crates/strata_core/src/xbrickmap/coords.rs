@@ -21,6 +21,15 @@ pub struct VoxelCoord {
 impl VoxelCoord {
     #[inline]
     pub fn new(x: u32, y: u32, z: u32) -> Self {
+        // Sector-local coords must be 0..SECTOR_DIM. An out-of-range axis makes
+        // `brick_index()` exceed 63, so `sector_mask >> bi` shifts by >= 64 —
+        // a debug panic ("shift with overflow") or a silently masked, wrong
+        // result in release. Callers sampling neighbours must wrap into 0..31
+        // before constructing a `VoxelCoord` (see meshing's `sample_block`).
+        debug_assert!(
+            x < SECTOR_DIM && y < SECTOR_DIM && z < SECTOR_DIM,
+            "VoxelCoord out of range: ({x}, {y}, {z}) not in 0..{SECTOR_DIM}"
+        );
         VoxelCoord { x, y, z }
     }
 

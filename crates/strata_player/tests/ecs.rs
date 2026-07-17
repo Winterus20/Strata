@@ -39,7 +39,7 @@ fn build_app() -> (App, Entity, Entity) {
         .id();
 
     // Player positioned just outside the +Z face (default yaw=0 looks toward -Z),
-    // with the eye (translation + EYE_HEIGHT) on the block's center line.
+    // with the eye (translation + EYE_HEIGHT) on the block's center line (y=7.5).
     let player = app
         .world_mut()
         .spawn((
@@ -47,8 +47,8 @@ fn build_app() -> (App, Entity, Entity) {
             PlayerState::default(),
             PlayerLook::default(),
             Inventory::default(),
-            Transform::from_translation(Vec3::new(5.5, 5.9, 6.5)),
-            GlobalTransform::from_translation(Vec3::new(5.5, 5.9, 6.5)),
+            Transform::from_translation(Vec3::new(5.5, 6.5, 6.5)),
+            GlobalTransform::from_translation(Vec3::new(5.5, 6.5, 6.5)),
         ))
         .id();
 
