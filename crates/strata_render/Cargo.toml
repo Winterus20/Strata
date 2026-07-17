@@ -5,9 +5,14 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-bevy = { workspace = true, default-features = true }
+# Render logic + our own wgpu device only — Bevy's default features (bevy_render,
+# bevy_pbr, audio, animation, ...) are NOT needed here and were pulling the whole
+# render stack into every build. Keep just `bevy_log` for the `info!`/`warn!`
+# macros (same policy as strata_core).
+bevy = { workspace = true, default-features = false, features = ["bevy_log"] }
 strata_core = { path = "../strata_core" }
 strata_world = { path = "../strata_world" }
+strata_physics = { path = "../strata_physics" }
 
 # GPU bootstrap for M4 (wgpu bootstrap + headless offscreen clear).
 # Pinned to 27.x to match the wgpu version pulled in by Bevy 0.18, avoiding a
@@ -18,3 +23,4 @@ bytemuck = { version = "1", features = ["derive"] }
 # Tiny executor used only by the #[cfg(test)] GPU test to drive async
 # request_adapter / request_device on the test thread.
 pollster = "0.4"
+thread-priority = "3.1.1"

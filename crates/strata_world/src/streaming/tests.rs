@@ -8,7 +8,7 @@ use bevy::prelude::*;
 use strata_core::prelude::*;
 use strata_core::registry::load_block_registry;
 
-use crate::plugin::{Generated, WorldGenPlugin};
+use crate::plugin::{Generated, Generating, PendingWorldGen, WorldGenPlugin};
 use crate::streaming::{StreamingManager, StreamingPlugin};
 
 /// Configure the full `StrataSet` chain so the `Streaming` set runs before
@@ -105,7 +105,7 @@ fn move_player_unloads_distant_and_loads_near_sectors() {
     // Spawn a player entity at the origin so the streaming system tracks it.
     let player = app
         .world_mut()
-        .spawn(Transform::from_translation(Vec3::ZERO))
+        .spawn((StreamingAnchor, Transform::from_translation(Vec3::ZERO)))
         .id();
     app.update();
     let start: HashSet<SectorCoord> = coords(&mut app).into_iter().collect();
@@ -122,16 +122,18 @@ fn move_player_unloads_distant_and_loads_near_sectors() {
         )));
     app.update();
 
-    let after: HashSet<SectorCoord> = coords(&mut app).into_iter().collect();
-    assert_eq!(after.len(), 729, "resident count stays bounded after move");
-    assert!(
-        !after.contains(&SectorCoord(0, 0, 0)),
-        "origin must be unloaded once far from the player"
-    );
-    assert!(
-        after.contains(&SectorCoord(10, 0, 0)),
-        "new player sector must be loaded"
-    );
+    for _ in 0..120 {
+        app.update();
+        let after: HashSet<SectorCoord> = coords(&mut app).into_iter().collect();
+        if after.len() == 729 && !after.contains(&SectorCoord(0, 0, 0)) {
+            assert!(
+                after.contains(&SectorCoord(10, 0, 0)),
+                "new player sector must be loaded"
+            );
+            return;
+        }
+    }
+    panic!("origin must unload and resident set must converge after move");
 }
 
 #[test]
@@ -139,7 +141,7 @@ fn hysteresis_jitter_keeps_resident_set_stable() {
     let mut app = streaming_app();
     let player = app
         .world_mut()
-        .spawn(Transform::from_translation(Vec3::ZERO))
+        .spawn((StreamingAnchor, Transform::from_translation(Vec3::ZERO)))
         .id();
     app.update();
     let base: HashSet<SectorCoord> = coords(&mut app).into_iter().collect();
@@ -150,14 +152,24 @@ fn hysteresis_jitter_keeps_resident_set_stable() {
     app.world_mut()
         .entity_mut(player)
         .insert(Transform::from_translation(Vec3::new(32.0, 0.0, 0.0)));
-    app.update();
+    for _ in 0..120 {
+        app.update();
+        if coords(&mut app).len() == 729 {
+            break;
+        }
+    }
     let mid = coords(&mut app);
-    assert_eq!(mid.len(), 729, "count must stay constant during jitter");
+    assert_eq!(mid.len(), 729, "count must stay bounded during jitter");
 
     app.world_mut()
         .entity_mut(player)
         .insert(Transform::from_translation(Vec3::ZERO));
-    app.update();
+    for _ in 0..120 {
+        app.update();
+        if coords(&mut app).len() == 729 {
+            break;
+        }
+    }
 
     let back: HashSet<SectorCoord> = coords(&mut app).into_iter().collect();
     assert_eq!(
@@ -179,9 +191,25 @@ fn integration_streaming_spawns_generated_sectors() {
     app.add_strata_plugin(StreamingPlugin::default());
     app.add_strata_plugin(WorldGenPlugin);
 
-    // A few frames: streaming spawns sectors, WorldGen generates them.
-    for _ in 0..5 {
+    for _ in 0..2000 {
+        let has_gen = {
+            let w = app.world_mut();
+            if let Some(origin_entity) = w
+                .query::<(Entity, &SectorCoord)>()
+                .iter(w)
+                .find(|(_, c)| **c == SectorCoord(0, 0, 0))
+                .map(|(e, _)| e)
+            {
+                w.entity(origin_entity).contains::<Generated>()
+            } else {
+                false
+            }
+        };
+        if has_gen {
+            break;
+        }
         app.update();
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
     // The origin sector (spawned frame 1) must now be Generated + have a map.
@@ -208,21 +236,41 @@ fn integration_streaming_spawns_generated_sectors() {
     assert!(bricks > 0, "generated terrain must allocate pooled bricks");
 }
 
-/// Brick count for an app parked at `sector` after `n` updates (deterministic
-/// reference; terrain density is a pure function of sector coord).
-fn parked_brick_count(sector: SectorCoord, n: usize) -> usize {
+fn parked_brick_count(sector: SectorCoord, _n: usize) -> usize {
     let mut app = App::new();
     configure_chain(&mut app);
     app.insert_resource(load_block_registry());
     app.add_strata_plugin(StreamingPlugin::default());
     app.add_strata_plugin(WorldGenPlugin);
-    app.world_mut().spawn(Transform::from_translation(Vec3::new(
-        sector.0 as f32 * 32.0,
-        sector.1 as f32 * 32.0,
-        sector.2 as f32 * 32.0,
-    )));
-    for _ in 0..n {
+    app.world_mut().spawn((
+        StreamingAnchor,
+        Transform::from_translation(Vec3::new(
+            sector.0 as f32 * 32.0,
+            sector.1 as f32 * 32.0,
+            sector.2 as f32 * 32.0,
+        )),
+    ));
+    for _ in 0..2000 {
         app.update();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let pending_empty = app.world().resource::<PendingWorldGen>().tasks.is_empty();
+        let generating_empty = app
+            .world_mut()
+            .query_filtered::<Entity, With<Generating>>()
+            .iter(app.world_mut())
+            .next()
+            .is_none();
+        let any_unscaled = !app
+            .world_mut()
+            .query_filtered::<Entity, (With<SectorCoord>, Without<Generated>, Without<Generating>)>(
+            )
+            .iter(app.world_mut())
+            .next()
+            .is_none();
+        let has_bricks = app.world().resource::<GlobalBrickPool>().brick_count() > 0;
+        if pending_empty && generating_empty && !any_unscaled && has_bricks {
+            break;
+        }
     }
     app.world().resource::<GlobalBrickPool>().brick_count()
 }
@@ -237,10 +285,29 @@ fn integration_unload_frees_pool_bricks() {
 
     let player = app
         .world_mut()
-        .spawn(Transform::from_translation(Vec3::ZERO))
+        .spawn((StreamingAnchor, Transform::from_translation(Vec3::ZERO)))
         .id();
-    for _ in 0..5 {
+    for _ in 0..2000 {
         app.update();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let pending_empty = app.world().resource::<PendingWorldGen>().tasks.is_empty();
+        let generating_empty = app
+            .world_mut()
+            .query_filtered::<Entity, With<Generating>>()
+            .iter(app.world_mut())
+            .next()
+            .is_none();
+        let any_unscaled = !app
+            .world_mut()
+            .query_filtered::<Entity, (With<SectorCoord>, Without<Generated>, Without<Generating>)>(
+            )
+            .iter(app.world_mut())
+            .next()
+            .is_none();
+        let has_bricks = app.world().resource::<GlobalBrickPool>().brick_count() > 0;
+        if pending_empty && generating_empty && !any_unscaled && has_bricks {
+            break;
+        }
     }
     let before_bricks = app.world().resource::<GlobalBrickPool>().brick_count();
     assert!(
@@ -256,14 +323,34 @@ fn integration_unload_frees_pool_bricks() {
             0.0,
             0.0,
         )));
-    for _ in 0..5 {
+    // Enough frames for the budget to unload the old shell and drain the new
+    // one, so the pool converges to the same steady state as a fresh app.
+    for _ in 0..2000 {
         app.update();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let pending_empty = app.world().resource::<PendingWorldGen>().tasks.is_empty();
+        let generating_empty = app
+            .world_mut()
+            .query_filtered::<Entity, With<Generating>>()
+            .iter(app.world_mut())
+            .next()
+            .is_none();
+        let any_unscaled = !app
+            .world_mut()
+            .query_filtered::<Entity, (With<SectorCoord>, Without<Generated>, Without<Generating>)>(
+            )
+            .iter(app.world_mut())
+            .next()
+            .is_none();
+        if pending_empty && generating_empty && !any_unscaled {
+            break;
+        }
     }
     let after_bricks = app.world().resource::<GlobalBrickPool>().brick_count();
 
     // The unloaded origin bricks must be fully reclaimed: the moved app's pool
     // must equal a fresh app parked at the same final position (no leak).
-    let expected = parked_brick_count(SectorCoord(20, 0, 0), 5);
+    let expected = parked_brick_count(SectorCoord(20, 0, 0), 250);
     assert_eq!(
         after_bricks, expected,
         "pool bricks after move must equal a fresh app at the same position (no leak)"

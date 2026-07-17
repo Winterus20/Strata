@@ -12,6 +12,16 @@ use bevy::math::Vec3;
 use bevy::prelude::*;
 
 use crate::plugin::Generated;
+use crate::streaming::{StreamingManager, load_priority};
+
+const LIGHTING_BUDGET: usize = 2;
+
+/// Per-frame timings for L0/L1 light compute (surfaced to client DIAG).
+#[derive(Resource, Default)]
+pub struct LightingTimers {
+    pub apply_us: u64,
+    pub applied: usize,
+}
 use strata_core::prelude::*;
 
 /// Voxels per 32³ sector. Mirrors `strata_core::SECTOR_VOXEL_COUNT`.
@@ -182,9 +192,10 @@ impl LightEngine {
         palette: &SectorPalette,
         registry: &BlockRegistry,
     ) -> SectorLight {
+        let pool_guard = pool.read_inner();
         let mut light = SectorLight::default();
-        self.compute_sky(map, pool, palette, registry, &mut light);
-        self.compute_block(map, pool, palette, registry, &mut light);
+        self.compute_sky(map, &pool_guard, palette, registry, &mut light);
+        self.compute_block(map, &pool_guard, palette, registry, &mut light);
         light
     }
 
@@ -201,30 +212,35 @@ impl LightEngine {
         self.compute_sector(coord, map, pool, palette, registry)
     }
 
-    /// L0 sky light: column-first, top-down. A transparent voxel above the local
-    /// terrain top receives `MAX`; each step down decreases by 1 until a
-    /// non-transparent voxel blocks the column (interior below overhang = dark).
+    /// L0 sky light: column-first, top-down. Sunlight falls straight down at
+    /// **full strength** — no per-step attenuation (Minecraft / 0fps model) —
+    /// until an opaque voxel blocks the column; every voxel at or below that
+    /// block is dark. (Lateral sky spread that softens column edges is a
+    /// deferred enhancement; M7 sky light is column-only.)
     fn compute_sky(
         &self,
         map: &XBrickMap,
-        pool: &GlobalBrickPool,
+        pool: &InnerPool,
         palette: &SectorPalette,
         registry: &BlockRegistry,
         light: &mut SectorLight,
     ) {
         for x in 0..SECTOR_DIM {
             for z in 0..SECTOR_DIM {
-                let mut l: u8 = MAX_LIGHT;
+                let mut blocked = false;
                 for y in (0..SECTOR_DIM).rev() {
                     let c = VoxelCoord::new(x, y, z);
-                    let id = map.get_block(pool, palette, c);
-                    if !registry.is_transparent(id) {
-                        l = 0;
-                        light.data[SectorLight::idx_of(c)].set_sky(0);
+                    let id = map.get_block_locked(pool, palette, c);
+                    let sky = if !registry.is_transparent(id) {
+                        // Opaque voxel: dark, and it blocks the column below.
+                        blocked = true;
+                        0
+                    } else if blocked {
+                        0
                     } else {
-                        light.data[SectorLight::idx_of(c)].set_sky(l);
-                        l = l.saturating_sub(1);
-                    }
+                        MAX_LIGHT
+                    };
+                    light.data[SectorLight::idx_of(c)].set_sky(sky);
                 }
             }
         }
@@ -236,7 +252,7 @@ impl LightEngine {
     fn compute_block(
         &self,
         map: &XBrickMap,
-        pool: &GlobalBrickPool,
+        pool: &InnerPool,
         palette: &SectorPalette,
         registry: &BlockRegistry,
         light: &mut SectorLight,
@@ -248,7 +264,7 @@ impl LightEngine {
         let mut increase: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
         for i in 0..SECTOR_VOXELS {
             let (x, y, z) = coord_of(i);
-            let id = map.get_block(pool, palette, VoxelCoord::new(x, y, z));
+            let id = map.get_block_locked(pool, palette, VoxelCoord::new(x, y, z));
             let emission = registry.light_emission(id);
             if emission > 0 {
                 let e = emission.min(MAX_LIGHT);
@@ -266,7 +282,7 @@ impl LightEngine {
         &self,
         queue: &mut std::collections::VecDeque<usize>,
         map: &XBrickMap,
-        pool: &GlobalBrickPool,
+        pool: &InnerPool,
         palette: &SectorPalette,
         registry: &BlockRegistry,
         light: &mut SectorLight,
@@ -291,7 +307,7 @@ impl LightEngine {
                     continue;
                 }
                 let nc = VoxelCoord::new(nx as u32, ny as u32, nz as u32);
-                let nid = map.get_block(pool, palette, nc);
+                let nid = map.get_block_locked(pool, palette, nc);
                 if !registry.is_transparent(nid) {
                     continue;
                 }
@@ -320,6 +336,7 @@ impl LightEngine {
         registry: &BlockRegistry,
         light: &mut SectorLight,
     ) {
+        let pool_guard = pool.read_inner();
         let sidx = SectorLight::idx_of(source);
         light.data[sidx].set_block(0);
 
@@ -349,41 +366,41 @@ impl LightEngine {
         let mut increase: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
         for i in 0..SECTOR_VOXELS {
             let (x, y, z) = coord_of(i);
-            let id = map.get_block(pool, palette, VoxelCoord::new(x, y, z));
+            let id = map.get_block_locked(&pool_guard, palette, VoxelCoord::new(x, y, z));
             if registry.light_emission(id) > 0 {
                 let e = registry.light_emission(id).min(MAX_LIGHT);
                 light.data[i].set_block(e);
                 increase.push_back(i);
             }
         }
-        self.propagate_increase(&mut increase, map, pool, palette, registry, light);
+        self.propagate_increase(&mut increase, map, &pool_guard, palette, registry, light);
     }
 
     #[inline]
     fn neighbor_indices(&self, idx: usize) -> impl Iterator<Item = usize> {
         let (x, y, z) = coord_of(idx);
-        NEIGHBOR_OFFSETS
-            .iter()
-            .filter_map(move |(dx, dy, dz)| {
-                let nx = x as i32 + dx;
-                let ny = y as i32 + dy;
-                let nz = z as i32 + dz;
-                if nx < 0
-                    || ny < 0
-                    || nz < 0
-                    || nx >= SECTOR_DIM as i32
-                    || ny >= SECTOR_DIM as i32
-                    || nz >= SECTOR_DIM as i32
-                {
-                    None
-                } else {
-                    Some(SectorLight::idx_of(VoxelCoord::new(
-                        nx as u32, ny as u32, nz as u32,
-                    )))
-                }
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
+        // Return the filter_map iterator directly (no `collect::<Vec>()`): it
+        // captures the owned `(x,y,z)` and borrows only the `'static` offset
+        // table, so no heap allocation happens per call — `remove_source` calls
+        // this thousands of times.
+        NEIGHBOR_OFFSETS.iter().filter_map(move |(dx, dy, dz)| {
+            let nx = x as i32 + dx;
+            let ny = y as i32 + dy;
+            let nz = z as i32 + dz;
+            if nx < 0
+                || ny < 0
+                || nz < 0
+                || nx >= SECTOR_DIM as i32
+                || ny >= SECTOR_DIM as i32
+                || nz >= SECTOR_DIM as i32
+            {
+                None
+            } else {
+                Some(SectorLight::idx_of(VoxelCoord::new(
+                    nx as u32, ny as u32, nz as u32,
+                )))
+            }
+        })
     }
 }
 
@@ -402,6 +419,7 @@ impl StrataPlugin for LightingPlugin {
         if !app.world().contains_resource::<LightEngine>() {
             app.insert_resource(LightEngine::default());
         }
+        app.init_resource::<LightingTimers>();
         app.add_systems(Update, lighting_system.in_set(StrataSet::Lighting));
     }
 }
@@ -414,6 +432,8 @@ fn lighting_system(
     registry: Res<BlockRegistry>,
     pool: Res<GlobalBrickPool>,
     engine: Res<LightEngine>,
+    streaming: Option<Res<StreamingManager>>,
+    mut timers: ResMut<LightingTimers>,
     query: Query<
         (
             Entity,
@@ -428,9 +448,44 @@ fn lighting_system(
         ),
     >,
 ) {
-    for (entity, coord, map, palette, _cd) in &query {
+    timers.apply_us = 0;
+    timers.applied = 0;
+    let player = streaming
+        .as_ref()
+        .map(|s| s.player_sector)
+        .unwrap_or(SectorCoord(0, 0, 0));
+    let move_dir = streaming
+        .as_ref()
+        .map(|s| s.move_dir)
+        .unwrap_or(SectorCoord(0, 0, 0));
+
+    let t0 = std::time::Instant::now();
+    // 1. Process all dirty sectors immediately (no budget limits for player edits).
+    for (entity, coord, map, palette, cd) in &query {
+        if cd.is_some() {
+            let light = engine.compute_sector(*coord, map, &pool, palette, &registry);
+            commands.entity(entity).insert(light);
+            timers.applied += 1;
+        }
+    }
+    // 2. Process new sectors up to the budget cap (nearest first).
+    let mut new_work: Vec<_> = query
+        .iter()
+        .filter(|(_, _, _, _, cd)| cd.is_none())
+        .collect();
+    new_work.sort_by_key(|(_, c, _, _, _)| load_priority(player, move_dir, **c));
+    let mut budget = LIGHTING_BUDGET;
+    for (entity, coord, map, palette, _) in new_work {
+        if budget == 0 {
+            break;
+        }
         let light = engine.compute_sector(*coord, map, &pool, palette, &registry);
         commands.entity(entity).insert(light);
+        budget -= 1;
+        timers.applied += 1;
+    }
+    if timers.applied > 0 {
+        timers.apply_us = t0.elapsed().as_micros() as u64;
     }
 }
 

@@ -104,13 +104,35 @@ fn headless_app() -> App {
     app.insert_resource(load_block_registry());
     app.insert_resource(RayProbe::default());
     app.insert_resource(RayHit::default());
-    app.add_systems(Update, (apply_edit, toggle_voxel));
+    app.add_systems(
+        Update,
+        (
+            apply_edit.in_set(StrataSet::Input),
+            toggle_voxel.in_set(StrataSet::Input),
+        ),
+    );
     app.add_systems(Last, probe_down);
     app
 }
 
 fn solid_id(registry: &BlockRegistry) -> BlockId {
     registry.id_by_name("stone").unwrap_or(BlockId(1))
+}
+
+fn drain_sector_colliders(app: &mut App) {
+    for _ in 0..120 {
+        app.update();
+        let ready = {
+            let mut q = app
+                .world_mut()
+                .query_filtered::<Entity, With<SectorCollider>>();
+            q.iter(app.world()).next().is_some()
+        };
+        if ready {
+            return;
+        }
+    }
+    panic!("sector collider did not finish building within frame budget");
 }
 
 /// A downward Rapier raycast against a sector's `Voxels` collider hits.
@@ -128,7 +150,7 @@ fn downward_raycast_hits_sector_voxel_collider() {
     app.world_mut()
         .spawn((SectorCoord(0, 0, 0), map, palette, Generated));
 
-    app.update();
+    drain_sector_colliders(&mut app);
     app.update();
 
     let hit = app.world().resource::<RayHit>();
@@ -189,7 +211,7 @@ fn edit_updates_collider_solid() {
         .spawn((SectorCoord(0, 0, 0), map, palette, Generated))
         .id();
 
-    app.update();
+    drain_sector_colliders(&mut app);
     app.update();
 
     // Before edit: a ray at the future voxel (7,7,7) must miss.
@@ -240,7 +262,7 @@ fn set_voxel_partial_path_is_safe() {
         .world_mut()
         .spawn((SectorCoord(0, 0, 0), map, palette, Generated))
         .id();
-    app.update();
+    drain_sector_colliders(&mut app);
     app.update();
 
     // Toggle voxel (3,3,3) on through the O(1) path from inside a system (so the

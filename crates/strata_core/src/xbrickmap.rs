@@ -20,7 +20,7 @@ pub mod coords;
 pub mod pool;
 
 pub use coords::VoxelCoord;
-pub use pool::{Brick, BrickHandle, GlobalBrickPool, SubBrick};
+pub use pool::{Brick, BrickHandle, GlobalBrickPool, InnerPool, SubBrick};
 
 /// A fully-filled 32³ sector has this many voxels.
 pub const SECTOR_VOXEL_COUNT: usize = 32 * 32 * 32;
@@ -32,7 +32,7 @@ pub const SECTOR_VOXEL_COUNT: usize = 32 * 32 * 32;
 /// 64-slot handle array, no `Vec<Brick>`) and O(1) for get/set.
 ///
 /// Stored per sector entity as an ECS `Component` (M3 meshing queries it).
-#[derive(Component)]
+#[derive(Component, Clone)]
 pub struct XBrickMap {
     pub coord: SectorCoord,
     pub sector_mask: u64,
@@ -46,6 +46,17 @@ impl XBrickMap {
             sector_mask: 0,
             bricks: [None; 64],
         }
+    }
+
+    /// O(1) handle lookup for an occupied brick index (0..64). Returns `None` when
+    /// the brick slot is empty or masked out — used by physics/meshing hot paths
+    /// that walk `sector_mask` instead of scanning all 32³ voxels.
+    #[inline]
+    pub fn brick_handle_at(&self, brick_index: usize) -> Option<BrickHandle> {
+        if brick_index >= 64 || (self.sector_mask >> brick_index) & 1 == 0 {
+            return None;
+        }
+        self.bricks[brick_index]
     }
 
     /// Read the block at `coord`. Returns `BlockId::AIR` (0) for any empty slot.
@@ -62,6 +73,39 @@ impl XBrickMap {
             return BlockId::AIR;
         }
         let brick = match self.bricks[bi].and_then(|h| pool.brick(h)) {
+            Some(b) => b,
+            None => return BlockId::AIR,
+        };
+        let si = coord.sub_index();
+        if (brick.sub_mask >> si) & 1 == 0 {
+            return BlockId::AIR;
+        }
+        let sub = &brick.subs[si];
+        let vb = coord.voxel_bit();
+        if (sub.voxel_mask >> vb) & 1 == 0 {
+            return BlockId::AIR;
+        }
+        palette.resolve(sub.indices[vb])
+    }
+
+    /// Read the block at `coord` using a pre-locked [`InnerPool`] reference (shared read guard).
+    /// Prevents repeated locking overhead inside voxel-iteration hot loops.
+    #[inline]
+    pub fn get_block_locked(
+        &self,
+        pool: &InnerPool,
+        palette: &SectorPalette,
+        coord: VoxelCoord,
+    ) -> BlockId {
+        let bi = coord.brick_index();
+        if (self.sector_mask >> bi) & 1 == 0 {
+            return BlockId::AIR;
+        }
+        let handle = match self.bricks[bi as usize] {
+            Some(h) => h,
+            None => return BlockId::AIR,
+        };
+        let brick = match pool.bricks.get(handle) {
             Some(b) => b,
             None => return BlockId::AIR,
         };
@@ -114,19 +158,30 @@ impl XBrickMap {
                 return; // already empty
             }
             let handle = self.bricks[bi].unwrap();
-            let brick = pool.brick_mut(handle).unwrap();
-            let si = coord.sub_index();
-            let sub = &mut brick.subs[si];
-            let vb = coord.voxel_bit();
-            sub.voxel_mask &= !(1u8 << vb);
-            sub.indices[vb] = 0;
-            if sub.voxel_mask == 0 {
-                brick.sub_mask &= !(1u64 << si);
-                if brick.sub_mask == 0 {
-                    pool.free_brick(handle);
-                    self.bricks[bi] = None;
-                    self.sector_mask &= !(1u64 << bi);
+            // Mutate the brick under the write guard, then drop the guard before
+            // freeing (RwLock forbids re-entrant write locking). Reborrow the
+            // guard into a plain `&mut Brick` so disjoint-field borrows work.
+            let became_empty = {
+                let mut g = pool.brick_mut(handle).unwrap();
+                let brick = &mut *g;
+                let si = coord.sub_index();
+                let sub = &mut brick.subs[si];
+                let vb = coord.voxel_bit();
+                sub.voxel_mask &= !(1u8 << vb);
+                sub.indices[vb] = 0;
+                let mut empty = false;
+                if sub.voxel_mask == 0 {
+                    brick.sub_mask &= !(1u64 << si);
+                    if brick.sub_mask == 0 {
+                        empty = true;
+                    }
                 }
+                empty
+            };
+            if became_empty {
+                pool.free_brick(handle);
+                self.bricks[bi] = None;
+                self.sector_mask &= !(1u64 << bi);
             }
             return;
         }
@@ -137,7 +192,8 @@ impl XBrickMap {
             self.sector_mask |= 1u64 << bi;
         }
         let handle = self.bricks[bi].unwrap();
-        let brick = pool.brick_mut(handle).unwrap();
+        let mut g = pool.brick_mut(handle).unwrap();
+        let brick = &mut *g;
         let local = palette.get_or_insert(block);
         let si = coord.sub_index();
         let sub = &mut brick.subs[si];
@@ -216,11 +272,18 @@ impl CompressedChunkData {
         let mut map = XBrickMap::new(coord);
         map.sector_mask = self.sector_mask;
         let palette = SectorPalette::from_entries(self.palette.clone());
+        let mut inner = pool.write_inner();
         for cb in &self.bricks {
-            let handle = pool.alloc_brick();
-            let brick = pool.brick_mut(handle).unwrap();
+            debug_assert_eq!(
+                cb.subs.len(),
+                64,
+                "CompressedBrick must carry exactly 64 sub-bricks (got {})",
+                cb.subs.len()
+            );
+            let handle = inner.bricks.insert(Brick::default());
+            let brick = &mut inner.bricks[handle];
             brick.sub_mask = cb.sub_mask;
-            for (i, s) in cb.subs.iter().enumerate() {
+            for (i, s) in cb.subs.iter().take(64).enumerate() {
                 brick.subs[i] = *s;
             }
             map.bricks[cb.brick_idx as usize] = Some(handle);

@@ -3,12 +3,20 @@
 //! alloc/free with generational versioning (no dangling handles, zero heap
 //! fragmentation). A `SecondaryMap` caches a per-brick uniform-material index.
 //!
+//! The pool is wrapped in `Arc<RwLock<..>>` so it is `Clone` + `Sync` and can be
+//! handed to background meshing threads (the `AsyncComputeTaskPool`) without
+//! touching the live `SlotMap` from the main thread. Reads take the shared lock;
+//! the few mutations (streaming free/alloc, world-gen) take the exclusive lock.
 //! No per-sector `Vec<Brick>` exists anywhere — the heap-fragmentation ban
 //! (AGENTS.md §7.G) is enforced structurally here.
 
 use bevy::prelude::*;
+use parking_lot::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 use serde::{Deserialize, Serialize};
 use slotmap::{SecondaryMap, SlotMap, new_key_type};
+use std::sync::Arc;
 
 new_key_type! {
     /// Generational handle to a pooled [`Brick`].
@@ -50,72 +58,135 @@ impl Default for Brick {
     }
 }
 
+/// Inner pool storage, shared (via `Arc`) across every `GlobalBrickPool` handle.
+pub struct InnerPool {
+    pub bricks: SlotMap<BrickHandle, Brick>,
+    /// Cached uniform material index per brick (0xFFFF = mixed or empty).
+    pub uniform: SecondaryMap<BrickHandle, u16>,
+}
+
+impl Default for InnerPool {
+    fn default() -> Self {
+        InnerPool {
+            bricks: SlotMap::with_key(),
+            uniform: SecondaryMap::new(),
+        }
+    }
+}
+
 /// Global pool of all live bricks. Shared across sectors; the XBrickMap only
 /// stores [`BrickHandle`]s plus a `sector_mask`.
-#[derive(Debug, Default, Resource)]
+///
+/// `Clone` is cheap (clones the `Arc`); the same underlying `SlotMap` is shared,
+/// so a `GlobalBrickPool` cloned into a background task reads the same live
+/// bricks. Mutations go through the internal `RwLock`.
+#[derive(Resource, Default, Clone)]
 pub struct GlobalBrickPool {
-    bricks: SlotMap<BrickHandle, Brick>,
-    /// Cached uniform material index per brick (0xFFFF = mixed or empty).
-    uniform: SecondaryMap<BrickHandle, u16>,
+    inner: Arc<RwLock<InnerPool>>,
 }
 
 impl GlobalBrickPool {
     pub fn new() -> Self {
         GlobalBrickPool {
-            bricks: SlotMap::with_key(),
-            uniform: SecondaryMap::new(),
+            inner: Arc::new(RwLock::new(InnerPool::default())),
         }
     }
 
     /// O(1) allocation of a fresh, empty brick.
-    pub fn alloc_brick(&mut self) -> BrickHandle {
-        let k = self.bricks.insert(Brick::default());
-        self.uniform.insert(k, 0xFFFF);
-        k
+    ///
+    /// The `uniform` cache is left *absent* (not pre-seeded): an absent entry
+    /// means "not yet computed", so the first `uniform_index` call actually
+    /// derives and caches it. Pre-seeding `0xFFFF` here made `uniform_index`
+    /// short-circuit to `None` forever (the compute path was dead code).
+    pub fn alloc_brick(&self) -> BrickHandle {
+        let mut g = self.inner.write();
+        g.bricks.insert(Brick::default())
     }
 
-    /// O(1) free. The brick's data is dropped; the SecondaryMap slot is
-    /// automatically hidden by the version bump, so no manual cleanup.
-    pub fn free_brick(&mut self, k: BrickHandle) {
-        self.bricks.remove(k);
+    /// O(1) free. Drops the brick data and its cached uniform index so a reused
+    /// slot never resolves a stale uniform value.
+    pub fn free_brick(&self, k: BrickHandle) {
+        let mut g = self.inner.write();
+        g.bricks.remove(k);
+        g.uniform.remove(k);
     }
 
+    /// Drop the cached uniform index for `k` after its voxels change. Callers
+    /// that use [`Self::uniform_index`] must invalidate on edit; it is *not*
+    /// called from `XBrickMap::set_block` to keep that (per-voxel, world-gen)
+    /// hot path free of an extra lock acquisition.
     #[inline]
-    pub fn brick(&self, k: BrickHandle) -> Option<&Brick> {
-        self.bricks.get(k)
+    pub fn invalidate_uniform(&self, k: BrickHandle) {
+        self.inner.write().uniform.remove(k);
     }
 
+    /// Immutably borrow a brick (shared lock). Returns `None` if the handle was
+    /// freed — background tasks must treat that as AIR.
     #[inline]
-    pub fn brick_mut(&mut self, k: BrickHandle) -> Option<&mut Brick> {
-        self.bricks.get_mut(k)
+    pub fn brick(&self, k: BrickHandle) -> Option<MappedRwLockReadGuard<'_, Brick>> {
+        let g = self.inner.read();
+        if g.bricks.contains_key(k) {
+            Some(RwLockReadGuard::map(g, |inner| &inner.bricks[k]))
+        } else {
+            None
+        }
+    }
+
+    /// Acquire a read guard on the inner pool storage for batch operations.
+    /// Helps avoid acquiring the lock repeatedly in hot loops.
+    #[inline]
+    pub fn read_inner(&self) -> RwLockReadGuard<'_, InnerPool> {
+        self.inner.read()
+    }
+
+    /// Acquire a write guard on the inner pool storage for batch allocation.
+    /// [`CompressedChunkData::unpack`] holds this once per sector instead of
+    /// per-brick lock churn (a major source of streaming main-thread stalls).
+    #[inline]
+    pub fn write_inner(&self) -> RwLockWriteGuard<'_, InnerPool> {
+        self.inner.write()
+    }
+
+    /// Mutably borrow a brick (exclusive lock).
+    #[inline]
+    pub fn brick_mut(&self, k: BrickHandle) -> Option<MappedRwLockWriteGuard<'_, Brick>> {
+        let g = self.inner.write();
+        if g.bricks.contains_key(k) {
+            Some(RwLockWriteGuard::map(g, |inner| &mut inner.bricks[k]))
+        } else {
+            None
+        }
     }
 
     /// True when no bricks are allocated (e.g. every sector is empty).
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.bricks.is_empty()
+        self.inner.read().bricks.is_empty()
     }
 
     /// Number of currently-allocated bricks (for boundary assertions).
     #[inline]
     pub fn brick_count(&self) -> usize {
-        self.bricks.len()
+        self.inner.read().bricks.len()
     }
 
     /// Returns the single palette index if the whole brick is one uniform,
-    /// non-empty material, else `None`. Result is cached in `uniform`.
+    /// non-empty material, else `None`. Computed on first call and cached in
+    /// `uniform`; callers must [`Self::invalidate_uniform`] after editing the
+    /// brick or the cached value goes stale.
     pub fn uniform_index(&mut self, k: BrickHandle) -> Option<u8> {
-        if let Some(&cached) = self.uniform.get(k) {
+        let mut g = self.inner.write();
+        if let Some(&cached) = g.uniform.get(k) {
             return if cached == 0xFFFF {
                 None
             } else {
                 Some(cached as u8)
             };
         }
-        let brick = match self.bricks.get(k) {
+        let brick = match g.bricks.get(k) {
             Some(b) => b,
             None => {
-                self.uniform.insert(k, 0xFFFF);
+                g.uniform.insert(k, 0xFFFF);
                 return None;
             }
         };
@@ -131,7 +202,7 @@ impl GlobalBrickPool {
                 match first {
                     None => first = Some(idx),
                     Some(f) if f != idx => {
-                        self.uniform.insert(k, 0xFFFF);
+                        g.uniform.insert(k, 0xFFFF);
                         return None;
                     }
                     _ => {}
@@ -140,11 +211,11 @@ impl GlobalBrickPool {
         }
         match first {
             Some(f) => {
-                self.uniform.insert(k, f as u16);
+                g.uniform.insert(k, f as u16);
                 Some(f)
             }
             None => {
-                self.uniform.insert(k, 0xFFFF);
+                g.uniform.insert(k, 0xFFFF);
                 None
             }
         }

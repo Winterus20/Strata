@@ -23,6 +23,28 @@ pub const DEFAULT_RADIUS: i32 = 3;
 /// pop-in and load/unload flapping during small player jitter.
 pub const DEFAULT_HYSTERESIS: i32 = 1;
 
+/// Sectors spawned per frame during streaming (initial ramp and movement).
+/// Dripping spawns spreads entity creation + world-gen/mesh downstream work
+/// across frames so the main-thread sync budget (~2–4 ms) is not blown in one
+/// hitch (industry streaming best practice: per-frame spawn cap).
+pub const SPAWN_PER_FRAME: usize = 8;
+
+/// Sectors unloaded per frame when the player crosses a streaming boundary.
+/// Unloading 49 sectors in one frame cascades into mesh eviction, GPU cache
+/// teardown, and lighting teardown in the same tick — spreading keeps 144 Hz.
+pub const UNLOAD_PER_FRAME: usize = 12;
+
+/// Alias kept for call sites that referred to the initial ramp constant.
+pub const INITIAL_SPAWN_PER_FRAME: usize = SPAWN_PER_FRAME;
+
+/// Per-frame streaming bookkeeping cost (spawn/unload counts + wall µs).
+#[derive(Resource, Default)]
+pub struct StreamingTimers {
+    pub us: u64,
+    pub spawned: usize,
+    pub unloaded: usize,
+}
+
 /// Convert a world-space position to the sector that contains it.
 #[inline]
 pub fn world_pos_to_sector(pos: Vec3) -> SectorCoord {
@@ -40,6 +62,27 @@ pub fn chebyshev(a: SectorCoord, b: SectorCoord) -> i32 {
         .abs()
         .max((a.1 - b.1).abs())
         .max((a.2 - b.2).abs())
+}
+
+/// Load/mesh priority score: **lower = sooner**. Nearest sectors win; a sector
+/// one step ahead of the player in the current movement direction is boosted
+/// (predictive prefetch, plan 08 / 12 §5).
+#[inline]
+pub fn load_priority(player: SectorCoord, move_dir: SectorCoord, c: SectorCoord) -> i32 {
+    let d = chebyshev(c, player);
+    if move_dir == SectorCoord(0, 0, 0) {
+        return d;
+    }
+    let ahead = SectorCoord(
+        player.0 + move_dir.0,
+        player.1 + move_dir.1,
+        player.2 + move_dir.2,
+    );
+    if chebyshev(c, ahead) < d {
+        d.saturating_sub(1)
+    } else {
+        d
+    }
 }
 
 /// Streaming orchestration state (plan 08 §StreamingManager).
@@ -60,6 +103,16 @@ pub struct StreamingManager {
     pub move_dir: SectorCoord,
     resident: HashMap<SectorCoord, Entity>,
     lru: VecDeque<SectorCoord>,
+    /// Remaining sectors to spawn during the initial ramp. The very first frame
+    /// `desired_resident_set` returns the full ~343-sector ball; spawning them
+    /// all at once would create 343 entities + 343 world-gen tasks in one frame.
+    /// We instead drip the initial load at `INITIAL_SPAWN_PER_FRAME` sectors/frame
+    /// so the generate/mesh/upload pipeline stays budgeted (no first-frame hitch).
+    initial_spawn_remaining: Option<usize>,
+    /// Whether the initial ramp is active. Off by default (tests expect the full
+    /// set in one call); the client enables it once at setup so the first real
+    /// frame drips spawns instead of bombing.
+    ramp_enabled: bool,
 }
 
 impl StreamingManager {
@@ -72,6 +125,8 @@ impl StreamingManager {
             move_dir: SectorCoord(0, 0, 0),
             resident: HashMap::new(),
             lru: VecDeque::new(),
+            initial_spawn_remaining: None,
+            ramp_enabled: false,
         }
     }
 
@@ -139,6 +194,10 @@ impl StreamingManager {
 pub struct StreamingPlugin {
     pub radius: i32,
     pub hysteresis: i32,
+    /// Enable the initial spawn ramp (client only). When set, the first frame's
+    /// full desired set is dripped at `INITIAL_SPAWN_PER_FRAME` sectors/frame
+    /// instead of spawned all at once. Tests leave this off.
+    pub ramp_enabled: bool,
 }
 
 impl Default for StreamingPlugin {
@@ -146,13 +205,23 @@ impl Default for StreamingPlugin {
         Self {
             radius: DEFAULT_RADIUS,
             hysteresis: DEFAULT_HYSTERESIS,
+            ramp_enabled: false,
         }
     }
 }
 
 impl StreamingPlugin {
     pub fn new(radius: i32, hysteresis: i32) -> Self {
-        Self { radius, hysteresis }
+        Self {
+            radius,
+            hysteresis,
+            ramp_enabled: false,
+        }
+    }
+
+    pub fn with_ramp(mut self) -> Self {
+        self.ramp_enabled = true;
+        self
     }
 }
 
@@ -165,7 +234,10 @@ impl StrataPlugin for StreamingPlugin {
         if !app.world().contains_resource::<GlobalBrickPool>() {
             app.insert_resource(GlobalBrickPool::new());
         }
-        app.insert_resource(StreamingManager::new(self.radius, self.hysteresis));
+        let mut mgr = StreamingManager::new(self.radius, self.hysteresis);
+        mgr.ramp_enabled = self.ramp_enabled;
+        app.insert_resource(mgr);
+        app.init_resource::<StreamingTimers>();
         app.add_systems(Update, streaming_system.in_set(StrataSet::Streaming));
     }
 }
@@ -182,10 +254,16 @@ impl StrataPlugin for StreamingPlugin {
 pub fn streaming_system(
     mut commands: Commands,
     mut manager: ResMut<StreamingManager>,
-    player: Query<&Transform>,
+    mut timers: ResMut<StreamingTimers>,
+    player: Query<&Transform, With<StreamingAnchor>>,
     sectors: Query<(Entity, &SectorCoord, Option<&XBrickMap>)>,
     mut pool: ResMut<GlobalBrickPool>,
 ) {
+    timers.us = 0;
+    timers.spawned = 0;
+    timers.unloaded = 0;
+    let t0 = std::time::Instant::now();
+
     // 1. Resolve the player sector (only the player entity carries a Transform;
     //    sector entities carry only `SectorCoord`).
     let player_sector = player
@@ -210,33 +288,69 @@ pub fn streaming_system(
     manager.last_player_sector = Some(player_sector);
     manager.player_sector = player_sector;
 
-    // Reconcile the resident map with the live sector entities (in case any were
-    // despawned externally) so we never re-spawn an existing sector.
-    let current: HashMap<SectorCoord, Entity> = sectors.iter().map(|(e, c, _)| (*c, e)).collect();
-    for (c, e) in &current {
-        if !manager.is_resident(c) {
-            manager.mark_loaded(*c, *e);
-        }
-    }
+    // Fast reconciliation: O(n_resident) entity-alive check + O(n_sectors) adopt
+    // scan, zero per-frame HashMap allocation.
     let dead: Vec<SectorCoord> = manager
         .resident
-        .keys()
-        .filter(|c| !current.contains_key(*c))
-        .copied()
+        .iter()
+        .filter(|&(_, e)| sectors.get(*e).is_err())
+        .map(|(c, _)| *c)
         .collect();
     for c in &dead {
         manager.mark_unloaded(c);
+    }
+    // Adopt externally-spawned sectors (rare; mainly test support).
+    for (e, c, _) in sectors.iter() {
+        if !manager.is_resident(c) {
+            manager.mark_loaded(*c, e);
+        }
     }
 
     let desired = manager.desired_resident_set(player_sector);
 
     // 2/3. LOAD — Filter-First: spawn only the sectors missing from the resident
     //     set. `WorldGen` (same frame, later set) will generate each one.
-    for c in &desired {
-        if !manager.is_resident(c) {
-            let e = commands.spawn(SectorCoord(c.0, c.1, c.2)).id();
-            manager.mark_loaded(*c, e);
+    //     When `ramp_enabled` (client only, not tests) and this is the first
+    //     substantial load, cap spawns at `INITIAL_SPAWN_PER_FRAME` so the full
+    //     ~343-sector ball is dripped across frames instead of all at once; this
+    //     keeps entity creation + world-gen task enqueue budgeted and avoids the
+    //     first-frame spawn bomb. Tests leave the ramp off and get the full set.
+    let mut initial_cap = if manager.ramp_enabled {
+        SPAWN_PER_FRAME
+    } else {
+        usize::MAX
+    };
+    if manager.ramp_enabled
+        && manager.initial_spawn_remaining.is_none()
+        && desired.len() > manager.resident.len() + SPAWN_PER_FRAME
+    {
+        manager.initial_spawn_remaining = Some(desired.len());
+    }
+    let mut to_spawn: Vec<SectorCoord> = desired
+        .iter()
+        .filter(|c| !manager.is_resident(c))
+        .copied()
+        .collect();
+    to_spawn.sort_by_key(|c| load_priority(player_sector, manager.move_dir, *c));
+    for c in to_spawn {
+        if initial_cap == 0 {
+            break;
         }
+        let e = commands.spawn(SectorCoord(c.0, c.1, c.2)).id();
+        manager.mark_loaded(c, e);
+        timers.spawned += 1;
+        initial_cap -= 1;
+        if let Some(rem) = manager.initial_spawn_remaining.as_mut() {
+            // Saturating: the ramp counter is seeded with `desired.len()`
+            // at ramp start, but the player can move (e.g. fall through Y
+            // sectors) mid-ramp, shifting `desired` so total spawns exceed
+            // the seed. `-= 1` then underflowed a `usize` (debug panic).
+            // Hitting 0 just ends the ramp (handled below).
+            *rem = rem.saturating_sub(1);
+        }
+    }
+    if manager.initial_spawn_remaining == Some(0) {
+        manager.initial_spawn_remaining = None;
     }
 
     // 4. UNLOAD — despawn sectors outside the desired set, freeing their pooled
@@ -248,15 +362,15 @@ pub fn streaming_system(
         .filter(|c| !desired.contains(*c))
         .copied()
         .collect();
-    to_unload.sort_by_key(|c| {
-        manager
-            .lru
-            .iter()
-            .position(|x| x == c)
-            .unwrap_or(usize::MAX)
-    });
+    // Farthest-from-player first: frees the shell the player just left before
+    // nearer sectors, and keeps the visible set stable while the budget drains.
+    to_unload.sort_by_key(|c| std::cmp::Reverse(chebyshev(*c, player_sector)));
 
+    let mut unload_budget = UNLOAD_PER_FRAME;
     for c in &to_unload {
+        if unload_budget == 0 {
+            break;
+        }
         if let Some(e) = manager.entity_for(c) {
             if let Ok((_, _, Some(map))) = sectors.get(e) {
                 map.free(&mut pool);
@@ -264,7 +378,10 @@ pub fn streaming_system(
             commands.entity(e).despawn();
         }
         manager.mark_unloaded(c);
+        timers.unloaded += 1;
+        unload_budget -= 1;
     }
+    timers.us = t0.elapsed().as_micros() as u64;
 }
 
 #[cfg(test)]

@@ -25,7 +25,12 @@ bevy = { workspace = true, default-features = false, features = [
     "bevy_asset",
     "bevy_mesh",
     "bevy_scene",
-    "detailed_trace",
+    # The client references `bevy::render::RenderPlugin` (to disable it) and
+    # `bevy::shader::{Shader, ShaderLoader}` (to register the asset itself since
+    # RenderPlugin is off). These types live behind `bevy_render`, so the client
+    # must enable it explicitly — previously it leaked in via strata_render's
+    # `default-features = true` (now removed for modularity).
+    "bevy_render",
 ] }
 bevy_rapier3d = { workspace = true }
 

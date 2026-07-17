@@ -198,8 +198,9 @@ fn open_column_has_max_sky_at_top() {
     let light = engine.compute_sector(SectorCoord(0, 0, 0), &map, &pool, &pal, &reg);
     // Fully open (air) sector: top voxel sees full sky.
     assert_eq!(light.sky(VoxelCoord::new(16, 31, 16)), 15);
-    // Bottom of the column is fully attenuated.
-    assert_eq!(light.sky(VoxelCoord::new(16, 0, 16)), 0);
+    // Open air column: sunlight reaches the bottom at full strength — there is
+    // no vertical attenuation, only an opaque block darkens the column below.
+    assert_eq!(light.sky(VoxelCoord::new(16, 0, 16)), 15);
 }
 
 #[test]

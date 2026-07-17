@@ -9,3 +9,5 @@ bevy = { workspace = true }
 bevy_rapier3d = { workspace = true }
 strata_core = { path = "../strata_core" }
 strata_world = { path = "../strata_world" }
+thread-priority = "3.1.1"
+futures-lite = "2.6.0"

@@ -6,7 +6,8 @@ use bevy_rapier3d::prelude::*;
 use strata_core::prelude::*;
 
 use crate::voxel_collider::{
-    CharacterController, build_sector_colliders, sync_dirty_sector_colliders,
+    CharacterController, PendingCollider, PhysicsPool, PhysicsTimers, apply_sector_collider_tasks,
+    cleanup_pending_colliders, spawn_sector_collider_tasks, sync_dirty_sector_colliders,
 };
 
 /// Strata physics plugin (M6): Rapier3D voxel colliders + character controller.
@@ -25,12 +26,19 @@ impl StrataPlugin for PhysicsPlugin {
         // `default-features = false`). The physics pipeline runs in PostUpdate.
         app.add_plugins(RapierPhysicsPlugin::<NoUserData>::default());
         app.insert_resource(CharacterController::default());
+        app.init_resource::<PhysicsPool>();
+        app.init_resource::<PendingCollider>();
+        app.init_resource::<PhysicsTimers>();
         app.add_systems(
             Update,
             (
-                build_sector_colliders.in_set(StrataSet::Physics),
-                sync_dirty_sector_colliders.in_set(StrataSet::Physics),
-            ),
+                apply_sector_collider_tasks,
+                spawn_sector_collider_tasks,
+                cleanup_pending_colliders,
+                sync_dirty_sector_colliders,
+            )
+                .chain()
+                .in_set(StrataSet::Physics),
         );
     }
 }
