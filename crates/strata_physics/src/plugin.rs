@@ -6,8 +6,9 @@ use bevy_rapier3d::prelude::*;
 use strata_core::prelude::*;
 
 use crate::voxel_collider::{
-    CharacterController, PendingCollider, PhysicsPool, PhysicsTimers, apply_sector_collider_tasks,
-    cleanup_pending_colliders, spawn_sector_collider_tasks, sync_dirty_sector_colliders,
+    CharacterController, PendingCollider, PhysicsTimers, PhysicsWorkerChannels,
+    apply_sector_collider_tasks, build_voxels_collider, cleanup_pending_colliders,
+    spawn_sector_collider_tasks, sync_dirty_sector_colliders,
 };
 
 /// Strata physics plugin (M6): Rapier3D voxel colliders + character controller.
@@ -26,7 +27,35 @@ impl StrataPlugin for PhysicsPlugin {
         // `default-features = false`). The physics pipeline runs in PostUpdate.
         app.add_plugins(RapierPhysicsPlugin::<NoUserData>::default());
         app.insert_resource(CharacterController::default());
-        app.init_resource::<PhysicsPool>();
+
+        let (tx_request, rx_request) =
+            std::sync::mpsc::channel::<crate::voxel_collider::VoxelColliderRequest>();
+        let (tx_response, rx_response) =
+            std::sync::mpsc::channel::<crate::voxel_collider::VoxelColliderResponse>();
+
+        std::thread::Builder::new()
+            .name("strata-physics-worker".to_string())
+            .spawn(move || {
+                while let Ok(req) = rx_request.recv() {
+                    let t0 = std::time::Instant::now();
+                    let collider = build_voxels_collider(&req.samples);
+                    let elapsed = t0.elapsed().as_micros() as u64;
+                    let _ = tx_response.send(crate::voxel_collider::VoxelColliderResponse {
+                        entity: req.entity,
+                        coord: req.coord,
+                        origin: req.origin,
+                        collider,
+                        rapier_us: elapsed,
+                    });
+                }
+            })
+            .expect("Failed to spawn strata-physics-worker thread");
+
+        app.insert_resource(PhysicsWorkerChannels {
+            tx_request,
+            rx_response: std::sync::Mutex::new(rx_response),
+        });
+
         app.init_resource::<PendingCollider>();
         app.init_resource::<PhysicsTimers>();
         app.add_systems(

@@ -685,9 +685,8 @@ impl Renderer {
         prepass.quad_capacity = new_cap;
         // Staging vecs mirror the SSBO capacity so `upload_quad_region` can stage
         // each sector at its own offset; grow them in lockstep with the buffers.
-        self.quad_upload_staging.resize((new_cap as usize) * 8, 0);
-        self.origin_upload_staging
-            .resize(new_cap as usize, [0.0; 4]);
+        self.quad_upload_staging.resize(new_cap * 8, 0);
+        self.origin_upload_staging.resize(new_cap, [0.0; 4]);
         prepass.bind_group = Self::make_bind_group(
             &self.device,
             &prepass.bgl,
@@ -826,7 +825,7 @@ impl Renderer {
         // issues one draw per run, not one per sector. Spans are sorted by base;
         // bit-adjacent spans (start == prev_end) fuse into one.
         let mut sorted = ranges.to_vec();
-        sorted.sort_by(|a, b| a.0.cmp(&b.0));
+        sorted.sort_by_key(|a| a.0);
         let mut runs: Vec<(u32, u32)> = Vec::with_capacity(sorted.len());
         for &(base, count) in &sorted {
             if count == 0 {

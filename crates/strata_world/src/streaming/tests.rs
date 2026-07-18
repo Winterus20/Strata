@@ -260,13 +260,13 @@ fn parked_brick_count(sector: SectorCoord, _n: usize) -> usize {
             .iter(app.world_mut())
             .next()
             .is_none();
-        let any_unscaled = !app
+        let any_unscaled = app
             .world_mut()
             .query_filtered::<Entity, (With<SectorCoord>, Without<Generated>, Without<Generating>)>(
             )
             .iter(app.world_mut())
             .next()
-            .is_none();
+            .is_some();
         let has_bricks = app.world().resource::<GlobalBrickPool>().brick_count() > 0;
         if pending_empty && generating_empty && !any_unscaled && has_bricks {
             break;
@@ -297,13 +297,13 @@ fn integration_unload_frees_pool_bricks() {
             .iter(app.world_mut())
             .next()
             .is_none();
-        let any_unscaled = !app
+        let any_unscaled = app
             .world_mut()
             .query_filtered::<Entity, (With<SectorCoord>, Without<Generated>, Without<Generating>)>(
             )
             .iter(app.world_mut())
             .next()
-            .is_none();
+            .is_some();
         let has_bricks = app.world().resource::<GlobalBrickPool>().brick_count() > 0;
         if pending_empty && generating_empty && !any_unscaled && has_bricks {
             break;
@@ -335,13 +335,13 @@ fn integration_unload_frees_pool_bricks() {
             .iter(app.world_mut())
             .next()
             .is_none();
-        let any_unscaled = !app
+        let any_unscaled = app
             .world_mut()
             .query_filtered::<Entity, (With<SectorCoord>, Without<Generated>, Without<Generating>)>(
             )
             .iter(app.world_mut())
             .next()
-            .is_none();
+            .is_some();
         if pending_empty && generating_empty && !any_unscaled {
             break;
         }

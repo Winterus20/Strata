@@ -10,12 +10,9 @@
 //! `voxels_from_points` (~4 ms for dense terrain) never blocks the frame loop.
 
 use bevy::prelude::*;
-use bevy::tasks::futures::check_ready;
-use bevy::tasks::{Task, TaskPool, TaskPoolBuilder};
 use bevy_rapier3d::prelude::*;
-use futures_lite::future::yield_now;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::mpsc::{Receiver, Sender};
 use strata_core::prelude::*;
 use strata_core::xbrickmap::coords::SECTOR_DIM;
 use strata_world::plugin::Generated;
@@ -30,6 +27,8 @@ const COLLIDER_APPLY_BUDGET: usize = 1;
 #[derive(Resource, Default)]
 pub struct PhysicsTimers {
     pub build_us: u64,
+    pub sort_us: u64,
+    pub queue_us: u64,
     pub built: usize,
     /// Voxel sample collection (bitmask walk, main thread).
     pub collect_us: u64,
@@ -66,42 +65,28 @@ pub struct CharacterController {
     pub controller: KinematicCharacterController,
 }
 
-/// Dedicated background pool for Rapier voxel collider construction.
+pub struct VoxelColliderRequest {
+    pub entity: Entity,
+    pub coord: SectorCoord,
+    pub origin: Vec3,
+    pub samples: Vec<Vec3>,
+}
+
+pub struct VoxelColliderResponse {
+    pub entity: Entity,
+    pub coord: SectorCoord,
+    pub origin: Vec3,
+    pub collider: Collider,
+    pub rapier_us: u64,
+}
+
 #[derive(Resource)]
-pub struct PhysicsPool(pub TaskPool, pub usize);
-
-impl FromWorld for PhysicsPool {
-    fn from_world(_world: &mut World) -> Self {
-        let n = std::thread::available_parallelism()
-            .map(|p| p.get())
-            .unwrap_or(4)
-            .max(2);
-        let workers = (n.saturating_sub(6)).clamp(1, 1);
-        PhysicsPool(
-            TaskPoolBuilder::new()
-                .num_threads(workers)
-                .thread_name("strata-physics".to_string())
-                .on_thread_spawn(lower_worker_thread_priority)
-                .build(),
-            workers,
-        )
-    }
-}
-
-fn lower_worker_thread_priority() {
-    use thread_priority::{ThreadPriority, set_current_thread_priority};
-    if let Ok(v) = 30u8.try_into() {
-        let _ = set_current_thread_priority(ThreadPriority::Crossplatform(v));
-    }
-}
-
-struct BuiltCollider {
-    collider: Collider,
-    rapier_us: u64,
+pub struct PhysicsWorkerChannels {
+    pub tx_request: Sender<VoxelColliderRequest>,
+    pub rx_response: std::sync::Mutex<Receiver<VoxelColliderResponse>>,
 }
 
 struct PendingColliderTask {
-    task: Task<BuiltCollider>,
     entity: Entity,
     origin: Vec3,
 }
@@ -200,34 +185,37 @@ pub fn build_voxels_collider(samples: &[Vec3]) -> Collider {
 
 fn queue_collider_build(
     commands: &mut Commands,
-    physics_pool: &PhysicsPool,
+    channels: &PhysicsWorkerChannels,
     pending: &mut PendingCollider,
     entity: Entity,
     coord: SectorCoord,
     samples: Vec<Vec3>,
 ) {
     let origin = sector_world_origin(coord);
-    let samples = Arc::new(samples);
-    let task = physics_pool.0.spawn(async move {
-        // Without an await point, `async_task` may poll this future on the
-        // spawning thread and run `voxels_from_points` synchronously (~5 ms).
-        yield_now().await;
-        let t0 = std::time::Instant::now();
-        let collider = build_voxels_collider(&samples);
-        BuiltCollider {
-            collider,
-            rapier_us: t0.elapsed().as_micros() as u64,
-        }
-    });
-    pending.tasks.insert(
+
+    let t_send = std::time::Instant::now();
+    let _ = channels.tx_request.send(VoxelColliderRequest {
+        entity,
         coord,
-        PendingColliderTask {
-            task,
-            entity,
-            origin,
-        },
-    );
+        origin,
+        samples,
+    });
+    let d_send = t_send.elapsed().as_micros();
+
+    let t_insert = std::time::Instant::now();
+    pending
+        .tasks
+        .insert(coord, PendingColliderTask { entity, origin });
+    let d_insert = t_insert.elapsed().as_micros();
+
+    let t_cmd = std::time::Instant::now();
     commands.entity(entity).insert(BuildingSectorCollider);
+    let d_cmd = t_cmd.elapsed().as_micros();
+
+    trace!(
+        "QUEUE_COLLIDER_BUILD_DIAG coord={:?} send={} us, insert={} us, cmd={} us",
+        coord, d_send, d_insert, d_cmd
+    );
 }
 
 /// Snapshot solid voxels and dispatch Rapier builds to the physics worker pool.
@@ -236,7 +224,7 @@ pub fn spawn_sector_collider_tasks(
     mut commands: Commands,
     registry: Res<BlockRegistry>,
     pool: Res<GlobalBrickPool>,
-    physics_pool: Res<PhysicsPool>,
+    channels: Res<PhysicsWorkerChannels>,
     streaming: Option<Res<StreamingManager>>,
     stream_timers: Option<Res<StreamingTimers>>,
     mut pending: ResMut<PendingCollider>,
@@ -260,6 +248,8 @@ pub fn spawn_sector_collider_tasks(
     >,
 ) {
     timers.build_us = 0;
+    timers.sort_us = 0;
+    timers.queue_us = 0;
     timers.collect_us = 0;
     timers.pending = pending.len();
     if new_sectors.is_empty() && revived.is_empty() {
@@ -271,7 +261,7 @@ pub fn spawn_sector_collider_tasks(
         return;
     }
 
-    let max_inflight = physics_pool.1.saturating_add(2).max(COLLIDER_SPAWN_BUDGET);
+    let max_inflight = 3; // 1 background worker thread + 2 tasks buffer limit
     if pending.len() >= max_inflight {
         return;
     }
@@ -286,11 +276,14 @@ pub fn spawn_sector_collider_tasks(
         .map(|s| s.move_dir)
         .unwrap_or(SectorCoord(0, 0, 0));
 
+    let t_sort = std::time::Instant::now();
     let mut work: Vec<_> = new_sectors.iter().chain(revived.iter()).collect();
     work.sort_by_key(|(_, c, _, _)| load_priority(player, move_dir, **c));
+    timers.sort_us = t_sort.elapsed().as_micros() as u64;
 
     let mut samples: Vec<Vec3> = Vec::new();
     let mut budget = COLLIDER_SPAWN_BUDGET;
+    timers.queue_us = 0;
     for (entity, coord, map, palette) in work {
         if budget == 0 {
             break;
@@ -306,18 +299,22 @@ pub fn spawn_sector_collider_tasks(
         };
         timers.collect_us += tc.elapsed().as_micros() as u64;
         if owned.is_empty() {
+            let t_q = std::time::Instant::now();
             commands.entity(entity).insert(SectorCollider);
+            timers.queue_us += t_q.elapsed().as_micros() as u64;
             budget -= 1;
             continue;
         }
+        let t_q = std::time::Instant::now();
         queue_collider_build(
             &mut commands,
-            &physics_pool,
+            &channels,
             &mut pending,
             entity,
             *coord,
             owned,
         );
+        timers.queue_us += t_q.elapsed().as_micros() as u64;
         budget -= 1;
     }
     timers.build_us = t0.elapsed().as_micros() as u64;
@@ -325,38 +322,32 @@ pub fn spawn_sector_collider_tasks(
 }
 
 /// Apply completed background collider builds on the main thread.
-///
-/// Runs **before** [`spawn_sector_collider_tasks`] each frame so tasks queued
-/// this frame are never polled until the next frame — the worker gets a full
-/// frame to finish `voxels_from_points` off-thread.
 pub fn apply_sector_collider_tasks(
     mut commands: Commands,
     mut pending: ResMut<PendingCollider>,
+    channels: Res<PhysicsWorkerChannels>,
     mut timers: ResMut<PhysicsTimers>,
     entities: Query<Entity, With<SectorCoord>>,
 ) {
     timers.apply_us = 0;
     timers.rapier_us = 0;
     timers.built = 0;
-    if pending.tasks.is_empty() {
-        timers.pending = 0;
-        return;
-    }
 
-    let coords: Vec<SectorCoord> = pending.tasks.keys().copied().collect();
     let mut apply_budget = COLLIDER_APPLY_BUDGET;
-    for coord in coords {
-        if apply_budget == 0 {
+    while apply_budget > 0 {
+        let Ok(res) = channels.rx_response.lock().unwrap().try_recv() else {
             break;
-        }
-        let mut pt = pending.tasks.remove(&coord).unwrap();
-        let Some(built) = check_ready(&mut pt.task) else {
-            pending.tasks.insert(coord, pt);
-            continue;
         };
+
+        // If the task was cleaned up (unloaded), discard it
+        if !pending.tasks.contains_key(&res.coord) {
+            continue;
+        }
+        let pt = pending.tasks.remove(&res.coord).unwrap();
+
         apply_budget -= 1;
         timers.built += 1;
-        timers.rapier_us += built.rapier_us;
+        timers.rapier_us += res.rapier_us;
 
         if entities.get(pt.entity).is_err() {
             continue;
@@ -366,7 +357,7 @@ pub fn apply_sector_collider_tasks(
         commands
             .entity(pt.entity)
             .insert(RigidBody::Fixed)
-            .insert(built.collider)
+            .insert(res.collider)
             .insert(Transform::from_translation(pt.origin))
             .insert(GlobalTransform::from_translation(pt.origin))
             .insert(SectorCollider)

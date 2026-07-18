@@ -224,7 +224,7 @@ struct DiagLogState {
 /// Windowed diagnostic: every 500 ms, or on a large FPS/frame-time spike, log player
 /// pose, streaming stage timings, and GPU counters. Avoids per-frame spam while
 /// still catching hitch frames.
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 fn diagnostics_log_system(
     mut state: Local<DiagLogState>,
     pool: Res<GlobalBrickPool>,
@@ -325,7 +325,7 @@ fn diagnostics_log_system(
         "PERIOD"
     };
     info!(
-        "DIAG[{tag}] fps={:.1} ema_fps={:.1} frame_ms={:.1} pos=({:.1},{:.1},{:.1}) eye=({:.1},{:.1},{:.1}) yaw={:.2} pitch={:.2} forward=({:.2},{:.2},{:.2}) eye_solid={:?} sectors={} quads={} reflatten={} uploaded={} draws={} rebuild={} pending={} wg_apply={} wg_n={} mesh_spawn={} mesh_n={} mesh_apply={} mesh_an={} phys_build={} phys_n={} phys_col={} phys_rap={} phys_apply={} phys_pend={} phys_sync={} phys_sn={} light={} light_n={} stream={} stream_sp={} stream_un={} us_reflatten={} us_upload={} us_draw={}",
+        "DIAG[{tag}] fps={:.1} ema_fps={:.1} frame_ms={:.1} pos=({:.1},{:.1},{:.1}) eye=({:.1},{:.1},{:.1}) yaw={:.2} pitch={:.2} forward=({:.2},{:.2},{:.2}) eye_solid={:?} sectors={} quads={} reflatten={} uploaded={} draws={} rebuild={} pending={} wg_apply={} wg_n={} mesh_spawn={} mesh_n={} mesh_apply={} mesh_an={} phys_build={} phys_sort={} phys_queue={} phys_n={} phys_col={} phys_rap={} phys_apply={} phys_pend={} phys_sync={} phys_sn={} light={} light_n={} stream={} stream_sp={} stream_un={} us_reflatten={} us_upload={} us_draw={}",
         fps,
         state.fps_ema,
         frame_ms,
@@ -355,6 +355,8 @@ fn diagnostics_log_system(
         mesh_timers.apply_us,
         mesh_timers.applied,
         phys_timers.build_us,
+        phys_timers.sort_us,
+        phys_timers.queue_us,
         phys_timers.built,
         phys_timers.collect_us,
         phys_timers.rapier_us,

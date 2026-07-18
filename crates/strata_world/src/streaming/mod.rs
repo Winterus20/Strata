@@ -257,7 +257,7 @@ pub fn streaming_system(
     mut timers: ResMut<StreamingTimers>,
     player: Query<&Transform, With<StreamingAnchor>>,
     sectors: Query<(Entity, &SectorCoord, Option<&XBrickMap>)>,
-    mut pool: ResMut<GlobalBrickPool>,
+    pool: Res<GlobalBrickPool>,
 ) {
     timers.us = 0;
     timers.spawned = 0;
@@ -367,19 +367,22 @@ pub fn streaming_system(
     to_unload.sort_by_key(|c| std::cmp::Reverse(chebyshev(*c, player_sector)));
 
     let mut unload_budget = UNLOAD_PER_FRAME;
-    for c in &to_unload {
-        if unload_budget == 0 {
-            break;
-        }
-        if let Some(e) = manager.entity_for(c) {
-            if let Ok((_, _, Some(map))) = sectors.get(e) {
-                map.free(&mut pool);
+    if unload_budget > 0 && !to_unload.is_empty() {
+        let mut inner_pool = pool.write_inner();
+        for c in &to_unload {
+            if unload_budget == 0 {
+                break;
             }
-            commands.entity(e).despawn();
+            if let Some(e) = manager.entity_for(c) {
+                if let Ok((_, _, Some(map))) = sectors.get(e) {
+                    map.free_locked(&mut inner_pool);
+                }
+                commands.entity(e).despawn();
+            }
+            manager.mark_unloaded(c);
+            timers.unloaded += 1;
+            unload_budget -= 1;
         }
-        manager.mark_unloaded(c);
-        timers.unloaded += 1;
-        unload_budget -= 1;
     }
     timers.us = t0.elapsed().as_micros() as u64;
 }

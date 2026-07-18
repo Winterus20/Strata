@@ -101,7 +101,7 @@ impl XBrickMap {
         if (self.sector_mask >> bi) & 1 == 0 {
             return BlockId::AIR;
         }
-        let handle = match self.bricks[bi as usize] {
+        let handle = match self.bricks[bi] {
             Some(h) => h,
             None => return BlockId::AIR,
         };
@@ -203,6 +203,15 @@ impl XBrickMap {
         sub.indices[vb] = local;
     }
 
+    /// Release every pooled brick owned by this sector back to the pre-locked [`InnerPool`].
+    /// Avoids repeated lock acquisition in loops.
+    pub fn free_locked(&self, pool: &mut InnerPool) {
+        for handle in self.bricks.iter().flatten() {
+            pool.bricks.remove(*handle);
+            pool.uniform.remove(*handle);
+        }
+    }
+
     /// Release every pooled brick owned by this sector back to `GlobalBrickPool`.
     ///
     /// Called by the streaming unload system *before* despawning the sector
@@ -210,9 +219,8 @@ impl XBrickMap {
     /// `XBrickMap` itself is dropped on despawn; without this explicit free its
     /// bricks would leak (they live in the global pool, not in the component).
     pub fn free(&self, pool: &mut GlobalBrickPool) {
-        for handle in self.bricks.iter().flatten() {
-            pool.free_brick(*handle);
-        }
+        let mut inner = pool.write_inner();
+        self.free_locked(&mut inner);
     }
 
     /// Snapshot this sector into a serializable [`CompressedChunkData`].

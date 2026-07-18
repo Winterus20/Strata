@@ -343,7 +343,7 @@ pub fn player_controller_system(
             &st,
             &input,
             look,
-            &is_solid,
+            is_solid,
             tf.translation,
             // Fixed timestep (default 64 Hz): movement is framerate-independent
             // and deterministic (plan 14 §D3), so tunneling/jitter that a

@@ -72,6 +72,10 @@ impl PendingMesh {
     pub fn len(&self) -> usize {
         self.tasks.len()
     }
+
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
 }
 
 /// Per-frame timing for the meshing spawn stage (the synchronous main-thread
@@ -375,11 +379,11 @@ pub fn apply_mesh_tasks(
         // faces toward us. The mask check breaks the cycle once both sides have
         // meshed with each other present.
         let offsets = neighbor_offsets(coord);
-        for i in 0..6 {
+        for (i, n) in offsets.iter().enumerate() {
             if mt.present_mask & (1u8 << i) == 0 {
                 continue;
             }
-            let n = offsets[i];
+            let n = *n;
             let back_bit = i ^ 1;
             if !storage.meshes.contains_key(&n) {
                 continue;

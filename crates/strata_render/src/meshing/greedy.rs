@@ -79,11 +79,47 @@ pub fn fill_sector_snapshot_locked(
     palette: &SectorPalette,
     out: &mut [BlockId; SNAPSHOT_LEN],
 ) {
-    for z in 0..32u32 {
-        for y in 0..32u32 {
-            for x in 0..32u32 {
-                out[snap_index(x, y, z)] =
-                    sector.get_block_locked(pool, palette, VoxelCoord::new(x, y, z));
+    out.fill(BlockId::AIR);
+    let mut sector_mask = sector.sector_mask;
+    while sector_mask != 0 {
+        let bi = sector_mask.trailing_zeros() as usize;
+        sector_mask &= sector_mask - 1;
+        let Some(handle) = sector.brick_handle_at(bi) else {
+            continue;
+        };
+        let Some(brick) = pool.bricks.get(handle) else {
+            continue;
+        };
+        let bx = (bi % 4) as u32;
+        let by = (bi / 16) as u32;
+        let bz = ((bi % 16) / 4) as u32;
+        let brick_base_x = bx * 8;
+        let brick_base_y = by * 8;
+        let brick_base_z = bz * 8;
+
+        let mut sub_mask = brick.sub_mask;
+        while sub_mask != 0 {
+            let si = sub_mask.trailing_zeros() as usize;
+            sub_mask &= sub_mask - 1;
+            let sub = &brick.subs[si];
+            let sx = (si % 4) as u32;
+            let sy = (si / 16) as u32;
+            let sz = ((si % 16) / 4) as u32;
+            let sub_base_x = brick_base_x + sx * 2;
+            let sub_base_y = brick_base_y + sy * 2;
+            let sub_base_z = brick_base_z + sz * 2;
+
+            let mut voxel_mask = sub.voxel_mask;
+            while voxel_mask != 0 {
+                let vb = voxel_mask.trailing_zeros() as usize;
+                voxel_mask &= voxel_mask - 1;
+                let id = palette.resolve(sub.indices[vb]);
+                if id != BlockId::AIR {
+                    let lx = sub_base_x + (vb as u32 & 1);
+                    let ly = sub_base_y + ((vb as u32 >> 2) & 1);
+                    let lz = sub_base_z + ((vb as u32 >> 1) & 1);
+                    out[snap_index(lx, ly, lz)] = id;
+                }
             }
         }
     }
@@ -116,50 +152,91 @@ pub fn fill_boundary_plane_locked(
     idx: usize,
     out: &mut BoundaryPlane,
 ) {
-    let sample =
-        |x: u32, y: u32, z: u32| sector.get_block_locked(pool, palette, VoxelCoord::new(x, y, z));
-    // The fixed primary-axis coordinate is the neighbor edge facing the owning
-    // sector: +X neighbor -> its x=0 face, -X neighbor -> its x=31 face, etc.
-    match idx {
-        0 => {
-            for ny in 0..32u32 {
-                for nz in 0..32u32 {
-                    out[(ny * 32 + nz) as usize] = sample(0, ny, nz);
-                }
-            }
+    out.fill(BlockId::AIR);
+    let mut sector_mask = sector.sector_mask;
+    while sector_mask != 0 {
+        let bi = sector_mask.trailing_zeros() as usize;
+        sector_mask &= sector_mask - 1;
+
+        // Filter bricks by face
+        let bx = (bi % 4) as u32;
+        let by = (bi / 16) as u32;
+        let bz = ((bi % 16) / 4) as u32;
+        match idx {
+            0 if bx != 0 => continue,
+            1 if bx != 3 => continue,
+            2 if by != 0 => continue,
+            3 if by != 3 => continue,
+            4 if bz != 0 => continue,
+            5 if bz != 3 => continue,
+            _ => {}
         }
-        1 => {
-            for ny in 0..32u32 {
-                for nz in 0..32u32 {
-                    out[(ny * 32 + nz) as usize] = sample(31, ny, nz);
-                }
+
+        let Some(handle) = sector.brick_handle_at(bi) else {
+            continue;
+        };
+        let Some(brick) = pool.bricks.get(handle) else {
+            continue;
+        };
+        let brick_base_x = bx * 8;
+        let brick_base_y = by * 8;
+        let brick_base_z = bz * 8;
+
+        let mut sub_mask = brick.sub_mask;
+        while sub_mask != 0 {
+            let si = sub_mask.trailing_zeros() as usize;
+            sub_mask &= sub_mask - 1;
+
+            // Filter sub-bricks by face
+            let sx = (si % 4) as u32;
+            let sy = (si / 16) as u32;
+            let sz = ((si % 16) / 4) as u32;
+            match idx {
+                0 if sx != 0 => continue,
+                1 if sx != 3 => continue,
+                2 if sy != 0 => continue,
+                3 if sy != 3 => continue,
+                4 if sz != 0 => continue,
+                5 if sz != 3 => continue,
+                _ => {}
             }
-        }
-        2 => {
-            for nx in 0..32u32 {
-                for nz in 0..32u32 {
-                    out[(nx * 32 + nz) as usize] = sample(nx, 0, nz);
+
+            let sub = &brick.subs[si];
+            let sub_base_x = brick_base_x + sx * 2;
+            let sub_base_y = brick_base_y + sy * 2;
+            let sub_base_z = brick_base_z + sz * 2;
+
+            let mut voxel_mask = sub.voxel_mask;
+            while voxel_mask != 0 {
+                let vb = voxel_mask.trailing_zeros() as usize;
+                voxel_mask &= voxel_mask - 1;
+
+                // Filter voxels by face
+                let lx = vb as u32 & 1;
+                let ly = (vb as u32 >> 2) & 1;
+                let lz = (vb as u32 >> 1) & 1;
+                match idx {
+                    0 if lx != 0 => continue,
+                    1 if lx != 1 => continue,
+                    2 if ly != 0 => continue,
+                    3 if ly != 1 => continue,
+                    4 if lz != 0 => continue,
+                    5 if lz != 1 => continue,
+                    _ => {}
                 }
-            }
-        }
-        3 => {
-            for nx in 0..32u32 {
-                for nz in 0..32u32 {
-                    out[(nx * 32 + nz) as usize] = sample(nx, 31, nz);
-                }
-            }
-        }
-        4 => {
-            for nx in 0..32u32 {
-                for ny in 0..32u32 {
-                    out[(nx * 32 + ny) as usize] = sample(nx, ny, 0);
-                }
-            }
-        }
-        _ => {
-            for nx in 0..32u32 {
-                for ny in 0..32u32 {
-                    out[(nx * 32 + ny) as usize] = sample(nx, ny, 31);
+
+                let id = palette.resolve(sub.indices[vb]);
+                if id != BlockId::AIR {
+                    let rx = sub_base_x + lx;
+                    let ry = sub_base_y + ly;
+                    let rz = sub_base_z + lz;
+                    let p_idx = match idx {
+                        0 | 1 => (ry * 32 + rz) as usize,
+                        2 | 3 => (rx * 32 + rz) as usize,
+                        4 | 5 => (rx * 32 + ry) as usize,
+                        _ => unreachable!(),
+                    };
+                    out[p_idx] = id;
                 }
             }
         }
