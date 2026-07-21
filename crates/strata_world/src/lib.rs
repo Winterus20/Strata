@@ -26,7 +26,7 @@ pub mod prelude {
         LightData, LightEngine, LightingPlugin, LightingTimers, MAX_LIGHT, SECTOR_VOXELS,
         SectorLight,
     };
-    pub use crate::plugin::{Generated, SectorSnapshot, WorldGenPlugin};
+    pub use crate::plugin::{Generated, WorldGenPlugin};
     pub use crate::rng::{Pcg32, WORLD_SEED, hash64};
     pub use crate::streaming::{
         DEFAULT_HYSTERESIS, DEFAULT_RADIUS, StreamingManager, StreamingPlugin, StreamingTimers,

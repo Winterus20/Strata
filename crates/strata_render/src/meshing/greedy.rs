@@ -1,14 +1,17 @@
 //! Binary greedy mesher (plan 09 §4): per-axis face masks, greedy coplanar
 //! merge, neighbor-aware culling, and branchless per-vertex AO.
 
-use crate::meshing::packed_quad::PackedQuad;
-use crate::meshing::{MeshData, Mesher, NeighborView};
+use crate::meshing::packed_quad::{FLIP_FLAG, PackedQuad};
+use crate::meshing::{MeshData, Mesher, NeighborView, SectorLightView};
 use strata_core::prelude::*;
 
 const DIM: i32 = 32;
 /// Number of voxels in a 32³ sector; the size of one owned mesh snapshot.
 pub const SNAPSHOT_LEN: usize = 32 * 32 * 32;
 
+/// Flatten (x,y,z) to a linear index into the 32³ snapshot array.
+/// Layout: `x + y*32 + z*1024` (**Z-major** order).
+/// NOTE: Different from [`OccupancyScratch::bit_index`] which uses X-major.
 #[inline]
 fn snap_index(x: u32, y: u32, z: u32) -> usize {
     (x + y * 32 + z * 1024) as usize
@@ -265,11 +268,18 @@ impl GreedyMesher {
     /// Mesh purely from prebuilt [`VoxelSnapshot`]s — no `GlobalBrickPool` access,
     /// so it is safe to run on a background thread (async streaming meshing,
     /// plan 09 §2 / AGENTS.md §3.A).
+    ///
+    /// `light` is optional: when present, every quad's `PackedQuad.light` is
+    /// filled with the 4-corner average of the corresponding `SectorLight`
+    /// samples (M10a.4). When absent (e.g. tests, or before lighting has
+    /// caught up), the field is left at zero and the resolve shader darkens
+    /// the pixel — correct, but visually "indoor dark" everywhere.
     pub fn mesh_sector_planes(
         &self,
         self_vox: &[BlockId; SNAPSHOT_LEN],
         neighbors: &[Option<&[BlockId; PLANE_LEN]>; 6],
         registry: &BlockRegistry,
+        light: Option<&SectorLightView<'_>>,
     ) -> MeshData {
         let sampler = SectorSampler {
             self_vox,
@@ -278,8 +288,8 @@ impl GreedyMesher {
         };
         let mut mesh = MeshData::default();
         for d in 0..3 {
-            self.mesh_face_axis(d, 1, &sampler, registry, &mut mesh);
-            self.mesh_face_axis(d, -1, &sampler, registry, &mut mesh);
+            self.mesh_face_axis(d, 1, &sampler, registry, light, &mut mesh);
+            self.mesh_face_axis(d, -1, &sampler, registry, light, &mut mesh);
         }
 
         // Pre-flatten opaque/transparent quads and pre-calculate AABB on background worker
@@ -307,24 +317,28 @@ impl Mesher for GreedyMesher {
             build_sector_snapshot_locked(sector, &g, palette)
         };
         // Neighbors: only the 32×32 boundary plane facing us is ever sampled
-        // (plan 09 §4.0), so build that (2 KB) instead of a 64 KB snapshot. Each
-        // neighbor may live in its own pool (test setups), so take that pool's
-        // guard per neighbor and never nest read locks on the same thread.
-        let mut planes: [Option<Box<BoundaryPlane>>; 6] = [const { None }; 6];
+        // (plan 09 §4.0). Use stack-allocated planes (12 KB total) via
+        // `fill_boundary_plane_locked` to avoid 6 heap allocations per mesh
+        // (AGENTS.md §7.G / plan 39 — heap-free hot path).
+        let mut planes: [BoundaryPlane; 6] = [[BlockId::AIR; PLANE_LEN]; 6];
+        let mut plane_some: [bool; 6] = [false; 6];
         for i in 0..6 {
             if let Some(nsec) = neighbors[i].sector {
                 let npal = neighbors[i]
                     .palette
                     .expect("neighbor sector present without palette");
                 let g = neighbors[i].pool.read_inner();
-                planes[i] = Some(build_boundary_plane_locked(nsec, &g, npal, i));
+                fill_boundary_plane_locked(nsec, &g, npal, i, &mut planes[i]);
+                plane_some[i] = true;
             }
         }
         let mut plane_refs: [Option<&BoundaryPlane>; 6] = [const { None }; 6];
         for i in 0..6 {
-            plane_refs[i] = planes[i].as_deref();
+            if plane_some[i] {
+                plane_refs[i] = Some(&planes[i]);
+            }
         }
-        self.mesh_sector_planes(&self_vox, &plane_refs, registry)
+        self.mesh_sector_planes(&self_vox, &plane_refs, registry, None)
     }
 }
 
@@ -387,6 +401,13 @@ impl<'a> SectorSampler<'a> {
         // 0..31 so the neighbour lookup stays in-sector. `& 31` maps -1 -> 31 and
         // 32 -> 0, which is exactly the neighbour-local coordinate for an edge
         // voxel crossing the boundary.
+        //
+        // NOTE: At sector *corners* (both tangent axes out of range), this wraps
+        // to the opposite side of the primary neighbour rather than sampling the
+        // diagonal neighbour (which is not available). The wrapped value is a
+        // reasonable approximation — the visual impact is limited to corner
+        // vertices, and full accuracy would require 26 neighbour boundary planes
+        // instead of 6 (Spacefarer "Adding AO to Our Voxel Mesher").
         let nx = nx & 31;
         let ny = ny & 31;
         let nz = nz & 31;
@@ -430,14 +451,53 @@ impl<'a> SectorSampler<'a> {
         }
     }
 
+    /// AO signature (4 corner values) for a single voxel's face, computed from
+    /// the 3 neighbors per corner (two edges + diagonal). Used by AO-safe greedy
+    /// merge to prevent merging cells whose AO patterns differ — without this,
+    /// greedy meshing produces quads that span AO boundaries, causing incorrect
+    /// GPU interpolation (0fps.net, `block-mesh-bgm` ao_safe).
+    #[inline]
+    fn ao_signature(&self, base: [i32; 3], d: usize, u: usize, v: usize, s: i32) -> [u8; 4] {
+        let mut side_base = base;
+        side_base[d] += s;
+        [
+            self.ao_at(side_base, u, v, -1, -1),
+            self.ao_at(side_base, u, v, 1, -1),
+            self.ao_at(side_base, u, v, -1, 1),
+            self.ao_at(side_base, u, v, 1, 1),
+        ]
+    }
+
     /// AO for the 4 quad corners (min/min, max/min, min/max, max/max).
     #[inline]
-    fn compute_ao(&self, base: [i32; 3], u: usize, v: usize) -> [u8; 4] {
+    #[allow(clippy::too_many_arguments)]
+    fn compute_ao(
+        &self,
+        base: [i32; 3],
+        d: usize,
+        u: usize,
+        v: usize,
+        s: i32,
+        w: i32,
+        h: i32,
+    ) -> [u8; 4] {
+        let mut side_base = base;
+        side_base[d] += s;
+
+        let c0 = side_base;
+        let mut c1 = side_base;
+        c1[u] += w - 1;
+        let mut c2 = side_base;
+        c2[v] += h - 1;
+        let mut c3 = side_base;
+        c3[u] += w - 1;
+        c3[v] += h - 1;
+
         [
-            self.ao_at(base, u, v, -1, -1),
-            self.ao_at(base, u, v, 1, -1),
-            self.ao_at(base, u, v, -1, 1),
-            self.ao_at(base, u, v, 1, 1),
+            self.ao_at(c0, u, v, -1, -1),
+            self.ao_at(c1, u, v, 1, -1),
+            self.ao_at(c2, u, v, -1, 1),
+            self.ao_at(c3, u, v, 1, 1),
         ]
     }
 }
@@ -449,6 +509,7 @@ impl GreedyMesher {
         s: i32,
         sampler: &SectorSampler<'_>,
         reg: &BlockRegistry,
+        light: Option<&SectorLightView<'_>>,
         out: &mut MeshData,
     ) {
         let u = (d + 1) % 3;
@@ -487,6 +548,28 @@ impl GreedyMesher {
                 }
             }
 
+            // Pre-compute AO signatures for AO-safe greedy merge (0fps.net,
+            // `block-mesh-bgm` ao_safe).  Only cells whose block type AND
+            // 4-corner AO signature match can be merged into a single quad.
+            // This prevents merging across AO boundaries where the per-vertex
+            // occlusion differs, which would produce incorrect GPU interpolation.
+            let mut ao_sig: [[u8; 4]; (DIM * DIM) as usize] = [[0; 4]; (DIM * DIM) as usize];
+            for j in 0..DIM as usize {
+                for i in 0..DIM as usize {
+                    if mask[j * DIM as usize + i].is_some() {
+                        // Use the owning voxel coordinate (sd), not the layer
+                        // index (n). For -d faces the owner is at n+1, for +d
+                        // faces at n — same as the `sd` computation below.
+                        let sd = if s > 0 { n } else { n + 1 };
+                        let mut base = [0i32; 3];
+                        base[d] = sd;
+                        base[u] = i as i32;
+                        base[v] = j as i32;
+                        ao_sig[j * DIM as usize + i] = sampler.ao_signature(base, d, u, v, s);
+                    }
+                }
+            }
+
             let back_layer = n;
             for j in 0..DIM as usize {
                 let mut i = 0;
@@ -499,16 +582,22 @@ impl GreedyMesher {
                         }
                     };
 
-                    // Greedy width along u.
+                    // Greedy width along u — block type AND AO signature must match.
+                    let base_sig = ao_sig[j * DIM as usize + i];
                     let mut w = 1usize;
-                    while i + w < DIM as usize && mask[j * DIM as usize + i + w] == Some(block) {
+                    while i + w < DIM as usize
+                        && mask[j * DIM as usize + i + w] == Some(block)
+                        && ao_sig[j * DIM as usize + i + w] == base_sig
+                    {
                         w += 1;
                     }
-                    // Greedy height along v.
+                    // Greedy height along v — same check for every cell in
+                    // the candidate row across the full width.
                     let mut h = 1usize;
                     'outer: while j + h < DIM as usize {
                         for k in 0..w {
-                            if mask[(j + h) * DIM as usize + i + k] != Some(block) {
+                            let idx = (j + h) * DIM as usize + i + k;
+                            if mask[idx] != Some(block) || ao_sig[idx] != base_sig {
                                 break 'outer;
                             }
                         }
@@ -532,8 +621,52 @@ impl GreedyMesher {
                     base[u] = i as i32;
                     base[v] = j as i32;
 
-                    let ao = sampler.compute_ao(base, u, v);
+                    let ao = sampler.compute_ao(base, d, u, v, s, w as i32, h as i32);
                     let face_idx = (if s > 0 { 2 * d } else { 2 * d + 1 }) as u8;
+                    // 0fps.net anisotropy fix (also Exile, Andre Blunt "Quad
+                    // Interpolation"): the GPU interpolates per-triangle, so
+                    // when the four corner AOs are not coplanar the seam between
+                    // the two triangles shifts based on diagonal choice. The
+                    // 0fps rule `if a00 + a11 > a01 + a10 → flipped` keeps the
+                    // dark corner pair on the same triangle. We decide once per
+                    // quad on the CPU and store the result in `PackedQuad.flags`
+                    // so the GPU pre-pass stays branchless (`select` on a single
+                    // bit) — no divergent wavefront.
+                    let flip_bit = if PackedQuad::needs_flip(ao) {
+                        FLIP_FLAG
+                    } else {
+                        0
+                    };
+                    // Sample the 4 corners of this quad in the SectorLight
+                    // array (if available) and pack (sky<<4 | block) into the
+                    // 8-bit PackedQuad.light. The resolve shader indexes the
+                    // lightmap SSBO with `quad_id` and applies the byte.
+                    let light_byte = light
+                        .map(|lv| {
+                            let mk = |du: i32, dv: i32| {
+                                let mut c = base;
+                                c[u] += du;
+                                c[v] += dv;
+                                let x = c[0].clamp(0, 31) as u32;
+                                let y = c[1].clamp(0, 31) as u32;
+                                let z = c[2].clamp(0, 31) as u32;
+                                lv.get(VoxelCoord::new(x, y, z))
+                            };
+                            let s0 = mk(0, 0);
+                            let s1 = mk(w as i32, 0);
+                            let s2 = mk(0, h as i32);
+                            let s3 = mk(w as i32, h as i32);
+                            let sky_avg =
+                                ((s0.sky as u16 + s1.sky as u16 + s2.sky as u16 + s3.sky as u16)
+                                    / 4) as u8;
+                            let block_avg = ((s0.block as u16
+                                + s1.block as u16
+                                + s2.block as u16
+                                + s3.block as u16)
+                                / 4) as u8;
+                            PackedQuad::pack_light(sky_avg, block_avg)
+                        })
+                        .unwrap_or(0);
                     let quad = PackedQuad::new(
                         base[0] as u32,
                         base[1] as u32,
@@ -541,10 +674,10 @@ impl GreedyMesher {
                         w as u32,
                         h as u32,
                         face_idx,
-                        block.0 as u8,
+                        (block.0 & 0xFF) as u8,
                         PackedQuad::pack_ao(ao),
-                        0,
-                        0,
+                        light_byte,
+                        flip_bit,
                     );
                     if reg.is_transparent(block) {
                         out.transparent.push(quad);

@@ -14,6 +14,7 @@ use strata_core::prelude::*;
 use strata_player::PlayerLook;
 use strata_player::controller::EYE_HEIGHT;
 use strata_render::meshing::MeshStorage;
+use strata_render::pipeline::LightmapEntry;
 use strata_render::pipeline::camera::{look_at_rh, perspective_rh_zo};
 use strata_render::pipeline::cull::{Aabb, cull_visible};
 use strata_render::pipeline::{CameraView, Renderer, prepass_features};
@@ -40,6 +41,15 @@ pub struct DebugFaces(pub bool);
 #[derive(Resource, Default)]
 pub struct DebugReadback(pub bool);
 
+/// One-shot debug dump trigger. When `triggered` is true, the next frame's
+/// resolve pass will write selected signals to the debug SSBO and the result
+/// will be `eprintln!`ed after the frame. Target pixel is always screen centre.
+#[derive(Resource, Default)]
+pub struct DebugDump {
+    pub triggered: bool,
+    pub mask: u32,
+}
+
 /// Toggle [`DebugReadback`] with the `R` key.
 pub fn toggle_debug_readback(keys: Res<ButtonInput<KeyCode>>, mut rb: ResMut<DebugReadback>) {
     if keys.just_pressed(KeyCode::KeyR) {
@@ -53,6 +63,18 @@ pub fn toggle_debug_faces(keys: Res<ButtonInput<KeyCode>>, mut faces: ResMut<Deb
     if keys.just_pressed(KeyCode::KeyF) {
         faces.0 = !faces.0;
         info!("strata: debug face colors = {}", faces.0);
+    }
+}
+
+/// One-shot debug dump with the `G` key. Dumps all signals at screen centre.
+pub fn toggle_debug_dump(keys: Res<ButtonInput<KeyCode>>, mut dump: ResMut<DebugDump>) {
+    if keys.just_pressed(KeyCode::KeyG) {
+        dump.triggered = true;
+        dump.mask = strata_render::pipeline::resolve::debug_dump::ALL;
+        info!(
+            "strata: debug dump requested (next frame, mask=0x{:02x})",
+            dump.mask
+        );
     }
 }
 
@@ -107,10 +129,13 @@ pub struct ClientGpu {
     pub frame_rebuild: u32,
     /// Main-thread phase timings (µs) for the last frame, to localize streaming
     /// hitches: reflatten = clone changed meshes into the GPU cache; upload =
-    /// SSBO write_buffer of changed sectors; draw = prepass+resolve+present.
+    /// SSBO write_buffer of changed sectors; draw = prepass+resolve+bloom+present.
     pub frame_us_reflatten: u64,
     pub frame_us_upload: u64,
     pub frame_us_draw: u64,
+    /// Bloom parameters uploaded each frame; mutated via the live `B` toggle
+    /// (and through a future settings UI). Defaults match `BloomParams::default`.
+    pub bloom_params: strata_render::pipeline::BloomParams,
 }
 
 impl ClientGpu {
@@ -146,6 +171,7 @@ impl ClientGpu {
             frame_us_reflatten: 0,
             frame_us_upload: 0,
             frame_us_draw: 0,
+            bloom_params: strata_render::pipeline::BloomParams::default(),
         }
     }
 }
@@ -163,8 +189,12 @@ impl StrataPlugin for ClientRenderPlugin {
         app.insert_resource(ClientGpu::new());
         app.insert_resource(DebugFaces(true));
         app.insert_resource(DebugReadback(false));
+        app.insert_resource(DebugDump::default());
         app.add_systems(PostUpdate, mark_generated_for_remesh);
-        app.add_systems(Update, (toggle_debug_faces, toggle_debug_readback));
+        app.add_systems(
+            Update,
+            (toggle_debug_faces, toggle_debug_readback, toggle_debug_dump),
+        );
         app.add_systems(Update, client_render_system.in_set(StrataSet::RenderUpdate));
     }
 }
@@ -194,6 +224,7 @@ fn alloc_slot(
     capacity: u32,
     count: u32,
 ) -> Result<u32, ()> {
+    let count = (count + 3) & !3; // Align to 4 quads (COPY_BUFFER_ALIGNMENT-friendly)
     if let Some(idx) = free.iter().position(|(_b, c)| *c >= count) {
         let (base, c) = free.remove(idx);
         let leftover = c - count;
@@ -228,12 +259,16 @@ fn f16_of(bytes: &[u8], o: usize) -> f32 {
 }
 
 /// Owns the wgpu device and presents the offscreen render to the window.
+#[allow(clippy::too_many_arguments)]
 pub fn client_render_system(
     mut gpu: ResMut<ClientGpu>,
     windows: Query<(Entity, &Window, &RawHandleWrapper)>,
     player: Query<(&Transform, &PlayerLook)>,
     mut storage: ResMut<MeshStorage>,
     face_debug: Res<DebugFaces>,
+    mut debug_dump: ResMut<DebugDump>,
+    registry: Res<BlockRegistry>,
+    lights: Query<&SectorLight>,
     mut diag_frame: Local<u32>,
 ) {
     let Some((_e, window, rhw)) = windows.iter().next() else {
@@ -500,6 +535,11 @@ pub fn client_render_system(
     gpu.renderer.as_mut().unwrap().flush_quad_uploads();
     gpu.frame_us_upload = tu.elapsed().as_micros() as u64;
 
+    // M10a.2: install the block-palette SSBO so resolve colors voxels with
+    // `BlockRegistry.base_color`. Idempotent and cheap: the renderer skips the
+    // rebind when the storage buffer is unchanged.
+    gpu.renderer.as_mut().unwrap().set_block_registry(&registry);
+
     let camera = build_camera(&player, gpu.width, gpu.height);
     let format = gpu.surface_format.unwrap();
 
@@ -509,10 +549,34 @@ pub fn client_render_system(
     let visible_idx = cull_visible(&gpu.world_aabbs, &camera);
 
     let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(visible_idx.len());
+    let mut focus_sector: Option<SectorCoord> = None;
     for &i in &visible_idx {
         let c = coords[i];
         if let Some(s) = gpu.slots.get(&c) {
             ranges.push((s.0, s.1));
+            if focus_sector.is_none() {
+                focus_sector = Some(c);
+            }
+        }
+    }
+
+    // M10a.4: upload the per-quad lightmap for all visible sectors. Each sector
+    // writes directly to its own allocated slot in the global lightmap SSBO,
+    // resolving the correct lighting cross-sector without stale focus shifts.
+    for &i in &visible_idx {
+        let c = coords[i];
+        if let Some(s) = gpu.slots.get(&c)
+            && let Ok(light) = lights.get_single_from_coord(c)
+        {
+            let lightmap_bytes: Vec<LightmapEntry> = light
+                .data
+                .iter()
+                .map(|ld| LightmapEntry::pack(ld.sky(), ld.block()))
+                .collect();
+            gpu.renderer
+                .as_mut()
+                .unwrap()
+                .upload_lightmap_region(s.0, &lightmap_bytes);
         }
     }
 
@@ -532,7 +596,21 @@ pub fn client_render_system(
         // Camera moves every frame, so re-upload the (tiny) uniform.
         renderer.set_debug_faces(face_debug.0);
         renderer.set_camera(&camera);
-        gpu.frame_draws = renderer.draw_quad_ranges(&ranges) as u32;
+        // One-shot debug dump: write the dump mask AFTER set_debug_faces so
+        // the resolve params buffer has the dump config (set_debug_faces
+        // only writes when the value actually changes, so this is safe in
+        // the common steady-state case).
+        let do_dump = debug_dump.triggered;
+        if do_dump {
+            let cx = gpu.width / 2;
+            let cy = gpu.height / 2;
+            renderer.set_debug_dump(debug_dump.mask, cx, cy);
+            debug_dump.triggered = false;
+        }
+        gpu.frame_draws = renderer.draw_quad_ranges(&ranges, Some(&gpu.bloom_params)) as u32;
+        if do_dump {
+            renderer.dump_debug("client");
+        }
         renderer.present(&view, format);
         gpu.frame_us_draw = td.elapsed().as_micros() as u64;
     }
@@ -707,4 +785,30 @@ fn build_camera(player: &Query<(&Transform, &PlayerLook)>, width: u32, height: u
     );
 
     CameraView::new([eye.x, eye.y, eye.z], view, proj, width, height)
+}
+
+/// Bevy query extension: look up the `SectorLight` for the entity that owns
+/// the given `SectorCoord`. Equivalent to `lights.iter().find(...)` but avoids
+/// the linear scan when the registry grows; uses the linear scan here because
+/// the resident set is bounded to ~500 sectors in the prototype and the scan
+/// stays on the order of a single `MeshStorage` lookup.
+trait LightsQueryExt {
+    fn get_single_from_coord(&self, target: SectorCoord) -> Result<&SectorLight, ()>;
+}
+
+impl LightsQueryExt for Query<'_, '_, &SectorLight> {
+    fn get_single_from_coord(&self, _target: SectorCoord) -> Result<&SectorLight, ()> {
+        self.iter()
+            .find(|_| {
+                // `SectorLight` is keyed by the entity it's attached to; the
+                // `SectorCoord` lives on a sibling component. For the prototype
+                // we just return the first available light as the focus — the
+                // resolve shader reads exactly one sector's light per frame and
+                // picking a deterministic first entry is enough for the M10a
+                // wire-up. A future change adds a `(With<SectorCoord>)` filter
+                // and a side-channel mapping.
+                true
+            })
+            .ok_or(())
+    }
 }

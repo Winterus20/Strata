@@ -182,6 +182,8 @@ impl XBrickMap {
                 pool.free_brick(handle);
                 self.bricks[bi] = None;
                 self.sector_mask &= !(1u64 << bi);
+            } else {
+                pool.invalidate_uniform(handle);
             }
             return;
         }
@@ -192,15 +194,18 @@ impl XBrickMap {
             self.sector_mask |= 1u64 << bi;
         }
         let handle = self.bricks[bi].unwrap();
-        let mut g = pool.brick_mut(handle).unwrap();
-        let brick = &mut *g;
-        let local = palette.get_or_insert(block);
-        let si = coord.sub_index();
-        let sub = &mut brick.subs[si];
-        let vb = coord.voxel_bit();
-        brick.sub_mask |= 1u64 << si;
-        sub.voxel_mask |= 1u8 << vb;
-        sub.indices[vb] = local;
+        {
+            let mut g = pool.brick_mut(handle).unwrap();
+            let brick = &mut *g;
+            let local = palette.get_or_insert(block);
+            let si = coord.sub_index();
+            let sub = &mut brick.subs[si];
+            let vb = coord.voxel_bit();
+            brick.sub_mask |= 1u64 << si;
+            sub.voxel_mask |= 1u8 << vb;
+            sub.indices[vb] = local;
+        }
+        pool.invalidate_uniform(handle);
     }
 
     /// Release every pooled brick owned by this sector back to the pre-locked [`InnerPool`].
@@ -282,6 +287,9 @@ impl CompressedChunkData {
         let palette = SectorPalette::from_entries(self.palette.clone());
         let mut inner = pool.write_inner();
         for cb in &self.bricks {
+            if cb.brick_idx >= 64 {
+                continue;
+            }
             debug_assert_eq!(
                 cb.subs.len(),
                 64,
@@ -394,5 +402,45 @@ mod tests {
             sink = sink.wrapping_add(map.get_block(&pool, &palette, VoxelCoord::new(x, y, z)).0);
         }
         std::hint::black_box(sink);
+    }
+
+    #[test]
+    fn unpack_skips_out_of_bounds_brick_idx() {
+        let mut pool = GlobalBrickPool::new();
+        let snapshot = CompressedChunkData {
+            coord: [0, 0, 0],
+            sector_mask: 0,
+            palette: vec![BlockId::AIR],
+            bricks: vec![CompressedBrick {
+                brick_idx: 64,
+                sub_mask: 0,
+                subs: vec![SubBrick::default(); 64],
+            }],
+        };
+        let (map, _palette) = snapshot.unpack(&mut pool);
+        assert_eq!(map.sector_mask, 0);
+    }
+
+    #[test]
+    fn test_set_block_invalidates_uniform_cache() {
+        let mut pool = GlobalBrickPool::new();
+        let mut palette = SectorPalette::new();
+        let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+        let c1 = VoxelCoord::new(0, 0, 0);
+        let c2 = VoxelCoord::new(0, 0, 1);
+
+        map.set_block(&mut pool, &mut palette, c1, BlockId(1));
+        let handle = map.brick_handle_at(c1.brick_index()).unwrap();
+
+        let idx1 = pool.uniform_index(handle);
+        assert!(idx1.is_some());
+
+        map.set_block(&mut pool, &mut palette, c2, BlockId(2));
+
+        let idx2 = pool.uniform_index(handle);
+        assert_eq!(
+            idx2, None,
+            "uniform cache must be invalidated after set_block"
+        );
     }
 }

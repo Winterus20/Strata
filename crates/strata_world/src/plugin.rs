@@ -14,6 +14,7 @@ use bevy::tasks::{Task, TaskPool, TaskPoolBuilder};
 use std::collections::HashMap;
 use std::sync::Arc;
 use strata_core::prelude::*;
+use strata_storage::backend::AsyncStorageBackend;
 
 use crate::generator::generate_compressed;
 use crate::streaming::{StreamingManager, load_priority};
@@ -36,10 +37,6 @@ pub struct Generated;
 #[derive(Debug, Component)]
 #[component(storage = "SparseSet")]
 pub struct Generating;
-
-/// Shareable generated snapshot, held on the sector entity (plan 07 snapshot).
-#[derive(Debug, Component, Clone)]
-pub struct SectorSnapshot(pub Arc<CompressedChunkData>);
 
 /// In-flight async world generation tasks.
 #[derive(Resource, Default)]
@@ -100,6 +97,17 @@ fn lower_worker_thread_priority() {
     }
 }
 
+/// In-flight async sector loading tasks.
+#[derive(Resource, Default)]
+pub struct PendingSectorLoad {
+    pub tasks: HashMap<SectorCoord, Task<Option<Arc<CompressedChunkData>>>>,
+}
+
+/// Marker component for sectors currently in the load pipeline.
+#[derive(Debug, Component)]
+#[component(storage = "SparseSet")]
+pub struct Loading;
+
 /// Strata world-generation plugin (M5).
 ///
 /// Generation runs asynchronously on background worker threads (`GeneratorPool`)
@@ -116,11 +124,17 @@ impl StrataPlugin for WorldGenPlugin {
             app.insert_resource(GlobalBrickPool::new());
         }
         app.init_resource::<PendingWorldGen>();
+        app.init_resource::<PendingSectorLoad>();
         app.init_resource::<GeneratorPool>();
         app.init_resource::<WorldGenTimers>();
         app.add_systems(
             Update,
-            (spawn_world_gen_tasks, apply_world_gen_tasks)
+            (
+                spawn_sector_load_tasks,
+                apply_sector_load_tasks,
+                spawn_world_gen_tasks,
+                apply_world_gen_tasks,
+            )
                 .chain()
                 .in_set(StrataSet::WorldGen),
         );
@@ -134,7 +148,10 @@ fn spawn_world_gen_tasks(
     mut pending: ResMut<PendingWorldGen>,
     generator_pool: Res<GeneratorPool>,
     streaming: Option<Res<StreamingManager>>,
-    q_new: Query<(Entity, &SectorCoord), (Without<Generated>, Without<Generating>)>,
+    q_new: Query<
+        (Entity, &SectorCoord),
+        (Without<Generated>, Without<Generating>, Without<Loading>),
+    >,
 ) {
     let mut budget = WORLDGEN_SPAWN_BUDGET;
     let pool = &generator_pool.0;
@@ -152,11 +169,12 @@ fn spawn_world_gen_tasks(
     work.sort_by_key(|(_, c)| load_priority(player, move_dir, *c));
 
     for (e, coord) in work {
+        if pending.tasks.contains_key(&coord) {
+            commands.entity(e).insert(Generating);
+            continue;
+        }
         if budget == 0 {
             break;
-        }
-        if pending.tasks.contains_key(&coord) {
-            continue;
         }
 
         let coord_val = coord;
@@ -176,6 +194,7 @@ fn apply_world_gen_tasks(
     mut pool: ResMut<GlobalBrickPool>,
     mut timers: ResMut<WorldGenTimers>,
     q_generating: Query<(Entity, &SectorCoord), With<Generating>>,
+    q_unbound: Query<(Entity, &SectorCoord), Without<Generated>>,
 ) {
     timers.apply_us = 0;
     timers.applied = 0;
@@ -186,6 +205,10 @@ fn apply_world_gen_tasks(
     let mut gen_entities = HashMap::new();
     for (e, coord) in &q_generating {
         gen_entities.insert(*coord, e);
+    }
+    let mut unbound_entities = HashMap::new();
+    for (e, coord) in &q_unbound {
+        unbound_entities.insert(*coord, e);
     }
 
     let coords: Vec<SectorCoord> = pending.tasks.keys().copied().collect();
@@ -202,7 +225,11 @@ fn apply_world_gen_tasks(
         let mut task = pending.tasks.remove(&coord).unwrap();
         let ready = check_ready(&mut task);
         if let Some(data) = ready {
-            if let Some(&e) = gen_entities.get(&coord) {
+            let target = gen_entities
+                .get(&coord)
+                .copied()
+                .or_else(|| unbound_entities.get(&coord).copied());
+            if let Some(e) = target {
                 let t0 = std::time::Instant::now();
                 let (map, palette) = data.unpack(&mut pool);
                 timers.apply_us += t0.elapsed().as_micros() as u64;
@@ -215,6 +242,116 @@ fn apply_world_gen_tasks(
                     .remove::<Generating>();
                 timers.applied += 1;
                 apply_budget -= 1;
+            }
+        } else {
+            pending.tasks.insert(coord, task);
+        }
+    }
+}
+
+/// Spawns background tasks to load sector data from disk via TokioBackend if metadata says it exists.
+#[allow(clippy::type_complexity)]
+fn spawn_sector_load_tasks(
+    mut commands: Commands,
+    mut pending: ResMut<PendingSectorLoad>,
+    manager: Option<Res<strata_save::save_manager::SaveManager>>,
+    backend: Option<Res<strata_save::plugin::SaveBackend>>,
+    generator_pool: Res<GeneratorPool>,
+    q_new: Query<
+        (Entity, &SectorCoord),
+        (Without<Generated>, Without<Generating>, Without<Loading>),
+    >,
+) {
+    let Some(mgr) = manager else {
+        return;
+    };
+    let Some(bk) = backend else {
+        return;
+    };
+    let pool = &generator_pool.0;
+
+    for (e, coord) in &q_new {
+        if pending.tasks.contains_key(coord) {
+            commands.entity(e).insert(Loading);
+            continue;
+        }
+
+        let coord_val = *coord;
+        let bk_val = bk.0.clone();
+        let metadata_store = mgr.metadata.clone();
+
+        let task = pool.spawn(async move {
+            match metadata_store.get(coord_val).await {
+                Ok(Some(_meta)) => match bk_val.read_sector(coord_val).await {
+                    Ok(payload) => match postcard::from_bytes::<CompressedChunkData>(&payload) {
+                        Ok(data) => Some(Arc::new(data)),
+                        Err(e) => {
+                            bevy::log::error!(
+                                "Failed to deserialize loaded sector {coord_val:?}: {e}"
+                            );
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        bevy::log::error!(
+                            "Failed to read loaded sector {coord_val:?} from disk: {e}"
+                        );
+                        None
+                    }
+                },
+                _ => None,
+            }
+        });
+
+        pending.tasks.insert(coord_val, task);
+        commands.entity(e).insert(Loading);
+    }
+}
+
+/// Checks completed loading tasks and applies them. If the task returned None (not in save/failed),
+/// it removes the Loading marker so that PCG terrain generation can run.
+#[allow(clippy::type_complexity)]
+fn apply_sector_load_tasks(
+    mut commands: Commands,
+    mut pending: ResMut<PendingSectorLoad>,
+    mut pool: ResMut<GlobalBrickPool>,
+    q_loading: Query<(Entity, &SectorCoord), With<Loading>>,
+    q_unbound: Query<(Entity, &SectorCoord), Without<Generated>>,
+) {
+    if pending.tasks.is_empty() {
+        return;
+    }
+
+    let mut loading_entities = HashMap::new();
+    for (e, coord) in &q_loading {
+        loading_entities.insert(*coord, e);
+    }
+    let mut unbound_entities = HashMap::new();
+    for (e, coord) in &q_unbound {
+        unbound_entities.insert(*coord, e);
+    }
+
+    let coords: Vec<SectorCoord> = pending.tasks.keys().copied().collect();
+    for coord in coords {
+        let mut task = pending.tasks.remove(&coord).unwrap();
+        if let Some(ready_result) = check_ready(&mut task) {
+            let target = loading_entities
+                .get(&coord)
+                .copied()
+                .or_else(|| unbound_entities.get(&coord).copied());
+            if let Some(e) = target {
+                commands.entity(e).remove::<Loading>();
+                if let Some(data) = ready_result {
+                    let (map, palette) = data.unpack(&mut pool);
+                    commands
+                        .entity(e)
+                        .insert(map)
+                        .insert(palette)
+                        .insert(SectorSnapshot(data))
+                        .insert(Generated);
+                } else {
+                    // Not in save file or failed to load. Fallback to PCG generation by removing Loading marker.
+                }
             }
         } else {
             pending.tasks.insert(coord, task);

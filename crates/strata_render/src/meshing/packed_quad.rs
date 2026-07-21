@@ -30,7 +30,8 @@ impl FaceDir {
             2 => FaceDir::PosY,
             3 => FaceDir::NegY,
             4 => FaceDir::PosZ,
-            _ => FaceDir::NegZ,
+            5 => FaceDir::NegZ,
+            _ => unreachable!("invalid face index: {i}"),
         }
     }
 
@@ -51,17 +52,29 @@ const POS_MASK: u32 = 0x1F; // 5 bits (0..31, sector-local position)
 const SIZE_MASK: u32 = 0x3F; // 6 bits (0..63, width/height up to 32)
 const FACE_MASK: u32 = 0x7; // 3 bits (0..7, six face directions)
 
+/// Bit 0 of [`PackedQuad::flags`] — when set, the pre-pass vertex shader
+/// emits the **flipped** diagonal split for this quad (0fps.net / Exile
+/// anisotropy fix). Stored CPU-side so the GPU stays branchless.
+///
+/// 0fps.net: `if a00 + a11 > a01 + a10` → flipped. The CPU computes the
+/// sum-compare in the mesher and stores the result here; the shader
+/// only reads the bit.
+pub const FLIP_FLAG: u8 = 0x1;
+
 /// An 8-byte packed greedy-meshed quad (plan 09 §3.2).
 ///
 /// Layout (little-endian):
 /// * `data[0..4]` — geometry word:
 ///   `x(5)|y(5)|z(5)|width(6)|height(6)|face(3)` (30 bits used, 2 reserved).
-///   NOTE: the constitution sketches `x/y/z/width/height(6)|face(2)`; a 2-bit
-///   face only spans 4 directions, so M3 uses 3 face bits (6 directions fit).
+///   NOTE: the constitution sketches `x/y/z(6)|width/height(6)|face(2)`; the
+///   implementation uses 5-bit positions (sufficient for 32³ sectors, 0..31)
+///   and 3-bit face (required for 6 directions, plan's 2-bit only fits 4).
+///   This is a deliberate deviation — 2 reserved bits remain for future use.
 /// * `data[4]`    — block type id (low byte; matches the constitution's `u8`)
 /// * `data[5]`    — AO: 4 corners x 2 bits (corner0 in bits 0..2, ... corner3 6..8)
 /// * `data[6]`    — light (sky<<4 | block, filled by lighting in a later milestone)
-/// * `data[7]`    — flags / reserved
+/// * `data[7]`    — flags: bit0 = [FLIP_FLAG] (CPU-decided diagonal flip for
+///   quad anisotropy correction)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PackedQuad {
@@ -69,6 +82,25 @@ pub struct PackedQuad {
 }
 
 impl PackedQuad {
+    /// True if the quad's 4-corner AO values require a **flipped** diagonal split
+    /// to avoid GPU barycentric interpolation seams (0fps.net anisotropy fix,
+    /// Exile "Vertex Ambient Occlusion", Andre Blunt "Quadrilateral
+    /// Interpolation"). The pre-pass vertex shader uses this bit to pick a
+    /// branchless `select` for the diagonal.
+    ///
+    /// 0fps.net: `if a00 + a11 > a01 + a10` → flipped. The CPU pre-decides the
+    /// comparison once per quad so the GPU never needs a divergent branch.
+    #[inline]
+    pub fn needs_flip(corners: [u8; 4]) -> bool {
+        // c0 = a00 (du=0,dv=0), c1 = a01 (du=1,dv=0),
+        // c2 = a10 (du=0,dv=1), c3 = a11 (du=1,dv=1) — matches
+        // `PackedQuad::ao()` packing order, which the pre-pass shader
+        // mirrors verbatim. The same rule works in either orientation
+        // because the diagonal choice only depends on the four corner
+        // AOs being assigned to the same four vertex positions.
+        (corners[0] as u32 + corners[3] as u32) > (corners[1] as u32 + corners[2] as u32)
+    }
+
     /// Pack a quad. Positions must be < 32; size < 64; `face` < 6.
     #[inline]
     #[allow(clippy::too_many_arguments)]
@@ -155,9 +187,32 @@ impl PackedQuad {
             | ((corners[3] & 0x3) << 6)
     }
 
+    /// Max of the 4 corner AO values (0..=3). Used by the resolve shader's
+    /// `mix(0.55, 1.0, ao_max / 3.0)` multiplier (M10a.3).
+    #[inline]
+    pub fn ao_max(&self) -> u8 {
+        let [c0, c1, c2, c3] = self.ao();
+        c0.max(c1).max(c2).max(c3)
+    }
+
+    /// Pack an 8-bit light value (`sky<<4 | block`) into the quad's light field.
+    /// Both nibbles are masked to 4 bits so the result is always a valid
+    /// `LightData` nibble pair (M7 `LightData` / M10a.4 layout).
+    #[inline]
+    pub fn pack_light(sky: u8, block: u8) -> u8 {
+        ((sky & 0xF) << 4) | (block & 0xF)
+    }
+
     #[inline]
     pub fn light(&self) -> u8 {
         self.data[6]
+    }
+
+    /// Overwrite the 8-bit light field. Used by the mesher when integrating
+    /// the `SectorLight` sample for this quad's 4 corners.
+    #[inline]
+    pub fn set_light(&mut self, light: u8) {
+        self.data[6] = light;
     }
 
     #[inline]
@@ -234,6 +289,13 @@ impl PackedQuad {
 
 /// 4-byte packed GPU vertex (plan 06 §B.4): pos(6|6|6) | normal(3) | uv(2|2) |
 /// ao(2) | color(3) — fits in 32 bits for vertex pulling.
+///
+/// **Limitation:** The `color` field is 3 bits (0..7), which only supports 8
+/// distinct block types. Production rendering uses [`PackedQuad`] vertex pulling
+/// where `block_type` is a full 8-bit field — `PackedVertex4` is a CPU-side
+/// validation/debug format only (see `meshdata_to_gpu_bytes` in the pipeline).
+/// If this format is ever promoted to production, the bit layout must be
+/// redesigned to accommodate the full block type range.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PackedVertex4 {
@@ -266,5 +328,22 @@ impl PackedVertex4 {
             ((g >> 25) & 0x3) as u8,
             ((g >> 27) & 0x7) as u8,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "invalid face index")]
+    fn from_index_rejects_6() {
+        FaceDir::from_index(6);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid face index")]
+    fn from_index_rejects_7() {
+        FaceDir::from_index(7);
     }
 }

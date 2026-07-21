@@ -39,6 +39,8 @@ impl OccupancyScratch {
     /// Flatten a local voxel coordinate to its bit index (range 0..32768).
     ///
     /// Layout `x*1024 + z*32 + y` keeps each axis in `[0,32)` and packs tightly.
+    /// NOTE: This is **X-major** order, different from [`snap_index`] in greedy.rs
+    /// which uses Z-major (`x + y*32 + z*1024`). Both are self-consistent.
     #[inline]
     pub fn bit_index(x: u32, y: u32, z: u32) -> usize {
         ((x << 10) | (z << 5) | y) as usize

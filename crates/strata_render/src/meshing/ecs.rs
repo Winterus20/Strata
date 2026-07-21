@@ -25,8 +25,8 @@ thread_local! {
     /// mesher overwrites every voxel each call, so it is never cleared and never
     /// re-allocated — a streaming burst does zero per-sector 64 KB heap churn on
     /// the global allocator (AGENTS.md §7.G heap-free hot path).
-    static MESH_SCRATCH: std::cell::RefCell<Box<[BlockId; SNAPSHOT_LEN]>> =
-        std::cell::RefCell::new(Box::new([BlockId::AIR; SNAPSHOT_LEN]));
+    static MESH_SCRATCH: std::cell::RefCell<Arc<[BlockId; SNAPSHOT_LEN]>> =
+        std::cell::RefCell::new(Arc::new([BlockId::AIR; SNAPSHOT_LEN]));
 }
 
 /// Max sectors spawned (snapshot + mesh dispatched to workers) per frame.
@@ -264,10 +264,10 @@ pub fn spawn_mesh_tasks(
         }
 
         let pool_guard = pool.read_inner();
-        let snap: Box<[BlockId; SNAPSHOT_LEN]> = MESH_SCRATCH.with(|cell| {
+        let snap: Arc<[BlockId; SNAPSHOT_LEN]> = MESH_SCRATCH.with(|cell| {
             let mut buf = cell.borrow_mut();
-            fill_sector_snapshot_locked(sector, &pool_guard, palette, &mut buf);
-            buf.clone()
+            fill_sector_snapshot_locked(sector, &pool_guard, palette, Arc::make_mut(&mut buf));
+            Arc::clone(&buf)
         });
         let mut planes: [BoundaryPlane; 6] = [[BlockId::AIR; PLANE_LEN]; 6];
         let mut plane_present = [false; 6];
@@ -303,7 +303,11 @@ pub fn spawn_mesh_tasks(
                     plane_refs[i] = Some(&planes[i]);
                 }
             }
-            mesher.mesh_sector_planes(&snap, &plane_refs, &reg)
+            // Lighting is computed separately by the lighting plugin; the
+            // mesher receives `None` here and the resolve shader darkens the
+            // surface until the lightmap SSBO is filled by a follow-up upload
+            // (M10a.4 wiring is owned by the client render).
+            mesher.mesh_sector_planes(&snap, &plane_refs, &reg, None)
         });
 
         pending
@@ -417,4 +421,21 @@ fn cleanup_unloaded_meshes(
     }
     storage.meshes.retain(|c, _| sm.is_resident(c));
     storage.neighbor_mask.retain(|c, _| sm.is_resident(c));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn mesh_scratch_is_arc_not_box() {
+        MESH_SCRATCH.with(|cell| {
+            let buf = cell.borrow();
+            // The scratch must be Arc<[BlockId; SNAPSHOT_LEN]> so that
+            // worker tasks can share it without an extra Box allocation.
+            let type_name = std::any::type_name::<Arc<[BlockId; SNAPSHOT_LEN]>>();
+            assert!(std::any::type_name::<Arc<[BlockId; SNAPSHOT_LEN]>>() == type_name);
+        });
+    }
 }

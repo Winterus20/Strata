@@ -405,13 +405,83 @@ pub fn sync_dirty_sector_colliders(
         let Some(mut voxels) = collider.as_voxels_mut() else {
             continue;
         };
-        for lx in 0..SECTOR_DIM {
-            for ly in 0..SECTOR_DIM {
-                for lz in 0..SECTOR_DIM {
-                    let coord = VoxelCoord::new(lx, ly, lz);
-                    let id = map.get_block_locked(&pool_guard, palette, coord);
-                    let occupied = id != BlockId::AIR && registry.is_solid(id);
+        for bi in 0..64 {
+            let bx = (bi % 4) as u32 * 8;
+            let by = (bi / 16) as u32 * 8;
+            let bz = ((bi % 16) / 4) as u32 * 8;
+
+            let handle = match map.brick_handle_at(bi) {
+                Some(h) => h,
+                None => {
+                    for lx in 0..8 {
+                        for ly in 0..8 {
+                            for lz in 0..8 {
+                                let key = IVect::new(
+                                    (bx + lx) as i32,
+                                    (by + ly) as i32,
+                                    (bz + lz) as i32,
+                                );
+                                voxels.set_voxel(key, false);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            let brick = match pool_guard.bricks.get(handle) {
+                Some(b) => b,
+                None => {
+                    for lx in 0..8 {
+                        for ly in 0..8 {
+                            for lz in 0..8 {
+                                let key = IVect::new(
+                                    (bx + lx) as i32,
+                                    (by + ly) as i32,
+                                    (bz + lz) as i32,
+                                );
+                                voxels.set_voxel(key, false);
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            for si in 0..64 {
+                let sx = (si % 4) as u32 * 2;
+                let sy = (si / 16) as u32 * 2;
+                let sz = ((si % 16) / 4) as u32 * 2;
+
+                if (brick.sub_mask >> si) & 1 == 0 {
+                    for lx in 0..2 {
+                        for ly in 0..2 {
+                            for lz in 0..2 {
+                                let key = IVect::new(
+                                    (bx + sx + lx) as i32,
+                                    (by + sy + ly) as i32,
+                                    (bz + sz + lz) as i32,
+                                );
+                                voxels.set_voxel(key, false);
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                let sub = &brick.subs[si];
+                for vb in 0..8 {
+                    let lx = bx + sx + (vb as u32 & 1);
+                    let ly = by + sy + ((vb as u32 >> 2) & 1);
+                    let lz = bz + sz + ((vb as u32 >> 1) & 1);
                     let key = IVect::new(lx as i32, ly as i32, lz as i32);
+
+                    let occupied = if (sub.voxel_mask >> vb) & 1 != 0 {
+                        let id = palette.resolve(sub.indices[vb]);
+                        id != BlockId::AIR && registry.is_solid(id)
+                    } else {
+                        false
+                    };
                     voxels.set_voxel(key, occupied);
                 }
             }
@@ -451,9 +521,6 @@ pub fn ground_below(xbrick: &XBrickMap, pool: &GlobalBrickPool, pos: Vec3) -> bo
     let wx = pos.x.floor() as i64;
     let wy = pos.y.floor() as i64;
     let wz = pos.z.floor() as i64;
-    if wy < 0 {
-        return false;
-    }
     let ox = xbrick.coord.0 as i64 * SECTOR_DIM as i64;
     let oy = xbrick.coord.1 as i64 * SECTOR_DIM as i64;
     let oz = xbrick.coord.2 as i64 * SECTOR_DIM as i64;

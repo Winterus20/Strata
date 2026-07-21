@@ -79,7 +79,7 @@ pub fn raycast_voxel(
     origin: Vec3,
     dir: Vec3,
     max_dist: f32,
-) -> Option<(VoxelCoord, FaceNormal)> {
+) -> Option<(VoxelCoord, FaceNormal, f32)> {
     let dim = SECTOR_DIM as f32;
     let dir = dir.normalize();
     if dir == Vec3::ZERO {
@@ -191,7 +191,7 @@ pub fn raycast_voxel(
     } else {
         FaceNormal::NegX
     };
-    let mut traveled;
+    let mut traveled = 0.0f32;
 
     loop {
         if !(0..32).contains(&vx) || !(0..32).contains(&vy) || !(0..32).contains(&vz) {
@@ -199,7 +199,7 @@ pub fn raycast_voxel(
         }
         let c = VoxelCoord::new(vx as u32, vy as u32, vz as u32);
         if xbrick.is_occupied(pool, c) {
-            return Some((c, normal));
+            return Some((c, normal, t_enter + traveled));
         }
 
         // Branchless axis selection: pick the smallest tMax.
@@ -258,7 +258,7 @@ mod tests {
         // Eye in air just outside the +X face, looking toward -X.
         let origin = Vec3::new(6.5, 7.5, 3.5);
         let dir = Vec3::new(-1.0, 0.0, 0.0);
-        let (v, n) = raycast_voxel(&map, &pool, origin, dir, REACH).unwrap();
+        let (v, n, _t) = raycast_voxel(&map, &pool, origin, dir, REACH).unwrap();
         assert_eq!(v, VoxelCoord::new(5, 7, 3));
         assert_eq!(n, FaceNormal::PosX); // entered through +X face
     }
@@ -268,7 +268,7 @@ mod tests {
         let (map, pool, _) = single_block_sector();
         let origin = Vec3::new(5.5, 7.5, 6.5);
         let dir = Vec3::new(0.0, 0.0, -1.0);
-        let (v, n) = raycast_voxel(&map, &pool, origin, dir, REACH).unwrap();
+        let (v, n, _t) = raycast_voxel(&map, &pool, origin, dir, REACH).unwrap();
         assert_eq!(v, VoxelCoord::new(5, 7, 3));
         // Player at +Z looking toward -Z sees the block's +Z face.
         assert_eq!(n, FaceNormal::PosZ);
@@ -279,7 +279,7 @@ mod tests {
         let (map, pool, _) = single_block_sector();
         let origin = Vec3::new(5.5, 5.5, 3.5);
         let dir = Vec3::new(0.0, 1.0, 0.0);
-        let (v, n) = raycast_voxel(&map, &pool, origin, dir, REACH).unwrap();
+        let (v, n, _t) = raycast_voxel(&map, &pool, origin, dir, REACH).unwrap();
         assert_eq!(v, VoxelCoord::new(5, 7, 3));
         assert_eq!(n, FaceNormal::NegY);
     }
@@ -289,7 +289,7 @@ mod tests {
         let (map, pool, _) = single_block_sector();
         let origin = Vec3::new(5.5, 9.5, 3.5);
         let dir = Vec3::new(0.0, -1.0, 0.0);
-        let (v, n) = raycast_voxel(&map, &pool, origin, dir, REACH).unwrap();
+        let (v, n, _t) = raycast_voxel(&map, &pool, origin, dir, REACH).unwrap();
         assert_eq!(v, VoxelCoord::new(5, 7, 3));
         assert_eq!(n, FaceNormal::PosY);
     }

@@ -10,6 +10,8 @@ solid = false
 transparent = true
 light_emission = 0
 base_color = [0, 0, 0]
+textures = ["air"]
+use_quad_uv = false
 
 [[block]]
 name = "stone"
@@ -19,6 +21,8 @@ solid = true
 transparent = false
 light_emission = 0
 base_color = [128, 128, 128]
+textures = ["stone"]
+use_quad_uv = false
 
 [[block]]
 name = "dirt"
@@ -28,6 +32,8 @@ solid = true
 transparent = false
 light_emission = 0
 base_color = [134, 96, 67]
+textures = ["dirt"]
+use_quad_uv = false
 
 [[block]]
 name = "grass"
@@ -37,6 +43,8 @@ solid = true
 transparent = false
 light_emission = 0
 base_color = [95, 159, 53]
+textures = ["grass_side", "grass_side", "grass_top", "dirt", "grass_side", "grass_side"]
+use_quad_uv = false
 
 [[block]]
 name = "wood"
@@ -46,6 +54,8 @@ solid = true
 transparent = false
 light_emission = 0
 base_color = [160, 120, 80]
+textures = ["plank"]
+use_quad_uv = false
 
 [[block]]
 name = "leaf"
@@ -55,6 +65,8 @@ solid = true
 transparent = true
 light_emission = 0
 base_color = [50, 120, 40]
+textures = ["leaf"]
+use_quad_uv = false
 
 [[block]]
 name = "sand"
@@ -64,6 +76,8 @@ solid = true
 transparent = false
 light_emission = 0
 base_color = [219, 205, 152]
+textures = ["sand"]
+use_quad_uv = false
 
 [[block]]
 name = "water"
@@ -73,6 +87,8 @@ solid = false
 transparent = true
 light_emission = 0
 base_color = [40, 90, 200]
+textures = ["water"]
+use_quad_uv = false
 
 [[block]]
 name = "log"
@@ -82,6 +98,8 @@ solid = true
 transparent = false
 light_emission = 0
 base_color = [102, 76, 48]
+textures = ["wood", "wood", "wood_top", "wood_top", "wood", "wood"]
+use_quad_uv = false
 
 [[block]]
 name = "plank"
@@ -91,6 +109,8 @@ solid = true
 transparent = false
 light_emission = 0
 base_color = [180, 150, 100]
+textures = ["plank"]
+use_quad_uv = false
 
 [[block]]
 name = "cobble"
@@ -100,6 +120,8 @@ solid = true
 transparent = false
 light_emission = 0
 base_color = [120, 120, 120]
+textures = ["cobble"]
+use_quad_uv = false
 
 [[block]]
 name = "glass"
@@ -109,6 +131,8 @@ solid = true
 transparent = true
 light_emission = 0
 base_color = [200, 230, 235]
+textures = ["glass"]
+use_quad_uv = false
 
 [[block]]
 name = "glowstone"
@@ -118,6 +142,8 @@ solid = true
 transparent = false
 light_emission = 15
 base_color = [255, 255, 200]
+textures = ["glowstone"]
+use_quad_uv = false
 
 [[block]]
 name = "metal"
@@ -127,6 +153,8 @@ solid = true
 transparent = false
 light_emission = 0
 base_color = [180, 180, 190]
+textures = ["metal"]
+use_quad_uv = false
 
 [[block]]
 name = "ice"
@@ -136,6 +164,8 @@ solid = true
 transparent = true
 light_emission = 0
 base_color = [180, 220, 235]
+textures = ["ice"]
+use_quad_uv = false
 
 [[block]]
 name = "lava"
@@ -145,3 +175,5 @@ solid = false
 transparent = false
 light_emission = 15
 base_color = [200, 80, 20]
+textures = ["lava"]
+use_quad_uv = false

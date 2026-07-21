@@ -8,7 +8,9 @@
 use bevy::prelude::*;
 
 /// A 32³ sector coordinate in sector-space (not voxel-space).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Component)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Component, serde::Serialize, serde::Deserialize,
+)]
 pub struct SectorCoord(pub i32, pub i32, pub i32);
 
 /// Authoritative per-sector transform state. `tier` is the live streaming tier.
@@ -55,6 +57,10 @@ pub struct NeedsBake;
 /// `Transform` entity (debug gizmo, prop) is never mistaken for the player.
 #[derive(Debug, Clone, Copy, Component)]
 pub struct StreamingAnchor;
+
+/// Shareable generated snapshot, held on the sector entity (plan 07 snapshot).
+#[derive(Debug, Component, Clone)]
+pub struct SectorSnapshot(pub std::sync::Arc<crate::xbrickmap::CompressedChunkData>);
 
 /// Diagnostic counter written by the filter-first demo system.
 #[derive(Debug, Resource, Default, PartialEq)]

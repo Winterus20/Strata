@@ -9,6 +9,7 @@ use strata_core::registry::load_block_registry;
 
 use crate::generator::{generate_compressed, generate_sector};
 use crate::plugin::{Generated, WorldGenPlugin};
+use crate::rng::WORLD_SEED;
 
 /// Byte-stable signature of a [`CompressedChunkData`] for equality checks
 /// (the struct does not derive `PartialEq`, so we compare field-by-field).
@@ -206,4 +207,96 @@ fn compressed_is_arc_shareable() {
     let a: Arc<CompressedChunkData> = generate_compressed(SectorCoord(5, 0, 5), &reg);
     let b = a.clone();
     assert_eq!(chunk_signature(&a), chunk_signature(&b));
+}
+
+#[test]
+fn test_underwater_cave_air_cells_are_air() {
+    let reg = load_block_registry();
+    let mut pool = GlobalBrickPool::new();
+    let mut palette = SectorPalette::new();
+    let map = generate_sector(SectorCoord(0, 0, 0), &reg, &mut pool, &mut palette);
+
+    let water_id = reg.id_by_name("water").unwrap_or(BlockId(7));
+    let mut cave_air_count = 0;
+    for lx in 0..32u32 {
+        for lz in 0..32u32 {
+            let wx = lx as i32;
+            let wz = lz as i32;
+            let biome = crate::biome::biome_at(wx, wz);
+            let h = crate::generator::height_at(wx, wz, biome);
+            for ly in 1..=30u32 {
+                let wy = ly as i32;
+                let wob = (crate::noise::fbm3(
+                    wx as f32 * 0.05,
+                    wy as f32 * 0.05,
+                    wz as f32 * 0.05,
+                    WORLD_SEED ^ 0x4B4B_4B4B_4B4B_4B4B,
+                ) - 0.5)
+                    * 3.0;
+                let terrain_d = (h as f32 - wy as f32) + wob;
+                if terrain_d > 0.0 {
+                    let cave = crate::noise::fbm3(
+                        wx as f32 * 0.08,
+                        wy as f32 * 0.08,
+                        wz as f32 * 0.08,
+                        WORLD_SEED ^ 0x5C5C_5C5C_5C5C_5C5C,
+                    );
+                    if cave > 0.62 {
+                        let block = map.get_block(&pool, &palette, VoxelCoord::new(lx, ly, lz));
+                        cave_air_count += 1;
+                        assert_eq!(
+                            block,
+                            BlockId::AIR,
+                            "Underwater cave cell at ({wx}, {wy}, {wz}) must be AIR"
+                        );
+                        assert_ne!(
+                            block, water_id,
+                            "Found water in underwater cave cell at ({wx}, {wy}, {wz})"
+                        );
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        cave_air_count > 0,
+        "Expected at least one 3D cave cell in sector"
+    );
+}
+
+#[test]
+fn test_async_gen_task_respawned_entity() {
+    let mut app = App::new();
+    app.insert_resource(load_block_registry());
+    app.insert_resource(GlobalBrickPool::new());
+    app.add_strata_plugin(WorldGenPlugin);
+
+    let e1 = app.world_mut().spawn(SectorCoord(0, 0, 0)).id();
+    app.update();
+
+    app.world_mut().despawn(e1);
+    let e2 = app.world_mut().spawn(SectorCoord(0, 0, 0)).id();
+
+    for _ in 0..2000 {
+        if app
+            .world()
+            .get_entity(e2)
+            .map(|e| e.contains::<Generated>())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        app.update();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+
+    let entity = app.world().entity(e2);
+    assert!(
+        entity.contains::<Generated>(),
+        "respawned sector entity must be marked Generated after task completes"
+    );
+    assert!(
+        entity.contains::<XBrickMap>(),
+        "respawned sector entity must have XBrickMap component"
+    );
 }

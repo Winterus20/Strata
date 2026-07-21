@@ -59,23 +59,56 @@ impl InputMapper {
     }
 }
 
+/// Cooldown in seconds between repeated break/place actions when holding down mouse buttons (0.2s = 5 actions/sec max).
+pub const ACTION_COOLDOWN_SECS: f32 = 0.2;
+
 /// ECS system: sample buttons and write the shared [`PlayerInput`], then emit
 /// break/place events for the interaction systems to consume.
 #[allow(clippy::too_many_arguments)]
 pub fn input_mapper_system(
     keys: Res<ButtonInput<KeyCode>>,
     mouse: Res<ButtonInput<MouseButton>>,
+    time: Res<Time>,
     mut input: ResMut<PlayerInput>,
     mut break_writer: MessageWriter<PlayerBreak>,
     mut place_writer: MessageWriter<PlayerPlace>,
+    mut break_timer: Local<Option<Timer>>,
+    mut place_timer: Local<Option<Timer>>,
 ) {
     let resolved = InputMapper::resolve(&keys, &mouse);
     // Change-detection guard: only flag the resource when it actually changed.
     input.set_if_neq(resolved);
-    if resolved.break_block {
+
+    let b_timer = break_timer
+        .get_or_insert_with(|| Timer::from_seconds(ACTION_COOLDOWN_SECS, TimerMode::Once));
+    b_timer.tick(time.delta());
+
+    let p_timer = place_timer
+        .get_or_insert_with(|| Timer::from_seconds(ACTION_COOLDOWN_SECS, TimerMode::Once));
+    p_timer.tick(time.delta());
+
+    let should_break = if mouse.just_pressed(MouseButton::Left)
+        || (mouse.pressed(MouseButton::Left) && b_timer.is_finished())
+    {
+        b_timer.reset();
+        true
+    } else {
+        false
+    };
+
+    let should_place = if mouse.just_pressed(MouseButton::Right)
+        || (mouse.pressed(MouseButton::Right) && p_timer.is_finished())
+    {
+        p_timer.reset();
+        true
+    } else {
+        false
+    };
+
+    if should_break {
         break_writer.write(PlayerBreak);
     }
-    if resolved.place_block {
+    if should_place {
         place_writer.write(PlayerPlace);
     }
 }
@@ -115,5 +148,64 @@ mod tests {
         keys.press(KeyCode::KeyQ);
         let input = InputMapper::resolve(&keys, &mouse);
         assert!(input.hotbar_next);
+    }
+
+    #[test]
+    fn input_cooldown_prevents_spam() {
+        use bevy::ecs::message::{MessageCursor, Messages};
+
+        let mut world = World::new();
+        world.insert_resource(Time::<()>::default());
+        let keys = ButtonInput::<KeyCode>::default();
+        let mut mouse = ButtonInput::<MouseButton>::default();
+        mouse.press(MouseButton::Left);
+        world.insert_resource(keys);
+        world.insert_resource(mouse);
+        world.insert_resource(PlayerInput::default());
+        world.init_resource::<Messages<PlayerBreak>>();
+        world.init_resource::<Messages<PlayerPlace>>();
+
+        let mut schedule = Schedule::default();
+        schedule.add_systems(input_mapper_system);
+
+        let mut cursor = MessageCursor::<PlayerBreak>::default();
+
+        // Step 1: Initial press -> 1 PlayerBreak message emitted
+        schedule.run(&mut world);
+        let count1 = cursor
+            .read(world.resource::<Messages<PlayerBreak>>())
+            .count();
+        assert_eq!(count1, 1, "first press emits 1 break message");
+
+        // Step 2: 10ms later (mouse held down, timer not finished) -> 0 new messages emitted
+        world
+            .resource_mut::<ButtonInput<MouseButton>>()
+            .clear_just_pressed(MouseButton::Left);
+        world
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(10));
+        schedule.run(&mut world);
+
+        let count2 = cursor
+            .read(world.resource::<Messages<PlayerBreak>>())
+            .count();
+        assert_eq!(
+            count2, 0,
+            "holding mouse before 0.2s cooldown expires emits 0 new break messages"
+        );
+
+        // Step 3: Advance past 200ms -> timer finishes, holding mouse emits break message again
+        world
+            .resource_mut::<Time>()
+            .advance_by(std::time::Duration::from_millis(250));
+        schedule.run(&mut world);
+
+        let count3 = cursor
+            .read(world.resource::<Messages<PlayerBreak>>())
+            .count();
+        assert_eq!(
+            count3, 1,
+            "after cooldown expires, holding mouse emits break message again"
+        );
     }
 }

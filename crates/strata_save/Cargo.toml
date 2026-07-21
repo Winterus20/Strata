@@ -1,0 +1,30 @@
+[package]
+name = "strata_save"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# Durable storage primitives (region/compress/metadata) this crate orchestrates.
+strata_storage = { path = "../strata_storage" }
+strata_core = { path = "../strata_core" }
+
+# ECS integration (Bevy plugin, events). Bevy pulled in without the full render stack.
+bevy = { workspace = true, default-features = false, features = ["bevy_log"] }
+
+# Async backend runtime (plan 15 §1.4: single tokio runtime + priority channel).
+tokio = { workspace = true }
+
+# Serialization (plan 15/38: postcard + versioned envelope).
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1.1", features = ["alloc"] }
+thiserror = "1"
+bytemuck = { version = "1", features = ["derive"] }
+
+# Save-envelope integrity hash (plan 15 §38: BLAKE3 over payload).
+blake3 = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+# Unique temp-dir names for tests (Windows-compatible).
+uuid = { version = "1", features = ["v4"] }

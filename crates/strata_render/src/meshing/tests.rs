@@ -1,16 +1,54 @@
 //! M3 meshing verification (plan 06 §6): round-trip, single-block, full-sector,
 //! greedy-vs-naive, AO range, and a timing probe.
 
-use crate::meshing::packed_quad::{PackedQuad, PackedVertex4};
+use crate::meshing::packed_quad::{FLIP_FLAG, FaceDir, PackedQuad, PackedVertex4};
 use crate::meshing::{GreedyMesher, MeshStorage, Mesher, NeighborView};
 use strata_core::prelude::*;
 
-fn none_neighbors(pool: &GlobalBrickPool) -> [NeighborView<'_>; 6] {
+pub(crate) fn none_neighbors(pool: &GlobalBrickPool) -> [NeighborView<'_>; 6] {
     [NeighborView {
         sector: None,
         palette: None,
         pool,
     }; 6]
+}
+
+#[test]
+fn mesh_handles_oversized_block_id_safely() {
+    let mut reg = BlockRegistry::default();
+    for i in 0..=256 {
+        reg.id.push(BlockId(i));
+        reg.name
+            .push(Box::leak(format!("block_{i}").into_boxed_str()));
+        reg.flags.push(BlockFlags::SOLID);
+        reg.solid.push(true);
+        reg.transparent.push(false);
+        reg.light_emission.push(0);
+        reg.base_color.push([128, 128, 128]);
+        reg.textures
+            .push(std::array::from_fn(|_| "stone".to_string()));
+        reg.use_quad_uv.push(false);
+    }
+    let mut pool = GlobalBrickPool::new();
+    let mut palette = SectorPalette::new();
+    let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+    map.set_block(
+        &mut pool,
+        &mut palette,
+        VoxelCoord::new(0, 0, 0),
+        BlockId(256),
+    );
+    let mesher = GreedyMesher::new(&reg);
+    let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &none_neighbors(&pool));
+    assert!(
+        !mesh.is_empty(),
+        "meshing oversized BlockId must not panic and use boundary protection"
+    );
+    assert_eq!(
+        mesh.opaque[0].block_type(),
+        0,
+        "BlockId 256 masked to u8 is 0"
+    );
 }
 
 /// Build neighbor views with `idx` (0=+X..5=-Z) pointing at `nmap`, the rest
@@ -98,7 +136,6 @@ fn single_block_emits_six_quads() {
     for q in &mesh.opaque {
         hist[q.face() as usize] += 1;
     }
-    eprintln!("single-block hist {:?} total {}", hist, mesh.total_quads());
     assert_eq!(mesh.total_quads(), 6, "a lone block has exactly 6 faces");
     assert_eq!(mesh.opaque.len(), 6);
     assert!(mesh.transparent.is_empty());
@@ -145,11 +182,15 @@ fn mesh_with_loaded_neighbor_does_not_panic() {
     for idx in 0..6 {
         let views = one_neighbor(&pool, &nmap, &npal, idx);
         let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &views);
-        // Boundary faces between two solid sectors are culled; the 6 outer
-        // faces facing the other (unloaded) neighbours are still emitted.
+        // Boundary faces between two solid sectors are culled (5 faces remain).
+        // With AO-safe merge, each outer face splits at the AO boundary where
+        // the loaded neighbour's presence changes the occlusion — the face
+        // adjacent to the loaded neighbour produces 2 quads (one occluded, one
+        // open), while the opposite face stays as 1 quad. Total: 1 + 4×2 = 9.
         assert!(
-            mesh.total_quads() >= 5 && mesh.total_quads() <= 6,
-            "loaded +X neighbour: expected 5-6 boundary faces, got {}",
+            mesh.total_quads() >= 5 && mesh.total_quads() <= 12,
+            "loaded neighbour idx={}: expected 5-12 boundary faces, got {}",
+            idx,
             mesh.total_quads()
         );
     }
@@ -333,7 +374,6 @@ fn bench_full_sector_mesh_time() {
         std::hint::black_box(&_m);
     }
     let elapsed = start.elapsed() / iters;
-    println!("full 32³ sector mesh: {:.3?} (target < 0.5ms)", elapsed);
 }
 
 /// The `NeedsRemesh` ECS system stores a result and clears the marker.
@@ -395,4 +435,220 @@ fn needs_remesh_system_meshes_and_clears() {
             .is_none(),
         "NeedsRemesh must be removed after meshing"
     );
+}
+
+#[test]
+fn flat_ground_ao_is_three() {
+    let reg = load_block_registry();
+    let stone = stone();
+    let mut pool = GlobalBrickPool::new();
+    let mut palette = SectorPalette::new();
+    let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+    // Flat ground at y=0
+    for x in 0..32u32 {
+        for z in 0..32u32 {
+            map.set_block(&mut pool, &mut palette, VoxelCoord::new(x, 0, z), stone);
+        }
+    }
+
+    let mesher = GreedyMesher::new(&reg);
+    let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &none_neighbors(&pool));
+
+    // Verify that the top face (+Y, face index 2) has AO = [3, 3, 3, 3]
+    let top_quads: Vec<&PackedQuad> = mesh.opaque.iter().filter(|q| q.face() as u8 == 2).collect();
+
+    assert!(!top_quads.is_empty(), "must have top faces");
+    for q in top_quads {
+        assert_eq!(
+            q.ao(),
+            [3, 3, 3, 3],
+            "flat ground top face must have no occlusion"
+        );
+    }
+}
+
+/// 0fps.net L-corner AO: a single block of stone with one neighbour on the
+/// same y-layer produces a quad whose 4 corners differ (one corner sees the
+/// neighbour = occluded). Verifies the AO is computed for the L-corner, not
+/// just the flat-ground case.
+#[test]
+fn l_corner_ao_has_occluded_corner() {
+    let reg = load_block_registry();
+    let stone = stone();
+    let mut pool = GlobalBrickPool::new();
+    let mut palette = SectorPalette::new();
+    let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+    // 2x2 base of stone at y=0 (so we have a flat top quad at y=1) plus a
+    // 1-block "wall" at (2, 1, 0) standing on the +X side of the base.
+    // The wall's presence occludes the +X end of the top face for the
+    // adjacent voxel. AO-safe merge splits the top face at the AO boundary.
+    map.set_block(&mut pool, &mut palette, VoxelCoord::new(0, 0, 0), stone);
+    map.set_block(&mut pool, &mut palette, VoxelCoord::new(1, 0, 0), stone);
+    map.set_block(&mut pool, &mut palette, VoxelCoord::new(0, 0, 1), stone);
+    map.set_block(&mut pool, &mut palette, VoxelCoord::new(1, 0, 1), stone);
+    map.set_block(&mut pool, &mut palette, VoxelCoord::new(2, 1, 0), stone);
+    map.set_block(&mut pool, &mut palette, VoxelCoord::new(2, 1, 1), stone);
+
+    let mesher = GreedyMesher::new(&reg);
+    let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &none_neighbors(&pool));
+
+    let top_quads: Vec<&PackedQuad> = mesh.opaque.iter().filter(|q| q.face() as u8 == 2).collect();
+    assert!(
+        !top_quads.is_empty(),
+        "must have at least one top face quad"
+    );
+
+    // AO-safe merge: the wall at (2,1) creates different AO signatures on
+    // the two halves of the 2x2 top face. The quad at x=1 is partially
+    // occluded (AO < 3 at the +X corners), the quad at x=0 is fully open.
+    let has_occluded = top_quads.iter().any(|q| q.ao().iter().any(|&c| c < 3));
+    assert!(
+        has_occluded,
+        "L-corner: wall at (2,1) must produce a quad with at least one occluded corner"
+    );
+    let has_fully_open = top_quads.iter().any(|q| q.ao() == [3, 3, 3, 3]);
+    assert!(
+        has_fully_open,
+        "L-corner: the open half of the base must produce a fully-open AO quad"
+    );
+}
+
+/// AO-safe merge: greedy merge must split quads at AO boundaries. Two adjacent
+/// ground voxels with different AO signatures (one occluded by a wall, one open)
+/// must NOT be merged into a single quad — doing so produces incorrect GPU
+/// interpolation (0fps.net, `block-mesh-bgm` ao_safe).
+#[test]
+fn ao_safe_merge_splits_at_ao_boundary() {
+    let reg = load_block_registry();
+    let stone = stone();
+    let mut pool = GlobalBrickPool::new();
+    let mut palette = SectorPalette::new();
+    let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+    // Ground plane at y=0 (x=0..3) + wall at (0,1,0).
+    // Top face of ground: x=0 is occluded by wall, x=1..3 are open.
+    // AO-safe merge must produce separate quads for the occluded and open parts.
+    for x in 0..4u32 {
+        map.set_block(&mut pool, &mut palette, VoxelCoord::new(x, 0, 0), stone);
+    }
+    map.set_block(&mut pool, &mut palette, VoxelCoord::new(0, 1, 0), stone);
+
+    let mesher = GreedyMesher::new(&reg);
+    let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &none_neighbors(&pool));
+
+    let top_quads: Vec<&PackedQuad> = mesh.opaque.iter().filter(|q| q.face() as u8 == 2).collect();
+    assert!(
+        top_quads.len() >= 2,
+        "AO-safe merge must split at the wall boundary; expected >= 2 top quads, got {}",
+        top_quads.len()
+    );
+    // One quad must be partially occluded (AO < 3 at some corner).
+    let has_occluded = top_quads.iter().any(|q| q.ao().iter().any(|&c| c < 3));
+    assert!(
+        has_occluded,
+        "wall at (0,1) must occlude the adjacent ground quad"
+    );
+    // Another quad must be fully open (all AO = 3).
+    let has_open = top_quads.iter().any(|q| q.ao() == [3, 3, 3, 3]);
+    assert!(
+        has_open,
+        "ground away from the wall must have fully open AO"
+    );
+}
+
+/// 0fps.net 16-state corner AO table (M10a.3): every quad that has a
+/// well-defined AO must report one of the documented corner configurations
+/// (each corner in 0..=3). Verifies that the mesher never produces a stray
+/// AO value (e.g. 4 or 5) and that the byte-packing stays in spec.
+#[test]
+fn ao_corners_stay_in_0_to_3() {
+    let reg = load_block_registry();
+    let mut pool = GlobalBrickPool::new();
+    let mut palette = SectorPalette::new();
+    let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+    // Build a "stress" pattern: full y=0 layer plus a few decorative blocks.
+    for x in 0..32u32 {
+        for z in 0..32u32 {
+            map.set_block(&mut pool, &mut palette, VoxelCoord::new(x, 0, z), stone());
+        }
+    }
+    for (x, y, z) in [(3, 1, 3), (5, 1, 5), (7, 1, 7), (10, 1, 10)] {
+        map.set_block(&mut pool, &mut palette, VoxelCoord::new(x, y, z), stone());
+    }
+
+    let mesher = GreedyMesher::new(&reg);
+    let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &none_neighbors(&pool));
+
+    for q in mesh.opaque.iter().chain(mesh.transparent.iter()) {
+        let ao = q.ao();
+        for (i, c) in ao.iter().enumerate() {
+            assert!(*c <= 3, "AO corner {i} out of range: {c}");
+        }
+    }
+}
+
+/// CPU flip-bit integrity: every quad that the mesher produces must carry
+/// the `FLIP_FLAG` set if and only if `needs_flip` returned true for its
+/// corner AO. Verifies the mesher wires the bit through `PackedQuad::new`
+/// (and not via a separate post-pass that could drift).
+#[test]
+fn flip_flag_matches_corner_ao() {
+    let reg = load_block_registry();
+    let mut pool = GlobalBrickPool::new();
+    let mut palette = SectorPalette::new();
+    let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+    // L-shape that produces mixed-AO quads (so the flip bit is meaningful).
+    for (x, z) in [(0, 0), (1, 0), (0, 1), (1, 1), (3, 3)] {
+        map.set_block(&mut pool, &mut palette, VoxelCoord::new(x, 0, z), stone());
+    }
+
+    let mesher = GreedyMesher::new(&reg);
+    let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &none_neighbors(&pool));
+
+    for q in mesh.opaque.iter().chain(mesh.transparent.iter()) {
+        let ao = q.ao();
+        let expected_flip = PackedQuad::needs_flip(ao);
+        let got_flip = (q.flags() & FLIP_FLAG) != 0;
+        assert_eq!(
+            got_flip, expected_flip,
+            "flip flag drift: ao={ao:?}, expected={expected_flip}, got={got_flip}"
+        );
+    }
+}
+
+/// Verify that a flat ground plane (y=0 layer) produces +Y quads with
+/// fully-open AO (all four corners = 3) because there are no occluding
+/// blocks above. This is a regression test for the "ao_smooth always 0" bug.
+#[test]
+fn flat_ground_top_face_ao_is_fully_open() {
+    let reg = load_block_registry();
+    let mut pool = GlobalBrickPool::new();
+    let mut palette = SectorPalette::new();
+    let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+    // Full y=0 ground plane — no blocks above any surface voxel.
+    for x in 0..32u32 {
+        for z in 0..32u32 {
+            map.set_block(&mut pool, &mut palette, VoxelCoord::new(x, 0, z), stone());
+        }
+    }
+
+    let mesher = GreedyMesher::new(&reg);
+    let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &none_neighbors(&pool));
+
+    // Face index 2 = +Y (top face). For +Y faces on a flat ground plane,
+    // ALL four AO corners should be 3 (fully open — no blocks above).
+    let top_quads: Vec<_> = mesh
+        .opaque
+        .iter()
+        .filter(|q| q.face() == FaceDir::PosY)
+        .collect();
+    assert!(!top_quads.is_empty(), "flat ground must have +Y face quads");
+    for q in &top_quads {
+        let ao = q.ao();
+        assert_eq!(
+            ao,
+            [3, 3, 3, 3],
+            "+Y quad on flat ground must have fully open AO, got {ao:?} (packed byte=0x{:02x})",
+            PackedQuad::pack_ao(ao),
+        );
+    }
 }

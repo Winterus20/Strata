@@ -325,3 +325,21 @@ fn world_voxel(coord: SectorCoord, local: VoxelCoord) -> IVec3 {
         coord.2 * 32 + local.z as i32,
     )
 }
+
+#[test]
+fn test_ground_below_negative_y() {
+    let mut pool = GlobalBrickPool::new();
+    let mut palette = SectorPalette::new();
+    let mut map = XBrickMap::new(SectorCoord(0, -1, 0));
+    map.set_block(
+        &mut pool,
+        &mut palette,
+        VoxelCoord::new(5, 20, 5),
+        BlockId(1),
+    );
+
+    assert!(
+        ground_below(&map, &pool, Vec3::new(5.5, -11.0, 5.5)),
+        "ground_below must return true for solid voxel at negative Y (-12)"
+    );
+}

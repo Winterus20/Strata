@@ -250,7 +250,7 @@ impl StrataPlugin for StreamingPlugin {
 /// (4) frees + despawns any sector that has drifted outside the effective
 /// radius. Freeing the pooled bricks happens before despawn so the shared
 /// [`GlobalBrickPool`] reclaims the memory (LRU steady-state).
-#[allow(clippy::type_complexity)]
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub fn streaming_system(
     mut commands: Commands,
     mut manager: ResMut<StreamingManager>,
@@ -258,6 +258,8 @@ pub fn streaming_system(
     player: Query<&Transform, With<StreamingAnchor>>,
     sectors: Query<(Entity, &SectorCoord, Option<&XBrickMap>)>,
     pool: Res<GlobalBrickPool>,
+    dirty_queue: Option<Res<strata_save::plugin::DirtyQueue>>,
+    mut messages: Option<ResMut<bevy_ecs::message::Messages<strata_save::plugin::SectorSave>>>,
 ) {
     timers.us = 0;
     timers.spawned = 0;
@@ -374,6 +376,17 @@ pub fn streaming_system(
                 break;
             }
             if let Some(e) = manager.entity_for(c) {
+                // If the sector is dirty, emit a SectorSave event before despawning
+                let is_dirty = dirty_queue
+                    .as_ref()
+                    .map(|dq| dq.tracker.is_dirty(*c))
+                    .unwrap_or(false);
+                #[allow(clippy::collapsible_if)]
+                if is_dirty {
+                    if let Some(ref mut msgs) = messages {
+                        msgs.write(strata_save::plugin::SectorSave(*c));
+                    }
+                }
                 if let Ok((_, _, Some(map))) = sectors.get(e) {
                     map.free_locked(&mut inner_pool);
                 }

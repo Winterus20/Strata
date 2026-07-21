@@ -105,33 +105,6 @@ pub fn density(x: f32, y: f32, z: f32, biome: Biome) -> f32 {
     d
 }
 
-/// Density using a precomputed column height `h` (world Y). Identical to
-/// [`density`] but skips the per-voxel `height_at` recompute (column cache,
-/// plan 11 §4.2.1). The 3D wobble/cave terms stay per-voxel (they depend on y).
-fn density_cached(x: f32, y: f32, z: f32, h: f32) -> f32 {
-    let wob = (fbm3(
-        x * TERRAIN_FREQ,
-        y * TERRAIN_FREQ,
-        z * TERRAIN_FREQ,
-        WORLD_SEED ^ TERRAIN_SALT,
-    ) - 0.5)
-        * 3.0;
-    let d = (h - y) + wob;
-    if d <= 0.0 {
-        return d;
-    }
-    let cave = fbm3(
-        x * CAVE_FREQ,
-        y * CAVE_FREQ,
-        z * CAVE_FREQ,
-        WORLD_SEED ^ CAVE_SALT,
-    );
-    if cave > CAVE_THRESHOLD {
-        return -1.0;
-    }
-    d
-}
-
 /// Decide the block at a world coordinate using the precomputed column `biome`
 /// and surface height `h` (AIR sentinel = 0 for empty). Byte-identical to the
 /// old per-voxel path (same biome/height, just cached once per column).
@@ -141,12 +114,29 @@ fn select_block_cached(x: i32, y: i32, z: i32, wb: &WorldBlocks, biome: Biome, h
     if y == 0 {
         return wb.stone;
     }
-    let d = density_cached(x as f32, y as f32, z as f32, h as f32);
-    if d <= 0.0 {
+    let wob = (fbm3(
+        x as f32 * TERRAIN_FREQ,
+        y as f32 * TERRAIN_FREQ,
+        z as f32 * TERRAIN_FREQ,
+        WORLD_SEED ^ TERRAIN_SALT,
+    ) - 0.5)
+        * 3.0;
+    let terrain_d = (h as f32 - y as f32) + wob;
+    if terrain_d <= 0.0 {
         // Above the surface: fill oceans up to sea level, else air.
         if y <= SEA_LEVEL {
             return wb.water;
         }
+        return air;
+    }
+
+    let cave = fbm3(
+        x as f32 * CAVE_FREQ,
+        y as f32 * CAVE_FREQ,
+        z as f32 * CAVE_FREQ,
+        WORLD_SEED ^ CAVE_SALT,
+    );
+    if cave > CAVE_THRESHOLD {
         return air;
     }
 

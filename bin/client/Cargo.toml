@@ -33,12 +33,16 @@ bevy = { workspace = true, default-features = false, features = [
     "bevy_render",
 ] }
 bevy_rapier3d = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+tempfile = "3"
 
 strata_core = { path = "../../crates/strata_core" }
 strata_world = { path = "../../crates/strata_world" }
 strata_physics = { path = "../../crates/strata_physics" }
 strata_render = { path = "../../crates/strata_render" }
 strata_player = { path = "../../crates/strata_player" }
+strata_save = { path = "../../crates/strata_save" }
+strata_storage = { path = "../../crates/strata_storage" }
 
 # GPU + helpers for M9b surface presentation (same wgpu 27 line as strata_render).
 wgpu = "27"

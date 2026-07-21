@@ -5,8 +5,10 @@ use std::collections::HashSet;
 
 use bevy::prelude::*;
 
+use bevy_ecs::system::RunSystemOnce;
 use strata_core::prelude::*;
 use strata_core::registry::load_block_registry;
+use strata_storage::backend::AsyncStorageBackend;
 
 use crate::plugin::{Generated, Generating, PendingWorldGen, WorldGenPlugin};
 use crate::streaming::{StreamingManager, StreamingPlugin};
@@ -366,4 +368,167 @@ fn integration_unload_frees_pool_bricks() {
             .any(|c| *c == SectorCoord(0, 0, 0))
     };
     assert!(!origin_present, "origin must be unloaded");
+}
+
+#[test]
+fn streaming_unload_dirty_sector_triggers_flush() {
+    let mut app = App::new();
+    configure_chain(&mut app);
+    app.insert_resource(load_block_registry());
+    app.add_strata_plugin(StreamingPlugin::default());
+    app.add_strata_plugin(WorldGenPlugin);
+
+    // Setup SavePlugin requirements
+    app.insert_resource(strata_save::plugin::DirtyQueue::default());
+    app.init_resource::<bevy_ecs::message::Messages<strata_save::plugin::SectorSave>>();
+
+    let player = app
+        .world_mut()
+        .spawn((StreamingAnchor, Transform::from_translation(Vec3::ZERO)))
+        .id();
+
+    // Wait for terrain generator to finish generating origin sectors
+    for _ in 0..2000 {
+        app.update();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let pending_empty = app.world().resource::<PendingWorldGen>().tasks.is_empty();
+        let generating_empty = app
+            .world_mut()
+            .query_filtered::<Entity, With<Generating>>()
+            .iter(app.world_mut())
+            .next()
+            .is_none();
+        let any_unscaled = app
+            .world_mut()
+            .query_filtered::<Entity, (With<SectorCoord>, Without<Generated>, Without<Generating>)>(
+            )
+            .iter(app.world_mut())
+            .next()
+            .is_some();
+        let has_bricks = app.world().resource::<GlobalBrickPool>().brick_count() > 0;
+        if pending_empty && generating_empty && !any_unscaled && has_bricks {
+            break;
+        }
+    }
+
+    // Mark origin as dirty
+    let coord = SectorCoord(0, 0, 0);
+    {
+        let dq = app.world().resource::<strata_save::plugin::DirtyQueue>();
+        dq.tracker.mark_dirty(coord);
+    }
+
+    // Move player far away so origin unloads
+    app.world_mut()
+        .entity_mut(player)
+        .insert(Transform::from_translation(Vec3::new(
+            20.0 * 32.0,
+            0.0,
+            0.0,
+        )));
+
+    for _ in 0..200 {
+        app.update();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+
+    // Verify SectorSave event was triggered
+    let emitted = app.world_mut().run_system_once(
+        |mut reader: MessageReader<strata_save::plugin::SectorSave>| {
+            reader.read().map(|e| e.0).collect::<Vec<SectorCoord>>()
+        },
+    );
+    assert!(
+        emitted.unwrap().contains(&coord),
+        "dirty sector must trigger SectorSave on unload"
+    );
+}
+
+#[tokio::test]
+async fn streaming_load_existing_sector_skips_regen() {
+    let dir = std::env::temp_dir().join(format!(
+        "strata_load_test_{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let backend = strata_storage::backend::TokioBackend::new(dir.clone()).unwrap();
+    let meta_store = strata_storage::metadata::FjallMetadata::open(&dir.join("metadata")).unwrap();
+    let save_manager = strata_save::save_manager::SaveManager::new(
+        std::sync::Arc::new(meta_store),
+        std::time::Duration::from_secs(300),
+    );
+
+    let mut app = App::new();
+    configure_chain(&mut app);
+    app.insert_resource(load_block_registry());
+
+    app.add_strata_plugin(StreamingPlugin::default());
+    app.add_strata_plugin(WorldGenPlugin);
+
+    app.insert_resource(strata_save::plugin::SaveBackend(backend.clone()));
+    app.insert_resource(save_manager.clone());
+
+    let coord = SectorCoord(0, 0, 0);
+    let mock_data = std::sync::Arc::new(CompressedChunkData {
+        coord: [0, 0, 0],
+        sector_mask: 0,
+        palette: vec![strata_core::registry::BlockId::AIR],
+        bricks: Vec::new(),
+    });
+    let payload = postcard::to_allocvec(&*mock_data).unwrap();
+    let payload_hash = blake3::hash(&payload).into();
+
+    backend
+        .write_sector_with_priority(
+            coord,
+            payload.clone(),
+            strata_storage::backend::priority::ACTIVE,
+        )
+        .await
+        .unwrap();
+
+    let meta = strata_storage::metadata::SectorMetadata {
+        coord,
+        hash: payload_hash,
+        size: payload.len() as u64,
+        mtime: 12345,
+        tier: 0,
+        version: 1,
+        dirty: false,
+    };
+    save_manager.metadata.put(meta).await.unwrap();
+
+    app.world_mut()
+        .spawn((StreamingAnchor, Transform::from_translation(Vec3::ZERO)));
+
+    for _ in 0..100 {
+        app.update();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        let w = app.world_mut();
+        let entity = w
+            .query::<(Entity, &SectorCoord)>()
+            .iter(w)
+            .find(|(_, c)| **c == coord)
+            .map(|(e, _)| w.entity(e));
+
+        if let Some(entity) = entity {
+            let is_ready = entity.contains::<Generated>() && entity.contains::<SectorSnapshot>();
+            if is_ready {
+                assert!(
+                    !entity.contains::<Generating>(),
+                    "loaded sector must not trigger PCG"
+                );
+                std::fs::remove_dir_all(&dir).ok();
+                return;
+            }
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+    panic!("sector failed to load from disk and apply");
 }

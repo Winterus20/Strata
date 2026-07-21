@@ -20,7 +20,17 @@ use strata_physics::plugin::PhysicsPlugin;
 use strata_player::controller::EYE_HEIGHT;
 use strata_player::prelude::*;
 use strata_render::meshing::MeshingPlugin;
+use strata_save::plugin::{DirtyQueue, SaveBackend, SavePlugin, SavedReceiver, SectorSave};
+use strata_save::save_manager::SaveManager;
+use strata_storage::backend::TokioBackend;
+use strata_storage::metadata::FjallMetadata;
 use strata_world::prelude::*;
+
+#[derive(Resource, Clone)]
+pub struct SaveDirectory(pub std::path::PathBuf);
+
+#[derive(Resource)]
+pub struct TempSaveDir(pub tempfile::TempDir);
 
 use client_input::{cursor_grab_system, mouse_look_system};
 use client_render::ClientRenderPlugin;
@@ -78,17 +88,17 @@ fn load_config() -> ClientConfig {
             match key {
                 "radius" => {
                     if let Ok(r) = value.parse::<i32>() {
-                        cfg.radius = r;
+                        cfg.radius = r.clamp(1, 16);
                     }
                 }
                 "width" => {
                     if let Ok(w) = value.parse::<u32>() {
-                        cfg.width = w;
+                        cfg.width = w.clamp(320, 7680);
                     }
                 }
                 "height" => {
                     if let Ok(h) = value.parse::<u32>() {
-                        cfg.height = h;
+                        cfg.height = h.clamp(240, 4320);
                     }
                 }
                 _ => {}
@@ -152,8 +162,42 @@ fn build_client_app(headless: bool, config: &ClientConfig) -> App {
 
     // Core scheduling (orders the StrataSet chain) + the block registry the
     // world-gen and meshing systems read from.
+    app.init_resource::<bevy::ecs::message::Messages<SectorSave>>();
     app.add_strata_plugin(StrataSchedulingPlugin);
     app.add_strata_plugin(BlockRegistryPlugin);
+
+    // Initialize storage backend & metadata store
+    let (save_dir, temp_dir) = if headless {
+        let temp = tempfile::tempdir().expect("failed to create temp dir");
+        let path = temp.path().to_path_buf();
+        (path, Some(temp))
+    } else {
+        let path = std::env::var("APPDATA")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| std::env::current_dir().unwrap())
+            .join("Strata")
+            .join("saves");
+        (path, None)
+    };
+
+    let backend =
+        TokioBackend::new(save_dir.clone()).expect("failed to initialize storage backend");
+    let meta_store =
+        FjallMetadata::open(&save_dir.join("metadata")).expect("failed to open metadata store");
+    let save_manager = SaveManager::new(
+        std::sync::Arc::new(meta_store),
+        std::time::Duration::from_secs(30),
+    );
+
+    app.insert_resource(SaveBackend(backend));
+    app.insert_resource(save_manager);
+    app.insert_resource(SaveDirectory(save_dir));
+    if let Some(td) = temp_dir {
+        app.insert_resource(TempSaveDir(td));
+    }
+    app.add_plugins(SavePlugin {
+        auto_save_interval: std::time::Duration::from_secs(30),
+    });
 
     // Streaming -> WorldGen -> Meshing -> Physics -> Lighting -> Player, plus our
     // client present plugin (registered last so the surface/resource exist).
@@ -166,7 +210,7 @@ fn build_client_app(headless: bool, config: &ClientConfig) -> App {
     app.add_strata_plugin(ClientRenderPlugin);
 
     app.add_systems(Startup, spawn_player_system);
-    app.add_systems(Update, shutdown_system);
+    app.add_systems(Update, (shutdown_system, save_player_system));
 
     // Window-only FPS input: cursor capture + mouse-look. Skipped headlessly
     // (no primary window / cursor to grab). Runs in the Input set so the updated
@@ -190,16 +234,163 @@ fn build_client_app(headless: bool, config: &ClientConfig) -> App {
     app
 }
 
-fn spawn_player_system(mut commands: Commands) {
-    spawn_player(&mut commands, spawn_position());
+fn spawn_player_system(
+    mut commands: Commands,
+    save_manager: Option<Res<SaveManager>>,
+    save_dir: Option<Res<SaveDirectory>>,
+) {
+    let mut spawn_pos = spawn_position();
+    let mut spawn_look = PlayerLook::default();
+
+    if let (Some(mgr), Some(dir)) = (save_manager, save_dir) {
+        let path = dir.0.join("player.dat");
+        #[allow(clippy::collapsible_if)]
+        if path.exists() {
+            if let Ok(player_data) = mgr.load_player(&path) {
+                spawn_pos = Vec3::from_slice(&player_data.position);
+                spawn_look.yaw = player_data.rotation[0];
+                spawn_look.pitch = player_data.rotation[1];
+                info!(
+                    "strata: Loaded player position {:?} and rotation from disk",
+                    spawn_pos
+                );
+            }
+        }
+    }
+
+    commands.spawn((
+        PlayerController::default(),
+        PlayerState::default(),
+        spawn_look,
+        Inventory::default(),
+        StreamingAnchor,
+        Transform::from_translation(spawn_pos),
+        GlobalTransform::from_translation(spawn_pos),
+        Name::new("player"),
+    ));
 }
 
-/// Graceful shutdown (plan 13 §2.6): on `AppExit`, log the teardown point. The
-/// wgpu device / SSBOs (`ClientGpu`) and the `GlobalBrickPool` are reclaimed by
-/// their `Drop` impls as the `App` is dropped — this is the explicit, observable
-/// shutdown hook the plan asks for.
-fn shutdown_system(mut exit: MessageReader<AppExit>) {
+fn save_player_system(
+    save_manager: Option<Res<SaveManager>>,
+    save_dir: Option<Res<SaveDirectory>>,
+    player_query: Query<(&Transform, &PlayerLook, &PlayerState, &Inventory), Changed<Transform>>,
+) {
+    if let (Some(mgr), Some(dir)) = (save_manager, save_dir) {
+        #[allow(clippy::collapsible_if)]
+        if let Ok((transform, look, _player_state, inventory)) = player_query.single() {
+            let path = dir.0.join("player.dat");
+            std::fs::create_dir_all(path.parent().unwrap()).ok();
+            let hotbar_index = inventory.active as u8;
+            let inventory: Vec<Option<strata_save::player_save_data::ItemStack>> = inventory
+                .hotbar
+                .iter()
+                .map(|stack| {
+                    Some(strata_save::player_save_data::ItemStack {
+                        block_id: stack.block.0 as u32,
+                        count: stack.count,
+                    })
+                })
+                .collect();
+            let player_data = strata_save::player_save_data::PlayerSaveData {
+                position: [
+                    transform.translation.x,
+                    transform.translation.y,
+                    transform.translation.z,
+                ],
+                rotation: [look.yaw, look.pitch],
+                health: 20.0,
+                hunger: 20.0,
+                xp: 0,
+                hotbar_index,
+                inventory,
+            };
+            if let Err(e) = mgr.save_player(&path, &player_data) {
+                error!("Failed to save player data: {e:?}");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn shutdown_system(
+    mut exit: MessageReader<AppExit>,
+    save_manager: Option<Res<SaveManager>>,
+    save_dir: Option<Res<SaveDirectory>>,
+    player_query: Query<(&Transform, &PlayerLook, &PlayerState, &Inventory)>,
+    sectors_query: Query<&SectorCoord>,
+    dirty_queue: Option<Res<DirtyQueue>>,
+    mut messages: Option<ResMut<bevy::ecs::message::Messages<SectorSave>>>,
+    saved_receiver: Option<Res<SavedReceiver>>,
+) {
     if exit.read().next().is_some() {
+        info!("strata: AppExit received — saving player and world data");
+
+        // 1. Force flush loaded dirty sectors to messages queue before shutting down
+        if let Some(ref dq) = dirty_queue {
+            for coord in sectors_query.iter() {
+                #[allow(clippy::collapsible_if)]
+                if dq.tracker.is_dirty(*coord) {
+                    if let Some(ref mut msgs) = messages {
+                        msgs.write(SectorSave(*coord));
+                    }
+                }
+            }
+        }
+
+        // 2. Save player position & look
+        if let (Some(mgr), Some(dir)) = (save_manager, save_dir.as_ref()) {
+            let path = dir.0.join("player.dat");
+            std::fs::create_dir_all(path.parent().unwrap()).ok();
+
+            if let Ok((transform, look, _player_state, inventory)) = player_query.single() {
+                let hotbar_index = inventory.active as u8;
+                let inventory_data: Vec<Option<strata_save::player_save_data::ItemStack>> =
+                    inventory
+                        .hotbar
+                        .iter()
+                        .map(|stack| {
+                            Some(strata_save::player_save_data::ItemStack {
+                                block_id: stack.block.0 as u32,
+                                count: stack.count,
+                            })
+                        })
+                        .collect();
+                let player_data = strata_save::player_save_data::PlayerSaveData {
+                    position: [
+                        transform.translation.x,
+                        transform.translation.y,
+                        transform.translation.z,
+                    ],
+                    rotation: [look.yaw, look.pitch],
+                    health: 20.0,
+                    hunger: 20.0,
+                    xp: 0,
+                    hotbar_index,
+                    inventory: inventory_data,
+                };
+                if let Err(e) = mgr.save_player(&path, &player_data) {
+                    error!("Failed to save player data: {e:?}");
+                } else {
+                    info!("strata: Successfully saved player data to disk");
+                }
+            }
+        }
+
+        // 3. Drain any pending completed sector saves (non-blocking)
+        if let Some(ref dq) = dirty_queue {
+            if let Some(ref rx_res) = saved_receiver {
+                if let Ok(mut rx) = rx_res.rx.lock() {
+                    while let Ok(coord) = rx.try_recv() {
+                        dq.tracker.clear(coord);
+                    }
+                }
+            }
+            info!(
+                "strata: Flushed all dirty sectors on shutdown (pending={})",
+                dq.tracker.pending()
+            );
+        }
+
         info!("strata: AppExit received — releasing GPU device + brick pool on teardown");
     }
 }
@@ -375,7 +566,8 @@ fn diagnostics_log_system(
     );
 }
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let config = load_config();
     let mut app = build_client_app(false, &config);
     app.run();
@@ -389,19 +581,52 @@ mod tests {
 
     /// The app must construct (all plugins + systems registered) without panic.
     /// No window/run is performed, so this is safe headlessly.
-    #[test]
-    fn test_client_app_builds() {
+    #[tokio::test]
+    async fn test_client_app_builds() {
         let cfg = ClientConfig::default();
-        let app = build_client_app(true, &cfg);
-        // Probe that the expected resources/plugins are present by running a few
-        // frames headlessly (no window) and checking the streaming->gen->mesh chain.
-        let _ = app;
+        let mut app = build_client_app(true, &cfg);
+        for _ in 0..4 {
+            app.update();
+        }
+        let world = app.world();
+        assert!(
+            world.contains_resource::<SaveManager>(),
+            "SaveManager resource must be registered"
+        );
+        assert!(
+            world.contains_resource::<SaveBackend>(),
+            "SaveBackend resource must be registered"
+        );
+        assert!(
+            world.contains_resource::<DirtyQueue>(),
+            "DirtyQueue resource must be registered"
+        );
+        assert!(
+            world.contains_resource::<strata_save::plugin::FlushScheduler>(),
+            "FlushScheduler resource must be registered"
+        );
+        assert!(
+            world.contains_resource::<GlobalBrickPool>(),
+            "GlobalBrickPool resource must be registered"
+        );
+        assert!(
+            world.contains_resource::<BlockRegistry>(),
+            "BlockRegistry resource must be registered"
+        );
+        assert!(
+            world.contains_resource::<PlayerInput>(),
+            "PlayerInput resource must be registered"
+        );
+        let world_mut = app.world_mut();
+        let mut pq = QueryState::<(&PlayerController, &PlayerLook), ()>::new(world_mut);
+        let player_count = pq.iter(world_mut).count();
+        assert_eq!(player_count, 1, "exactly one player entity must exist");
     }
 
     /// End-to-end headless pipeline check: with a player present, sectors stream
     /// in, get generated, and are meshed into `MeshStorage` (no GPU required).
-    #[test]
-    fn test_stream_gen_mesh_chain() {
+    #[tokio::test]
+    async fn test_stream_gen_mesh_chain() {
         let cfg = ClientConfig::default();
         let mut app = build_client_app(true, &cfg);
 
@@ -424,9 +649,9 @@ mod tests {
     /// Diagnostic: simulate the full fall from the spawn point and report where
     /// the player ends up relative to the terrain surface, and whether its eye
     /// voxel is solid (buried => gray screen). Prints with `--nocapture`.
-    #[test]
+    #[tokio::test]
     #[ignore = "diagnostic: heavy (600 sim frames); run explicitly with --ignored"]
-    fn diag_player_settles_above_terrain() {
+    async fn diag_player_settles_above_terrain() {
         use strata_player::controller::{EYE_HEIGHT, PlayerController};
 
         let cfg = ClientConfig::default();
@@ -480,9 +705,9 @@ mod tests {
     /// GPU and report the vertical sky/terrain composition (top/middle/bottom
     /// center-column colors). Reveals whether the "gray screen" is terrain, sky,
     /// or a broken frame. Skipped when no capable GPU is present.
-    #[test]
+    #[tokio::test]
     #[ignore = "diagnostic: heavy (600 sim frames + GPU); run explicitly with --ignored"]
-    fn diag_render_from_player_view() {
+    async fn diag_render_from_player_view() {
         use strata_player::controller::{EYE_HEIGHT, PlayerController};
         use strata_render::meshing::{MeshData, MeshStorage};
         use strata_render::pipeline::camera::{look_at_rh, perspective_rh_zo};
@@ -609,5 +834,81 @@ mod tests {
         eprintln!("DIAG-RENDER: top(y=16)={:?}", sample(16));
         eprintln!("DIAG-RENDER: middle(y=128)={:?}", sample(128));
         eprintln!("DIAG-RENDER: bottom(y=240)={:?}", sample(240));
+    }
+
+    #[tokio::test]
+    async fn test_save_and_shutdown_handle_missing_player() {
+        let cfg = ClientConfig::default();
+        let mut app = build_client_app(true, &cfg);
+        for _ in 0..4 {
+            app.update();
+        }
+        let world = app.world_mut();
+        let mut pq = QueryState::<Entity, With<PlayerController>>::new(world);
+        let entities: Vec<_> = pq.iter(world).collect();
+        for entity in entities {
+            world.despawn(entity);
+        }
+        app.update();
+    }
+
+    #[test]
+    fn test_load_config_clamps_values() {
+        use std::env;
+        use std::fs;
+        let tmp = env::temp_dir().join("strata_test_cfg");
+        let _ = fs::create_dir_all(&tmp);
+        let cfg_path = tmp.join("client.toml");
+        fs::write(&cfg_path, "radius = 9999\nwidth = 99999\nheight = 99999\n")
+            .expect("write config");
+        let orig = env::current_dir().expect("cwd");
+        env::set_current_dir(&tmp).expect("chdir");
+        let cfg = load_config();
+        env::set_current_dir(orig).expect("chdir back");
+        assert_eq!(cfg.radius, 16, "radius should be clamped to 16");
+        assert_eq!(cfg.width, 7680, "width should be clamped to 7680");
+        assert_eq!(cfg.height, 4320, "height should be clamped to 4320");
+    }
+
+    #[tokio::test]
+    async fn test_save_player_uses_real_inventory() {
+        let cfg = ClientConfig::default();
+        let mut app = build_client_app(true, &cfg);
+        for _ in 0..4 {
+            app.update();
+        }
+        {
+            let world = app.world_mut();
+            let mut pq =
+                QueryState::<(&mut Transform, &mut Inventory), With<PlayerController>>::new(world);
+            if let Ok((mut tf, mut inv)) = pq.single_mut(world) {
+                inv.hotbar[0] = ItemStack {
+                    block: BlockId(42),
+                    count: 99,
+                };
+                inv.active = 3;
+                tf.translation.x += 0.1;
+            }
+        }
+        app.update();
+        app.update();
+        let world = app.world();
+        let save_dir = world.resource::<SaveDirectory>();
+        let path = save_dir.0.join("player.dat");
+        if path.exists() {
+            let save_mgr = world.resource::<SaveManager>();
+            if let Ok(data) = save_mgr.load_player(&path) {
+                assert_eq!(data.hotbar_index, 3, "hotbar_index should be 3");
+                assert_eq!(data.inventory.len(), 9, "inventory should have 9 slots");
+                assert_eq!(
+                    data.inventory[0],
+                    Some(strata_save::player_save_data::ItemStack {
+                        block_id: 42,
+                        count: 99,
+                    }),
+                    "first inventory slot should have block_id=42, count=99"
+                );
+            }
+        }
     }
 }

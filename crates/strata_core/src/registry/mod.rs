@@ -47,6 +47,8 @@ pub struct BlockRegistry {
     pub transparent: Vec<bool>,
     pub light_emission: Vec<u8>,
     pub base_color: Vec<[u8; 3]>,
+    pub textures: Vec<[String; 6]>,
+    pub use_quad_uv: Vec<bool>,
 }
 
 impl BlockRegistry {
@@ -112,6 +114,20 @@ impl BlockRegistry {
         self.debug_check(id);
         self.base_color[id.0 as usize]
     }
+
+    /// Textures for each face (6 faces: +X, -X, +Y, -Y, +Z, -Z).
+    #[inline]
+    pub fn textures(&self, id: BlockId) -> &[String; 6] {
+        self.debug_check(id);
+        &self.textures[id.0 as usize]
+    }
+
+    /// Should this block use quad-space UV mapping instead of world-space?
+    #[inline]
+    pub fn use_quad_uv(&self, id: BlockId) -> bool {
+        self.debug_check(id);
+        self.use_quad_uv[id.0 as usize]
+    }
 }
 
 // ── TOML data-driven loading ───────────────────────────────────────────────
@@ -130,6 +146,8 @@ struct BlockDefToml {
     transparent: bool,
     light_emission: u8,
     base_color: [u8; 3],
+    textures: Vec<String>,
+    use_quad_uv: Option<bool>,
 }
 
 fn flags_from_strs(flags: &[String]) -> BlockFlags {
@@ -168,6 +186,38 @@ pub fn load_block_registry() -> BlockRegistry {
         reg.transparent.push(d.transparent);
         reg.light_emission.push(d.light_emission);
         reg.base_color.push(d.base_color);
+
+        let parsed_textures = match d.textures.len() {
+            0 => [
+                "air".to_string(),
+                "air".to_string(),
+                "air".to_string(),
+                "air".to_string(),
+                "air".to_string(),
+                "air".to_string(),
+            ],
+            1 => [
+                d.textures[0].clone(),
+                d.textures[0].clone(),
+                d.textures[0].clone(),
+                d.textures[0].clone(),
+                d.textures[0].clone(),
+                d.textures[0].clone(),
+            ],
+            6 => [
+                d.textures[0].clone(),
+                d.textures[1].clone(),
+                d.textures[2].clone(),
+                d.textures[3].clone(),
+                d.textures[4].clone(),
+                d.textures[5].clone(),
+            ],
+            other => {
+                panic!("Block '{}' must have 1 or 6 textures, got {}", name, other);
+            }
+        };
+        reg.textures.push(parsed_textures);
+        reg.use_quad_uv.push(d.use_quad_uv.unwrap_or(false));
     }
     // Invariant: SoA arrays are indexed by BlockId.0, so ids must be contiguous
     // and ordered (id N stored at slot N). A gap or reorder in the TOML would
@@ -360,6 +410,28 @@ mod tests {
             assert_eq!(reg.transparent[i], d.transparent);
             assert_eq!(reg.light_emission[i], d.light_emission);
             assert_eq!(reg.base_color[i], d.base_color);
+
+            let expected_textures = match d.textures.len() {
+                1 => [
+                    d.textures[0].clone(),
+                    d.textures[0].clone(),
+                    d.textures[0].clone(),
+                    d.textures[0].clone(),
+                    d.textures[0].clone(),
+                    d.textures[0].clone(),
+                ],
+                6 => [
+                    d.textures[0].clone(),
+                    d.textures[1].clone(),
+                    d.textures[2].clone(),
+                    d.textures[3].clone(),
+                    d.textures[4].clone(),
+                    d.textures[5].clone(),
+                ],
+                _ => unreachable!(),
+            };
+            assert_eq!(reg.textures[i], expected_textures);
+            assert_eq!(reg.use_quad_uv[i], d.use_quad_uv.unwrap_or(false));
         }
     }
 

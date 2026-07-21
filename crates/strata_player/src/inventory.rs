@@ -34,33 +34,47 @@ impl Default for Inventory {
 }
 
 impl Inventory {
-    /// The currently-selected stack.
+    /// The currently-selected stack. Safely returns an empty stack if `active` is out of bounds.
     #[inline]
     pub fn active_slot(&self) -> ItemStack {
-        self.hotbar[self.active]
+        self.hotbar.get(self.active).copied().unwrap_or(ItemStack {
+            block: BlockId::AIR,
+            count: 0,
+        })
     }
 
     /// The `BlockId` selected for placement.
     #[inline]
     pub fn active_block(&self) -> BlockId {
-        self.hotbar[self.active].block
+        self.active_slot().block
+    }
+
+    /// Try to consume 1 item from the active slot. Returns `true` if an item was available and consumed.
+    pub fn consume_active(&mut self) -> bool {
+        if let Some(stack) = self.hotbar.get_mut(self.active) {
+            if stack.count > 0 {
+                stack.count -= 1;
+                return true;
+            }
+        }
+        false
     }
 
     /// Select a specific slot (ignored if out of range).
     pub fn select(&mut self, slot: usize) {
-        if slot < 9 {
+        if slot < self.hotbar.len() {
             self.active = slot;
         }
     }
 
     /// Cycle to the next slot (scroll down).
     pub fn scroll_next(&mut self) {
-        self.active = (self.active + 1) % 9;
+        self.active = (self.active + 1) % self.hotbar.len();
     }
 
     /// Cycle to the previous slot (scroll up).
     pub fn scroll_prev(&mut self) {
-        self.active = (self.active + 8) % 9;
+        self.active = (self.active + self.hotbar.len() - 1) % self.hotbar.len();
     }
 }
 
@@ -110,5 +124,24 @@ mod tests {
         assert_eq!(inv.active, 4);
         inv.select(99); // out of range -> ignored
         assert_eq!(inv.active, 4);
+    }
+
+    #[test]
+    fn active_slot_out_of_bounds_returns_empty_stack() {
+        let mut inv = Inventory::default();
+        inv.active = 99; // manually set out of bounds
+        let slot = inv.active_slot();
+        assert_eq!(slot.count, 0);
+        assert_eq!(slot.block, BlockId::AIR);
+        assert_eq!(inv.active_block(), BlockId::AIR);
+        assert!(!inv.consume_active());
+    }
+
+    #[test]
+    fn consume_active_reduces_count() {
+        let mut inv = Inventory::default();
+        assert_eq!(inv.active_slot().count, 64);
+        assert!(inv.consume_active());
+        assert_eq!(inv.active_slot().count, 63);
     }
 }

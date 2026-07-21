@@ -19,6 +19,7 @@ strata_physics = { path = "../strata_physics" }
 # second wgpu build. bytemuck kept in lockstep with the workspace's 1.x line.
 wgpu = "27"
 bytemuck = { version = "1", features = ["derive"] }
+image = "0.25"
 
 # Tiny executor used only by the #[cfg(test)] GPU test to drive async
 # request_adapter / request_device on the test thread.

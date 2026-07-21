@@ -278,19 +278,20 @@ pub fn player_controller_system(
     input: Res<PlayerInput>,
     pool: Res<GlobalBrickPool>,
     registry: Res<BlockRegistry>,
-    sectors: Query<(&SectorCoord, &XBrickMap, &SectorPalette)>,
+    sectors: Query<(Entity, &SectorCoord, &XBrickMap, &SectorPalette)>,
     mut player: Query<(
         &mut Transform,
         &PlayerController,
         &mut PlayerState,
         &PlayerLook,
     )>,
+    mut sector_index: Local<std::collections::HashMap<SectorCoord, Entity>>,
 ) {
-    // Index the loaded sectors so the collision probe can look up any world-space
-    // voxel, including across sector boundaries (the player straddles up to two
-    // sectors per axis). Unloaded sectors report empty => never block.
-    let sector_index: std::collections::HashMap<SectorCoord, (&XBrickMap, &SectorPalette)> =
-        sectors.iter().map(|(c, m, p)| (*c, (m, p))).collect();
+    // Re-use the Local HashMap buffer across ticks to eliminate per-tick heap allocations.
+    sector_index.clear();
+    for (entity, coord, _, _) in sectors.iter() {
+        sector_index.insert(*coord, entity);
+    }
 
     // Collision is against *solid* blocks only — liquids (water) and other
     // non-solid voxels must not stop the player, otherwise it stands on the sea
@@ -301,16 +302,16 @@ pub fn player_controller_system(
             wy.div_euclid(32) as i32,
             wz.div_euclid(32) as i32,
         );
-        match sector_index.get(&sc) {
-            Some((m, palette)) => {
+        if let Some(&entity) = sector_index.get(&sc) {
+            if let Ok((_, _, m, palette)) = sectors.get(entity) {
                 let lx = wx.rem_euclid(32) as u32;
                 let ly = wy.rem_euclid(32) as u32;
                 let lz = wz.rem_euclid(32) as u32;
                 let id = m.get_block(&pool, palette, VoxelCoord::new(lx, ly, lz));
-                id != BlockId::AIR && registry.is_solid(id)
+                return id != BlockId::AIR && registry.is_solid(id);
             }
-            None => false,
         }
+        false
     };
 
     for (mut tf, ctrl, mut st, look) in &mut player {
