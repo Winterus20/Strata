@@ -1,15 +1,14 @@
 //! Per-sector lightmap SSBO (M10a.4).
 //!
-//! Holds the packed 8-bit light value per voxel for the *currently-bound*
-//! sector (32^3 = 32768 bytes = 32 KB). The pre-pass packs `quad_id` (the
-//! sector-local quad index 0..N-1) into the visbuf, and the resolve shader
-//! looks up the light the mesher pre-baked into the quad's `PackedQuad.light`
-//! via this SSBO.
+//! Holds packed 8-bit light values keyed by **global SSBO slot index** (same
+//! bump-allocator `base` as the quad buffer). The buffer grows with
+//! [`crate::pipeline::Renderer::ensure_quad_capacity`]; its initial size is
+//! `SECTOR_LIGHTMAP_QUADS` (32 KB) until the first grow. The resolve shader
+//! looks up `lightmap[quad_id & lightmap_mask]`.
 //!
-//! For M10a the mesher writes the per-quad light directly into
-//! `PackedQuad.light` (one byte, `sky<<4 | block`), so the SSBO is the
-//! parallel array of those bytes keyed by quad id. The plan-level 32^3 light
-//! texture is reserved for M10a+ when a true voxel-light probe is added.
+//! For M10a the mesher also writes per-quad light into `PackedQuad.light`
+//! (one byte, `sky<<4 | block`); this SSBO is the parallel array sampled at
+//! resolve time.
 
 use bytemuck::{Pod, Zeroable};
 use wgpu::{Buffer, BufferDescriptor, BufferUsages, Device, Queue};

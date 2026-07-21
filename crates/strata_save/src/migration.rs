@@ -8,7 +8,10 @@ use crate::world_metadata::WorldMetadata;
 use strata_storage::error::{StorageError, StorageResult};
 
 /// The current on-disk save format version.
-pub const CURRENT_SAVE_VERSION: u32 = 1;
+///
+/// Bumped to 2 with the header‖payload BLAKE3 domain (`SaveEnvelope`).
+/// v1 (payload-only hash) still verifies on open; migration re-packs to v2.
+pub const CURRENT_SAVE_VERSION: u32 = 2;
 
 /// A single forward migration step (plan 15 §38 §2).
 pub struct MigrationChain {
@@ -20,9 +23,16 @@ pub struct MigrationChain {
     pub transform: Box<dyn Fn(WorldMetadata) -> WorldMetadata>,
 }
 
-/// Build the ordered migration chain. For v1 the chain is empty (identity).
+/// Build the ordered migration chain.
+///
+/// v1 → v2: identity on `WorldMetadata`; re-`pack` switches hash domain to
+/// header‖payload (see `SaveEnvelope`).
 pub fn chain() -> Vec<MigrationChain> {
-    Vec::new()
+    vec![MigrationChain {
+        from: 1,
+        to: 2,
+        transform: Box::new(|m| m),
+    }]
 }
 
 /// Run the from→to chain on `envelope` until `save_version == CURRENT_SAVE_VERSION`.

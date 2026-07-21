@@ -72,9 +72,9 @@ fn round_trip_pack_unpack_equal_per_voxel() {
     let mut palette = SectorPalette::new();
     let map = generate_sector(SectorCoord(3, 0, -2), &reg, &mut pool, &mut palette);
 
-    let data = map.pack(&pool, &palette);
+    let data = map.pack(&pool, &palette).expect("pack");
     let mut pool2 = GlobalBrickPool::new();
-    let (map2, palette2) = data.unpack(&mut pool2);
+    let (map2, palette2) = data.unpack(&mut pool2).expect("unpack");
 
     for lx in 0..32u32 {
         for ly in 0..32u32 {
@@ -241,7 +241,7 @@ fn test_underwater_cave_air_cells_are_air() {
                         wz as f32 * 0.08,
                         WORLD_SEED ^ 0x5C5C_5C5C_5C5C_5C5C,
                     );
-                    if cave > 0.62 {
+                    if cave > 0.72 {
                         let block = map.get_block(&pool, &palette, VoxelCoord::new(lx, ly, lz));
                         cave_air_count += 1;
                         assert_eq!(

@@ -76,6 +76,12 @@ pub struct PlayerStepResult {
 const COLLIDE_SKIN: f32 = 1.0e-3;
 /// How far below the feet the ground probe looks when deciding `grounded`.
 const GROUND_PROBE: f32 = 0.05;
+/// Plan 14 §Player Controller: clamp fall speed (world units / s).
+const TERMINAL_VELOCITY: f32 = 50.0;
+/// Sub-step when `|delta|` exceeds half a voxel (plan 14 collide-and-slide).
+const MAX_AXIS_STEP: f32 = 0.5;
+/// Cap sub-steps so pathological deltas still terminate (plan 14 max-substeps).
+const MAX_AXIS_SUBSTEPS: usize = 32;
 
 /// The player's axis-aligned bounding box for a given capsule *center*.
 #[inline]
@@ -114,8 +120,42 @@ fn aabb_hits_solid(is_solid: &impl Fn(i64, i64, i64) -> bool, center: Vec3) -> b
 /// collisions by snapping the AABB to the blocking face. Returns the new center
 /// and whether a collision stopped the motion on that axis.
 ///
+/// When `|delta| > MAX_AXIS_STEP`, the move is split into sub-steps so a large
+/// `vy*dt` cannot tunnel through a thin floor (plan 14).
+///
 /// `axis`: 0 = X, 1 = Y, 2 = Z.
 fn move_axis(
+    is_solid: &impl Fn(i64, i64, i64) -> bool,
+    center: Vec3,
+    axis: usize,
+    delta: f32,
+) -> (Vec3, bool) {
+    if delta == 0.0 {
+        return (center, false);
+    }
+
+    let abs = delta.abs();
+    if abs <= MAX_AXIS_STEP {
+        return move_axis_once(is_solid, center, axis, delta);
+    }
+
+    let steps = ((abs / MAX_AXIS_STEP).ceil() as usize).clamp(1, MAX_AXIS_SUBSTEPS);
+    let step = delta / steps as f32;
+    let mut pos = center;
+    let mut hit = false;
+    for _ in 0..steps {
+        let (p, h) = move_axis_once(is_solid, pos, axis, step);
+        pos = p;
+        if h {
+            hit = true;
+            break;
+        }
+    }
+    (pos, hit)
+}
+
+/// Single discrete axis move (no sub-stepping).
+fn move_axis_once(
     is_solid: &impl Fn(i64, i64, i64) -> bool,
     center: Vec3,
     axis: usize,
@@ -165,6 +205,67 @@ fn move_axis(
         moved[axis] = snapped;
     }
     (moved, hit)
+}
+
+/// Cheap MTD-style push-out when the AABB already overlaps solids at rest
+/// (spawn-in-block / sector pop-in). Tries the shortest axis separation first.
+fn depenetrate_if_overlapping(
+    is_solid: &impl Fn(i64, i64, i64) -> bool,
+    center: Vec3,
+) -> (Vec3, bool) {
+    if !aabb_hits_solid(is_solid, center) {
+        return (center, false);
+    }
+
+    let (min, max) = player_aabb(center);
+    let (x0, x1) = voxel_span(min.x, max.x);
+    let (y0, y1) = voxel_span(min.y, max.y);
+    let (z0, z1) = voxel_span(min.z, max.z);
+
+    let mut best: Option<(f32, usize, f32)> = None; // (|pen|, axis, signed push)
+    for vx in x0..=x1 {
+        for vy in y0..=y1 {
+            for vz in z0..=z1 {
+                if !is_solid(vx, vy, vz) {
+                    continue;
+                }
+                let cell = [vx as f32, vy as f32, vz as f32];
+                // Penetration depth on each axis (how far to push center to clear).
+                let push_neg_x = (cell[0] + 1.0 + PLAYER_RADIUS + COLLIDE_SKIN) - center.x;
+                let push_pos_x = center.x - (cell[0] - PLAYER_RADIUS - COLLIDE_SKIN);
+                let push_neg_y = (cell[1] + 1.0 + PLAYER_HALF_HEIGHT + COLLIDE_SKIN) - center.y;
+                let push_pos_y = center.y - (cell[1] - PLAYER_HALF_HEIGHT - COLLIDE_SKIN);
+                let push_neg_z = (cell[2] + 1.0 + PLAYER_RADIUS + COLLIDE_SKIN) - center.z;
+                let push_pos_z = center.z - (cell[2] - PLAYER_RADIUS - COLLIDE_SKIN);
+
+                let candidates = [
+                    (push_neg_x.abs(), 0, push_neg_x),
+                    (push_pos_x.abs(), 0, -push_pos_x),
+                    (push_neg_y.abs(), 1, push_neg_y),
+                    (push_pos_y.abs(), 1, -push_pos_y),
+                    (push_neg_z.abs(), 2, push_neg_z),
+                    (push_pos_z.abs(), 2, -push_pos_z),
+                ];
+                for (pen, axis, signed) in candidates {
+                    if pen <= 0.0 {
+                        continue;
+                    }
+                    if best.is_none_or(|(b, _, _)| pen < b) {
+                        best = Some((pen, axis, signed));
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some((_, axis, signed)) = best {
+        let mut out = center;
+        out[axis] += signed;
+        // Prefer a resolved pose; if still overlapping, leave the push (caller
+        // may clear on a later frame / other axis).
+        return (out, true);
+    }
+    (center, true)
 }
 
 /// Is a solid voxel directly beneath the feet (within `GROUND_PROBE`)?
@@ -236,7 +337,7 @@ pub fn integrate_player(
     let grounded_now = grounded_below(&is_solid, position);
 
     // Vertical velocity: gravity, then jump (only from the ground).
-    let mut vy = state.vy - ctrl.gravity * dt;
+    let mut vy = (state.vy - ctrl.gravity * dt).max(-TERMINAL_VELOCITY);
     if grounded_now && vy < 0.0 {
         vy = 0.0;
     }
@@ -248,7 +349,8 @@ pub fn integrate_player(
 
     // Axis-separated sweep: resolve X, then Z, then Y independently so the player
     // slides along walls instead of sticking, and lands cleanly on floors.
-    let mut pos = position;
+    // Depenetrate first when already overlapping (spawn / sector pop-in).
+    let (mut pos, _) = depenetrate_if_overlapping(&is_solid, position);
     let (p, _) = move_axis(&is_solid, pos, 0, horiz.x);
     pos = p;
     let (p, _) = move_axis(&is_solid, pos, 2, horiz.z);
@@ -379,7 +481,8 @@ mod tests {
                     &mut palette,
                     VoxelCoord::new(x, 0, z),
                     BlockId(1),
-                );
+                )
+                .expect("test floor set_block");
             }
         }
         (map, pool, palette)
@@ -439,7 +542,8 @@ mod tests {
                     &mut palette,
                     VoxelCoord::new(x, 0, z),
                     BlockId(1),
-                );
+                )
+                .expect("test floor set_block");
             }
         }
         let ctrl = PlayerController::default();
@@ -562,7 +666,8 @@ mod tests {
                     &mut palette,
                     VoxelCoord::new(x, 0, z),
                     BlockId(1),
-                );
+                )
+                .expect("test floor set_block");
             }
         }
         for y in 1..4u32 {
@@ -572,7 +677,8 @@ mod tests {
                     &mut palette,
                     VoxelCoord::new(8, y, z),
                     BlockId(1),
-                );
+                )
+                .expect("test wall set_block");
             }
         }
         let is_solid = world_solid(&map, &pool);
@@ -605,6 +711,96 @@ mod tests {
             pos.x + PLAYER_RADIUS <= 8.0 + 1.0e-2,
             "player must be stopped by the wall, got x={}",
             pos.x
+        );
+    }
+
+    #[test]
+    fn terminal_velocity_is_clamped() {
+        let pool = GlobalBrickPool::new();
+        let map = XBrickMap::new(SectorCoord(0, 0, 0));
+        let ctrl = PlayerController::default();
+        let state = PlayerState {
+            grounded: false,
+            flying: false,
+            vy: -200.0,
+        };
+        let r = integrate_player(
+            &ctrl,
+            &state,
+            &PlayerInput::default(),
+            &PlayerLook::default(),
+            world_solid(&map, &pool),
+            Vec3::new(5.0, 40.0, 5.0),
+            1.0 / 60.0,
+        );
+        assert!(
+            r.vy >= -50.0 - 1.0e-3,
+            "vy must be clamped to terminal velocity (−50), got {}",
+            r.vy
+        );
+    }
+
+    #[test]
+    fn large_fall_delta_does_not_tunnel_through_floor() {
+        // One-frame |vy*dt| ≫ 0.5 voxel: without sub-stepping the AABB leaps past
+        // the floor cell and never overlaps it (classic discrete tunneling).
+        let (map, pool, _) = floor_sector();
+        let ctrl = PlayerController::default();
+        let state = PlayerState {
+            grounded: false,
+            flying: false,
+            vy: -80.0,
+        };
+        // Feet just above the floor top (y=1); center at ~2.2.
+        let start = sector_world_origin(SectorCoord(0, 0, 0)) + Vec3::new(5.0, 2.2, 5.0);
+        let dt = 0.25; // |vy*dt| = 20 ≫ MAX_AXIS_STEP
+        let r = integrate_player(
+            &ctrl,
+            &state,
+            &PlayerInput::default(),
+            &PlayerLook::default(),
+            world_solid(&map, &pool),
+            start,
+            dt,
+        );
+        let feet = r.new_position.y - PLAYER_HALF_HEIGHT;
+        assert!(
+            feet >= 1.0 - 0.05,
+            "must not tunnel below floor top (y=1), got feet={feet} (pos.y={})",
+            r.new_position.y
+        );
+        assert!(
+            r.grounded || r.vy.abs() < 1.0e-3,
+            "fall should land/stop on the floor"
+        );
+    }
+
+    #[test]
+    fn depenetrates_when_spawned_inside_block() {
+        let (map, pool, _) = floor_sector();
+        // Center inside the floor voxel at y=0 → AABB overlaps solid.
+        let buried = sector_world_origin(SectorCoord(0, 0, 0)) + Vec3::new(5.0, 0.5, 5.0);
+        assert!(
+            world_solid(&map, &pool)(
+                buried.x.floor() as i64,
+                buried.y.floor() as i64,
+                buried.z.floor() as i64
+            ),
+            "precondition: spawn inside solid floor"
+        );
+        let r = integrate_player(
+            &PlayerController::default(),
+            &PlayerState::default(),
+            &PlayerInput::default(),
+            &PlayerLook::default(),
+            world_solid(&map, &pool),
+            buried,
+            1.0 / 60.0,
+        );
+        let feet = r.new_position.y - PLAYER_HALF_HEIGHT;
+        assert!(
+            feet >= 1.0 - 0.05,
+            "depenetration must push above the floor, got feet={feet}"
         );
     }
 }

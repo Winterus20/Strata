@@ -16,6 +16,7 @@ fn build_app() -> (App, Entity, Entity) {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
     app.insert_resource(GlobalBrickPool::new());
+    app.insert_resource(load_block_registry());
     app.insert_resource(PlayerInput::default());
     app.add_message::<PlayerBreak>();
     app.add_message::<PlayerPlace>();
@@ -33,8 +34,9 @@ fn build_app() -> (App, Entity, Entity) {
         &mut palette,
         VoxelCoord::new(5, 7, 3),
         BlockId(1),
-    );
-    let snapshot = SectorSnapshot(std::sync::Arc::new(map.pack(&pool, &palette)));
+    )
+    .expect("test set_block");
+    let snapshot = SectorSnapshot(std::sync::Arc::new(map.pack(&pool, &palette).expect("pack")));
     let sector = app
         .world_mut()
         .spawn((SectorCoord(0, 0, 0), map, palette, snapshot))
@@ -85,7 +87,9 @@ fn break_message_clears_voxel_and_marks_sector() {
     // original PCG data and the break is lost on reload.
     let snap = entity.get::<SectorSnapshot>().unwrap();
     let mut unpack_pool = GlobalBrickPool::new();
-    let (pool2, pal2) = snap.0.unpack(&mut unpack_pool);
+    let Ok((pool2, pal2)) = snap.0.unpack(&mut unpack_pool) else {
+        panic!("snapshot unpack failed");
+    };
     assert_eq!(
         pool2.get_block(&unpack_pool, &pal2, VoxelCoord::new(5, 7, 3)),
         BlockId::AIR,
@@ -126,6 +130,7 @@ fn break_message_at_boundary_marks_neighbor_sector() {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
     app.insert_resource(GlobalBrickPool::new());
+    app.insert_resource(load_block_registry());
     app.insert_resource(PlayerInput::default());
     app.add_message::<PlayerBreak>();
     app.add_message::<PlayerPlace>();
@@ -143,8 +148,9 @@ fn break_message_at_boundary_marks_neighbor_sector() {
         &mut palette,
         VoxelCoord::new(31, 7, 3),
         BlockId(1),
-    );
-    let snapshot = SectorSnapshot(std::sync::Arc::new(map.pack(&pool, &palette)));
+    )
+    .expect("test boundary set_block");
+    let snapshot = SectorSnapshot(std::sync::Arc::new(map.pack(&pool, &palette).expect("pack")));
     let sector = app
         .world_mut()
         .spawn((SectorCoord(0, 0, 0), map, palette, snapshot))
@@ -154,7 +160,7 @@ fn break_message_at_boundary_marks_neighbor_sector() {
     let neighbor_map = XBrickMap::new(SectorCoord(1, 0, 0));
     let neighbor_palette = SectorPalette::new();
     let neighbor_snapshot = SectorSnapshot(std::sync::Arc::new(
-        neighbor_map.pack(&pool, &neighbor_palette),
+        neighbor_map.pack(&pool, &neighbor_palette).expect("pack"),
     ));
     let neighbor_sector = app
         .world_mut()
@@ -211,6 +217,7 @@ fn break_message_crosses_sector_boundary() {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
     app.insert_resource(GlobalBrickPool::new());
+    app.insert_resource(load_block_registry());
     app.insert_resource(PlayerInput::default());
     app.add_message::<PlayerBreak>();
     app.add_message::<PlayerPlace>();
@@ -222,7 +229,7 @@ fn break_message_crosses_sector_boundary() {
     let mut pool = GlobalBrickPool::new();
     let mut palette = SectorPalette::new();
     let map_a = XBrickMap::new(SectorCoord(0, 0, 0));
-    let snapshot_a = SectorSnapshot(std::sync::Arc::new(map_a.pack(&pool, &palette)));
+    let snapshot_a = SectorSnapshot(std::sync::Arc::new(map_a.pack(&pool, &palette).expect("pack")));
     let sector_a = app
         .world_mut()
         .spawn((SectorCoord(0, 0, 0), map_a, palette.clone(), snapshot_a))
@@ -235,8 +242,9 @@ fn break_message_crosses_sector_boundary() {
         &mut palette,
         VoxelCoord::new(0, 7, 3),
         BlockId(1),
-    );
-    let snapshot_b = SectorSnapshot(std::sync::Arc::new(map_b.pack(&pool, &palette)));
+    )
+    .expect("test sector_b set_block");
+    let snapshot_b = SectorSnapshot(std::sync::Arc::new(map_b.pack(&pool, &palette).expect("pack")));
     let sector_b = app
         .world_mut()
         .spawn((SectorCoord(1, 0, 0), map_b, palette, snapshot_b))
@@ -286,6 +294,7 @@ fn place_message_crosses_sector_boundary() {
     let mut app = App::new();
     app.add_plugins(MinimalPlugins);
     app.insert_resource(GlobalBrickPool::new());
+    app.insert_resource(load_block_registry());
     app.insert_resource(PlayerInput::default());
     app.add_message::<PlayerBreak>();
     app.add_message::<PlayerPlace>();
@@ -299,7 +308,7 @@ fn place_message_crosses_sector_boundary() {
 
     // Empty sector A at (0, 0, 0)
     let map_a = XBrickMap::new(SectorCoord(0, 0, 0));
-    let snapshot_a = SectorSnapshot(std::sync::Arc::new(map_a.pack(&pool, &palette)));
+    let snapshot_a = SectorSnapshot(std::sync::Arc::new(map_a.pack(&pool, &palette).expect("pack")));
     let sector_a = app
         .world_mut()
         .spawn((SectorCoord(0, 0, 0), map_a, palette.clone(), snapshot_a))
@@ -312,8 +321,9 @@ fn place_message_crosses_sector_boundary() {
         &mut palette,
         VoxelCoord::new(0, 7, 3),
         BlockId(1),
-    );
-    let snapshot_b = SectorSnapshot(std::sync::Arc::new(map_b.pack(&pool, &palette)));
+    )
+    .expect("test sector_b set_block");
+    let snapshot_b = SectorSnapshot(std::sync::Arc::new(map_b.pack(&pool, &palette).expect("pack")));
     let sector_b = app
         .world_mut()
         .spawn((SectorCoord(1, 0, 0), map_b, palette, snapshot_b))

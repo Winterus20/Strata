@@ -20,6 +20,10 @@ bevy = { workspace = true, default-features = false, features = [
     "bevy_window",
     "bevy_winit",
     "bevy_log",
+    # Required to print real system names in schedule ambiguity warnings
+    # (Bevy 0.18 DebugName). Remove once ambiguities are resolved if binary
+    # size matters; keep for local schedule debugging.
+    "debug",
     # Rapier's physics plugin conditionally adds AssetPlugin/MeshPlugin/ScenePlugin,
     # so those crates must be compiled (they do NOT pull in bevy_render).
     "bevy_asset",
@@ -43,6 +47,10 @@ strata_render = { path = "../../crates/strata_render" }
 strata_player = { path = "../../crates/strata_player" }
 strata_save = { path = "../../crates/strata_save" }
 strata_storage = { path = "../../crates/strata_storage" }
+
+# Sector snapshot encode + content hash on durable AppExit flush (same stack as strata_save).
+postcard = { version = "1.1", features = ["alloc"] }
+blake3 = { workspace = true }
 
 # GPU + helpers for M9b surface presentation (same wgpu 27 line as strata_render).
 wgpu = "27"

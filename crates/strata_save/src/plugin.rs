@@ -7,6 +7,18 @@
 //! (it needs a `MetadataStore`); the plugin reads it when present. Streaming
 //! integration is referenced, not edited here (that lives in `strata_world`,
 //! out of scope for this task).
+//!
+//! # F6 client shutdown flush
+//!
+//! Order (durable region write → metadata → clear dirty) is enforced inside
+//! `handle_sector_saves` because `TokioBackend::write_sector*` now awaits
+//! completion. For process exit, F6 should:
+//! 1. Stop emitting new `SectorSave` / auto-save ticks.
+//! 2. Drain remaining dirty via `DirtyQueue` + `SectorSave` (or direct writes).
+//! 3. Call [`strata_storage::backend::AsyncStorageBackend::sync`] then
+//!    [`strata_storage::backend::AsyncStorageBackend::flush`] on `SaveBackend`.
+//! 4. Rely on `process_saved_sectors` / `DirtyTracker::clear` only after those
+//!    durable steps (never clear dirty on consume alone).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,13 +136,17 @@ impl Plugin for SavePlugin {
             .insert_resource(SavedReceiver {
                 rx: std::sync::Mutex::new(rx),
             })
+            // Writers of `SectorSave` (streaming unload in Streaming, dirty
+            // track in Physics) must finish before the flush reader. Auto-save
+            // + handle + process are chained after Physics so Input break/place
+            // snapshot mutations are visible to the same-frame save path.
             .add_systems(
                 Update,
                 (
                     track_dirty_sectors.in_set(StrataSet::Physics),
-                    auto_save_tick,
-                    handle_sector_saves,
-                    process_saved_sectors,
+                    (auto_save_tick, handle_sector_saves, process_saved_sectors)
+                        .chain()
+                        .after(StrataSet::Physics),
                 ),
             );
     }

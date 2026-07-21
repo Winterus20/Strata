@@ -339,8 +339,13 @@ pub fn apply_sector_collider_tasks(
             break;
         };
 
-        // If the task was cleaned up (unloaded), discard it
-        if !pending.tasks.contains_key(&res.coord) {
+        // Stale / cleaned: require entity match so an old response for a recycled
+        // sector coord cannot consume the newer pending task (or attach the wrong
+        // collider). Leave pending in place so the matching response can apply.
+        let Some(pt) = pending.tasks.get(&res.coord) else {
+            continue;
+        };
+        if pt.entity != res.entity {
             continue;
         }
         let pt = pending.tasks.remove(&res.coord).unwrap();
@@ -537,4 +542,79 @@ pub fn ground_below(xbrick: &XBrickMap, pool: &GlobalBrickPool, pos: Vec3) -> bo
         return false;
     }
     xbrick.is_occupied(pool, VoxelCoord::new(lx as u32, ly as u32, lz as u32))
+}
+
+#[cfg(test)]
+mod entity_match_tests {
+    use super::*;
+    use bevy::ecs::system::SystemState;
+    use std::sync::mpsc;
+
+    #[test]
+    fn stale_collider_response_skips_entity_mismatch() {
+        let mut app = App::new();
+        app.init_resource::<PhysicsTimers>();
+        app.init_resource::<PendingCollider>();
+
+        let (tx_req, _rx_req) = mpsc::channel::<VoxelColliderRequest>();
+        let (tx_res, rx_res) = mpsc::channel::<VoxelColliderResponse>();
+        app.insert_resource(PhysicsWorkerChannels {
+            tx_request: tx_req,
+            rx_response: std::sync::Mutex::new(rx_res),
+        });
+
+        let coord = SectorCoord(0, 0, 0);
+        let live = app.world_mut().spawn(coord).id();
+        let stale = Entity::from_bits(0xDEAD_BEEF);
+
+        app.world_mut()
+            .resource_mut::<PendingCollider>()
+            .tasks
+            .insert(
+                coord,
+                PendingColliderTask {
+                    entity: live,
+                    origin: Vec3::ZERO,
+                },
+            );
+
+        // Old worker result for a previous entity at the same sector coord.
+        tx_res
+            .send(VoxelColliderResponse {
+                entity: stale,
+                coord,
+                origin: Vec3::ZERO,
+                collider: Collider::ball(0.1),
+                rapier_us: 1,
+            })
+            .unwrap();
+
+        {
+            let mut state: SystemState<(
+                Commands,
+                ResMut<PendingCollider>,
+                Res<PhysicsWorkerChannels>,
+                ResMut<PhysicsTimers>,
+                Query<Entity, With<SectorCoord>>,
+            )> = SystemState::new(app.world_mut());
+            let (commands, pending, channels, timers, entities) = state.get_mut(app.world_mut());
+            apply_sector_collider_tasks(commands, pending, channels, timers, entities);
+            state.apply(app.world_mut());
+        }
+
+        let pending = app.world().resource::<PendingCollider>();
+        assert!(
+            pending.tasks.contains_key(&coord),
+            "pending task for live entity must survive a stale response"
+        );
+        assert_eq!(
+            pending.tasks.get(&coord).unwrap().entity,
+            live,
+            "pending entity must remain the live sector"
+        );
+        assert!(
+            app.world().get::<SectorCollider>(live).is_none(),
+            "stale response must not insert SectorCollider on the live entity"
+        );
+    }
 }

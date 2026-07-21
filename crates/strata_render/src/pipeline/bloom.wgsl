@@ -58,6 +58,15 @@ fn fs_bright(in: VertexOutput) -> @location(0) vec4<f32> {
 @group(0) @binding(3) var blur_src: texture_2d<f32>;
 @group(0) @binding(4) var blur_sampler: sampler;
 
+// ---- downsample (mip i → mip i+1, bilinear) ----
+// Shares the blur_src/blur_sampler bindings (same layout). The linear sampler
+// does 2×2 bilinear averaging when the target is half the source resolution,
+// which is the standard half-res downsample for bloom pyramid construction.
+@fragment
+fn fs_downsample(in: VertexOutput) -> @location(0) vec4<f32> {
+  return textureSample(blur_src, blur_sampler, in.uv);
+}
+
 // 9-tap separable Gaussian, sigma ~ 2.0. Hand-unrolled for branchless codegen
 // and constant-folded by the WGSL compiler.
 const BLUR_OFFSETS: array<f32, 9> = array<f32, 9>(

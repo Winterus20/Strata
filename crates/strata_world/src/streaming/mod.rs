@@ -136,11 +136,12 @@ impl StreamingManager {
     }
 
     /// All sectors that must be resident for `player`: every coordinate within
-    /// Chebyshev `effective_radius`, plus a single predictive-prefetch sector
-    /// one step ahead in the last movement direction (plan 12 §5).
+    /// Chebyshev `effective_radius`, plus a predictive-prefetch sector one step
+    /// *beyond* the ball (`radius+1` along `move_dir`) so movement pre-buffers
+    /// the next shell (plan 12 §5).
     pub fn desired_resident_set(&self, player: SectorCoord) -> HashSet<SectorCoord> {
         let r = self.effective_radius();
-        let mut set = HashSet::with_capacity(((2 * r + 1) as usize).pow(3));
+        let mut set = HashSet::with_capacity(((2 * r + 1) as usize).pow(3) + 1);
         for dx in -r..=r {
             for dy in -r..=r {
                 for dz in -r..=r {
@@ -149,10 +150,11 @@ impl StreamingManager {
             }
         }
         if self.move_dir != SectorCoord(0, 0, 0) {
+            let ahead = r + 1;
             set.insert(SectorCoord(
-                player.0 + self.move_dir.0,
-                player.1 + self.move_dir.1,
-                player.2 + self.move_dir.2,
+                player.0 + self.move_dir.0 * ahead,
+                player.1 + self.move_dir.1 * ahead,
+                player.2 + self.move_dir.2 * ahead,
             ));
         }
         set
@@ -260,6 +262,8 @@ pub fn streaming_system(
     pool: Res<GlobalBrickPool>,
     dirty_queue: Option<Res<strata_save::plugin::DirtyQueue>>,
     mut messages: Option<ResMut<bevy_ecs::message::Messages<strata_save::plugin::SectorSave>>>,
+    mut pending_gen: Option<ResMut<crate::plugin::PendingWorldGen>>,
+    mut pending_load: Option<ResMut<crate::plugin::PendingSectorLoad>>,
 ) {
     timers.us = 0;
     timers.spawned = 0;
@@ -391,6 +395,14 @@ pub fn streaming_system(
                     map.free_locked(&mut inner_pool);
                 }
                 commands.entity(e).despawn();
+            }
+            // Drop in-flight gen/load tasks so workers do not write into a
+            // despawned (or soon-respawned) sector entity.
+            if let Some(ref mut pg) = pending_gen {
+                pg.tasks.remove(c);
+            }
+            if let Some(ref mut pl) = pending_load {
+                pl.tasks.remove(c);
             }
             manager.mark_unloaded(c);
             timers.unloaded += 1;

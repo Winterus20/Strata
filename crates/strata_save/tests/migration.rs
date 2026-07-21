@@ -5,7 +5,7 @@ use strata_save::migration::{CURRENT_SAVE_VERSION, migrate};
 use strata_save::world_metadata::WorldMetadata;
 
 #[test]
-fn migration_chain_no_op_for_v1() {
+fn migration_chain_no_op_at_current() {
     let meta = WorldMetadata {
         seed: 12345,
         spawn_point: [0.0, 64.0, 0.0],
@@ -23,7 +23,7 @@ fn migration_chain_no_op_for_v1() {
 
     let migrated = migrate(&env).unwrap();
     assert_eq!(migrated.save_version, CURRENT_SAVE_VERSION);
-    // v1 chain is empty → identity: payload is byte-identical.
+    // Already at current → identity: payload is byte-identical.
     assert_eq!(migrated.payload, env.payload);
     let loaded: WorldMetadata = migrated.decode().unwrap();
     assert_eq!(loaded, meta);

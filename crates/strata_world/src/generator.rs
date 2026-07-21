@@ -23,7 +23,7 @@ const SEA_LEVEL: i32 = 30;
 const HEIGHT_FREQ: f32 = 0.01;
 const TERRAIN_FREQ: f32 = 0.05;
 const CAVE_FREQ: f32 = 0.08;
-const CAVE_THRESHOLD: f32 = 0.62;
+const CAVE_THRESHOLD: f32 = 0.72;
 
 const HEIGHT_SALT: u64 = 0x3A3A_3A3A_3A3A_3A3A;
 const TERRAIN_SALT: u64 = 0x4B4B_4B4B_4B4B_4B4B;
@@ -227,7 +227,8 @@ fn place_trees(
                     palette,
                     VoxelCoord::new(lx as u32, y, lz as u32),
                     wb.log,
-                );
+                )
+                .expect("worldgen trunk set_block");
             }
 
             // Leaf blob centred on the trunk top.
@@ -251,7 +252,8 @@ fn place_trees(
                         if map.is_occupied(pool, c) {
                             continue; // never overwrite existing voxels
                         }
-                        map.set_block(pool, palette, c, wb.leaf);
+                        map.set_block(pool, palette, c, wb.leaf)
+                            .expect("worldgen leaf set_block");
                     }
                 }
             }
@@ -299,7 +301,8 @@ pub fn generate_sector(
                 let h = col_height[lx as usize][lz as usize];
                 let b = select_block_cached(wx, wy, wz, &wb, biome, h);
                 if b != BlockId::AIR {
-                    map.set_block(pool, palette, VoxelCoord::new(lx, ly, lz), b);
+                    map.set_block(pool, palette, VoxelCoord::new(lx, ly, lz), b)
+                        .expect("worldgen terrain set_block");
                 }
             }
         }
@@ -315,7 +318,10 @@ pub fn generate_compressed(coord: SectorCoord, reg: &BlockRegistry) -> Arc<Compr
     let mut pool = GlobalBrickPool::new();
     let mut palette = SectorPalette::new();
     let map = generate_sector(coord, reg, &mut pool, &mut palette);
-    Arc::new(map.pack(&pool, &palette))
+    Arc::new(
+        map.pack(&pool, &palette)
+            .expect("worldgen pack must succeed"),
+    )
 }
 
 /// Generate a sector, returning both the map and its palette (shares `pool`).

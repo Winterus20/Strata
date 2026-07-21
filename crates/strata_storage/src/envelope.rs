@@ -133,9 +133,10 @@ pub fn compress(payload: &[u8], tier: Tier) -> StorageResult<Vec<u8>> {
         .map_err(|e| StorageError::Compress(e.to_string()))
 }
 
-/// Decompress `bytes` produced by [`compress`].
+/// Decompress `bytes` produced by [`compress`], capped at
+/// [`crate::compress::MAX_DECOMPRESSED_SECTOR_BYTES`].
 pub fn decompress(bytes: &[u8]) -> StorageResult<Vec<u8>> {
-    zstd::stream::decode_all(bytes).map_err(|e| StorageError::Decompress(e.to_string()))
+    crate::compress::decompress(bytes)
 }
 
 /// BLAKE3 over a compressed payload — the dedup key (plan 15 §1.3).

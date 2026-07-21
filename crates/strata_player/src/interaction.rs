@@ -4,6 +4,9 @@
 //! drive them from `PlayerBreak`/`PlayerPlace` events (injectable in tests, no
 //! window required) and insert `ChunkDirty` + `NeedsRemesh` for downstream meshing
 //! and collider sync (Filter-First via the `With<PlayerController>` player query).
+//!
+//! Prototype note: client-local break/place only — full server-authoritative
+//! multiplayer interaction is out of scope for this module milestone.
 
 use bevy::prelude::*;
 use strata_core::component::SectorSnapshot;
@@ -37,6 +40,7 @@ pub struct PlayerBreak;
 pub struct PlayerPlace;
 
 /// Remove the hit voxel (set to AIR). Returns `true` if a solid voxel was removed.
+/// Returns `false` if the voxel was empty or `set_block` fails (palette full).
 pub fn apply_break(
     map: &mut XBrickMap,
     pool: &mut GlobalBrickPool,
@@ -44,14 +48,25 @@ pub fn apply_break(
     hit: &RayHit,
 ) -> bool {
     let was_occupied = map.is_occupied(pool, hit.voxel);
-    map.set_block(pool, palette, hit.voxel, BlockId::AIR);
-    let now_occupied = map.is_occupied(pool, hit.voxel);
-    was_occupied && !now_occupied
+    if !was_occupied {
+        return false;
+    }
+    match map.set_block(pool, palette, hit.voxel, BlockId::AIR) {
+        Ok(()) => true,
+        Err(PaletteFullError) => {
+            // AIR never inserts into the palette; treat as failed break.
+            warn!(
+                "apply_break: set_block AIR failed at {:?} (PaletteFullError)",
+                hit.voxel
+            );
+            false
+        }
+    }
 }
 
-/// Place `block` on the face of the hit voxel. Blocked (returns `false`) when the
-/// target is outside the sector (sky), already occupied, or would overlap the
-/// player's AABB.
+/// Place `block` on the face of the hit voxel (same-sector only — does not
+/// resolve cross-sector targets). Blocked (returns `false`) when the target is
+/// outside the sector (sky), already occupied, or would overlap the player's AABB.
 pub fn apply_place(
     map: &mut XBrickMap,
     pool: &mut GlobalBrickPool,
@@ -70,18 +85,7 @@ pub fn apply_place(
         return false;
     }
     let target = VoxelCoord::new(tvx as u32, tvy as u32, tvz as u32);
-    if map.is_occupied(pool, target) {
-        return false; // target already solid
-    }
-
-    let origin = sector_world_origin(hit.sector_coord);
-    let tw = origin + Vec3::new(tvx as f32, tvy as f32, tvz as f32);
-    if voxel_overlaps_player(tw, player_center) {
-        return false; // would intersect the player
-    }
-
-    map.set_block(pool, palette, target, block);
-    true
+    apply_place_in_sector(map, pool, palette, hit.sector_coord, target, block, player_center)
 }
 
 /// AABB overlap test between a target voxel (unit cube at `v`) and the player box.
@@ -99,9 +103,79 @@ fn voxel_overlaps_player(v: Vec3, center: Vec3) -> bool {
         && pmin.z < vmax.z
 }
 
-/// ECS system: on `PlayerBreak`, raycast from the player and remove the hit voxel,
-/// then mark the sector `ChunkDirty` + `NeedsRemesh`.
-#[allow(clippy::type_complexity)]
+/// Resolve the target sector and local voxel coordinate for a place operation,
+/// handling cross-sector wrapping when the target falls outside the hit sector.
+#[inline]
+fn resolve_place_target(
+    hit_coord: SectorCoord,
+    hit_voxel: VoxelCoord,
+    normal: FaceNormal,
+) -> (SectorCoord, VoxelCoord) {
+    let (dx, dy, dz) = normal.delta();
+    let mut target_sc = hit_coord;
+    let mut tx = hit_voxel.x as i32 + dx;
+    let mut ty = hit_voxel.y as i32 + dy;
+    let mut tz = hit_voxel.z as i32 + dz;
+
+    if tx < 0 {
+        target_sc.0 -= 1;
+        tx += 32;
+    } else if tx >= 32 {
+        target_sc.0 += 1;
+        tx -= 32;
+    }
+    if ty < 0 {
+        target_sc.1 -= 1;
+        ty += 32;
+    } else if ty >= 32 {
+        target_sc.1 += 1;
+        ty -= 32;
+    }
+    if tz < 0 {
+        target_sc.2 -= 1;
+        tz += 32;
+    } else if tz >= 32 {
+        target_sc.2 += 1;
+        tz -= 32;
+    }
+
+    let target_v = VoxelCoord::new(tx as u32, ty as u32, tz as u32);
+    (target_sc, target_v)
+}
+
+/// Core place logic: occupancy check, player overlap, set block.
+/// Does NOT handle cross-sector resolution — the caller must resolve the target
+/// sector and local voxel coordinates before calling.
+#[inline]
+fn apply_place_in_sector(
+    map: &mut XBrickMap,
+    pool: &mut GlobalBrickPool,
+    palette: &mut SectorPalette,
+    sector_coord: SectorCoord,
+    target: VoxelCoord,
+    block: BlockId,
+    player_center: Vec3,
+) -> bool {
+    if map.is_occupied(pool, target) {
+        return false;
+    }
+    let origin = sector_world_origin(sector_coord);
+    let tw = origin + Vec3::new(target.x as f32, target.y as f32, target.z as f32);
+    if voxel_overlaps_player(tw, player_center) {
+        return false;
+    }
+    match map.set_block(pool, palette, target, block) {
+        Ok(()) => true,
+        Err(PaletteFullError) => {
+            warn!(
+                "apply_place: palette full at sector {:?} voxel {:?}; skipping place",
+                sector_coord, target
+            );
+            false
+        }
+    }
+}
+
 /// Helper to check if a sector coordinate is within the 8m interaction AABB around `eye`.
 #[inline]
 pub fn is_sector_in_reach(c: &SectorCoord, eye: Vec3, reach: f32) -> bool {
@@ -122,6 +196,7 @@ pub fn player_break_system(
     mut commands: Commands,
     mut break_ev: MessageReader<PlayerBreak>,
     mut pool: ResMut<GlobalBrickPool>,
+    registry: Res<BlockRegistry>,
     mut sectors: Query<(
         Entity,
         &SectorCoord,
@@ -145,11 +220,15 @@ pub fn player_break_system(
     let dir = look_direction(look);
 
     let mut best_hit: Option<(Entity, SectorCoord, VoxelCoord, FaceNormal, f32)> = None;
-    for (e, c, map, _, _) in sectors.iter() {
+    for (e, c, map, palette, _) in sectors.iter() {
         if !is_sector_in_reach(c, eye, REACH) {
             continue;
         }
-        if let Some((v, n, t)) = raycast_voxel(map, &pool, eye, dir, REACH) {
+        let is_solid = |v: VoxelCoord| {
+            let id = map.get_block(&pool, palette, v);
+            id != BlockId::AIR && registry.is_solid(id)
+        };
+        if let Some((v, n, t)) = raycast_voxel(map, &pool, eye, dir, REACH, is_solid) {
             if best_hit.is_none() || t < best_hit.unwrap().4 {
                 best_hit = Some((e, *c, v, n, t));
             }
@@ -165,7 +244,9 @@ pub fn player_break_system(
             };
             if apply_break(&mut map, &mut pool, &mut palette, &hit) {
                 if let Some(mut snap) = snap {
-                    *snap = SectorSnapshot(std::sync::Arc::new(map.pack(&pool, &palette)));
+                    if let Ok(packed) = map.pack(&pool, &palette) {
+                        *snap = SectorSnapshot(std::sync::Arc::new(packed));
+                    }
                 }
                 commands.entity(e).insert(ChunkDirty).insert(NeedsRemesh);
 
@@ -208,6 +289,7 @@ pub fn player_place_system(
     mut commands: Commands,
     mut place_ev: MessageReader<PlayerPlace>,
     mut pool: ResMut<GlobalBrickPool>,
+    registry: Res<BlockRegistry>,
     mut sectors: Query<(
         Entity,
         &SectorCoord,
@@ -237,11 +319,15 @@ pub fn player_place_system(
     let dir = look_direction(look);
 
     let mut best_hit: Option<(Entity, SectorCoord, VoxelCoord, FaceNormal, f32)> = None;
-    for (e, c, map, _, _) in sectors.iter() {
+    for (e, c, map, palette, _) in sectors.iter() {
         if !is_sector_in_reach(c, eye, REACH) {
             continue;
         }
-        if let Some((v, n, t)) = raycast_voxel(map, &pool, eye, dir, REACH) {
+        let is_solid = |v: VoxelCoord| {
+            let id = map.get_block(&pool, palette, v);
+            id != BlockId::AIR && registry.is_solid(id)
+        };
+        if let Some((v, n, t)) = raycast_voxel(map, &pool, eye, dir, REACH, is_solid) {
             if best_hit.is_none() || t < best_hit.unwrap().4 {
                 best_hit = Some((e, *c, v, n, t));
             }
@@ -249,33 +335,7 @@ pub fn player_place_system(
     }
 
     if let Some((_, hit_coord, v, n, _)) = best_hit {
-        let (dx, dy, dz) = n.delta();
-        let mut target_sc = hit_coord;
-        let mut tx = v.x as i32 + dx;
-        let mut ty = v.y as i32 + dy;
-        let mut tz = v.z as i32 + dz;
-
-        if tx < 0 {
-            target_sc.0 -= 1;
-            tx += 32;
-        } else if tx >= 32 {
-            target_sc.0 += 1;
-            tx -= 32;
-        }
-        if ty < 0 {
-            target_sc.1 -= 1;
-            ty += 32;
-        } else if ty >= 32 {
-            target_sc.1 += 1;
-            ty -= 32;
-        }
-        if tz < 0 {
-            target_sc.2 -= 1;
-            tz += 32;
-        } else if tz >= 32 {
-            target_sc.2 += 1;
-            tz -= 32;
-        }
+        let (target_sc, target_v) = resolve_place_target(hit_coord, v, n);
 
         let mut target_entity = None;
         for (e, c, _, _, _) in sectors.iter() {
@@ -287,43 +347,50 @@ pub fn player_place_system(
 
         if let Some(target_ent) = target_entity {
             if let Ok((e, c, mut map, mut palette, snap)) = sectors.get_mut(target_ent) {
-                let target_v = VoxelCoord::new(tx as u32, ty as u32, tz as u32);
-                if !map.is_occupied(&pool, target_v) {
-                    let origin = sector_world_origin(*c);
-                    let tw = origin + Vec3::new(tx as f32, ty as f32, tz as f32);
-                    if !voxel_overlaps_player(tw, tf.translation) {
-                        map.set_block(&mut pool, &mut palette, target_v, block);
-                        inv.consume_active();
-                        if let Some(mut snap) = snap {
-                            *snap = SectorSnapshot(std::sync::Arc::new(map.pack(&pool, &palette)));
+                if apply_place_in_sector(
+                    &mut map,
+                    &mut pool,
+                    &mut palette,
+                    *c,
+                    target_v,
+                    block,
+                    tf.translation,
+                ) {
+                    inv.consume_active();
+                    if let Some(mut snap) = snap {
+                        if let Ok(packed) = map.pack(&pool, &palette) {
+                            *snap = SectorSnapshot(std::sync::Arc::new(packed));
                         }
-                        commands.entity(e).insert(ChunkDirty).insert(NeedsRemesh);
+                    }
+                    commands.entity(e).insert(ChunkDirty).insert(NeedsRemesh);
 
-                        let mut modified_neighbors = Vec::new();
-                        if tx == 0 {
-                            modified_neighbors.push(SectorCoord(c.0 - 1, c.1, c.2));
-                        } else if tx == 31 {
-                            modified_neighbors.push(SectorCoord(c.0 + 1, c.1, c.2));
-                        }
-                        if ty == 0 {
-                            modified_neighbors.push(SectorCoord(c.0, c.1 - 1, c.2));
-                        } else if ty == 31 {
-                            modified_neighbors.push(SectorCoord(c.0, c.1 + 1, c.2));
-                        }
-                        if tz == 0 {
-                            modified_neighbors.push(SectorCoord(c.0, c.1, c.2 - 1));
-                        } else if tz == 31 {
-                            modified_neighbors.push(SectorCoord(c.0, c.1, c.2 + 1));
-                        }
+                    let mut modified_neighbors = Vec::new();
+                    let tx = target_v.x as i32;
+                    let ty = target_v.y as i32;
+                    let tz = target_v.z as i32;
+                    if tx == 0 {
+                        modified_neighbors.push(SectorCoord(c.0 - 1, c.1, c.2));
+                    } else if tx == 31 {
+                        modified_neighbors.push(SectorCoord(c.0 + 1, c.1, c.2));
+                    }
+                    if ty == 0 {
+                        modified_neighbors.push(SectorCoord(c.0, c.1 - 1, c.2));
+                    } else if ty == 31 {
+                        modified_neighbors.push(SectorCoord(c.0, c.1 + 1, c.2));
+                    }
+                    if tz == 0 {
+                        modified_neighbors.push(SectorCoord(c.0, c.1, c.2 - 1));
+                    } else if tz == 31 {
+                        modified_neighbors.push(SectorCoord(c.0, c.1, c.2 + 1));
+                    }
 
-                        if !modified_neighbors.is_empty() {
-                            for (e_neigh, c_neigh, _, _, _) in sectors.iter() {
-                                if modified_neighbors.contains(c_neigh) {
-                                    commands
-                                        .entity(e_neigh)
-                                        .insert(ChunkDirty)
-                                        .insert(NeedsRemesh);
-                                }
+                    if !modified_neighbors.is_empty() {
+                        for (e_neigh, c_neigh, _, _, _) in sectors.iter() {
+                            if modified_neighbors.contains(c_neigh) {
+                                commands
+                                    .entity(e_neigh)
+                                    .insert(ChunkDirty)
+                                    .insert(NeedsRemesh);
                             }
                         }
                     }
@@ -347,7 +414,8 @@ mod tests {
             &mut palette,
             VoxelCoord::new(5, 7, 3),
             BlockId(1),
-        );
+        )
+        .expect("test harness set_block");
         let hit = RayHit {
             voxel: VoxelCoord::new(5, 7, 3),
             normal: FaceNormal::PosX,
@@ -417,7 +485,8 @@ mod tests {
             &mut palette,
             VoxelCoord::new(0, 7, 3),
             BlockId(1),
-        );
+        )
+        .expect("test edge set_block");
         // Hit the -X face of the edge block -> neighbour is at x=-1 (sky).
         let hit = RayHit {
             voxel: VoxelCoord::new(0, 7, 3),
@@ -445,13 +514,15 @@ mod tests {
             &mut palette,
             VoxelCoord::new(5, 7, 3),
             BlockId(1),
-        );
+        )
+        .expect("test occupied set_block");
         map.set_block(
             &mut pool,
             &mut palette,
             VoxelCoord::new(6, 7, 3),
             BlockId(1),
-        );
+        )
+        .expect("test occupied neighbour set_block");
         let hit = RayHit {
             voxel: VoxelCoord::new(5, 7, 3),
             normal: FaceNormal::PosX,
@@ -482,6 +553,7 @@ mod tests {
         let mut app = App::new();
         app.add_plugins(MinimalPlugins);
         app.insert_resource(GlobalBrickPool::new());
+        app.insert_resource(load_block_registry());
         app.add_message::<PlayerPlace>();
         app.add_systems(Update, player_place_system);
 
@@ -493,8 +565,11 @@ mod tests {
             &mut palette,
             VoxelCoord::new(5, 7, 3),
             BlockId(1),
-        );
-        let snapshot = SectorSnapshot(std::sync::Arc::new(map.pack(&pool, &palette)));
+        )
+        .expect("test inventory set_block");
+        let snapshot = SectorSnapshot(std::sync::Arc::new(
+            map.pack(&pool, &palette).expect("pack test sector"),
+        ));
         let sector = app
             .world_mut()
             .spawn((SectorCoord(0, 0, 0), map, palette, snapshot))

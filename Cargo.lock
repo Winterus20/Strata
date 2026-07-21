@@ -4205,8 +4205,10 @@ version = "0.0.0"
 dependencies = [
  "bevy",
  "bevy_rapier3d",
+ "blake3",
  "bytemuck",
  "pollster",
+ "postcard",
  "raw-window-handle",
  "strata_core",
  "strata_physics",

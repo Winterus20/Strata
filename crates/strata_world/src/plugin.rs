@@ -25,6 +25,10 @@ const WORLDGEN_SPAWN_BUDGET: usize = 4;
 /// Max synchronous `unpack` calls per frame on the main thread. One unpack can
 /// still take several ms; keeping this at 1 avoids stacking with mesh snapshots.
 const WORLDGEN_APPLY_BUDGET: usize = 1;
+/// Max disk-load tasks spawned per frame (mirrors worldgen spawn budget).
+pub(crate) const LOAD_SPAWN_BUDGET: usize = 4;
+/// Max synchronous disk-load applies (`unpack`) per frame.
+const LOAD_APPLY_BUDGET: usize = 1;
 
 /// Marker: a sector's voxel data has been generated and applied.
 #[derive(Debug, Component)]
@@ -37,6 +41,23 @@ pub struct Generated;
 #[derive(Debug, Component)]
 #[component(storage = "SparseSet")]
 pub struct Generating;
+
+/// Marker: disk load failed closed (hash mismatch / deserialize / corrupt IO while
+/// metadata claimed the sector exists). Blocks PCG fall-through overwrite.
+/// [`StorageError::NotFound`] is *not* LoadFailed — that maps to Missing (regen).
+#[derive(Debug, Component)]
+#[component(storage = "SparseSet")]
+pub struct LoadFailed;
+
+/// Outcome of an async sector disk load.
+pub(crate) enum SectorLoadOutcome {
+    /// No metadata row, or metadata without region payload — safe to fall through to PCG.
+    Missing,
+    /// Payload verified and deserialized.
+    Loaded(Arc<CompressedChunkData>),
+    /// Metadata present but integrity/IO/deserialize failed — fail closed.
+    Failed,
+}
 
 /// In-flight async world generation tasks.
 #[derive(Resource, Default)]
@@ -98,15 +119,25 @@ fn lower_worker_thread_priority() {
 }
 
 /// In-flight async sector loading tasks.
+///
+/// Results are produced on the process tokio runtime (same runtime that owns
+/// the storage backend worker). An `Arc<Mutex<Option<_>>>` slot avoids polling
+/// tokio IO futures on Bevy's `TaskPool`, which otherwise stalls forever.
 #[derive(Resource, Default)]
 pub struct PendingSectorLoad {
-    pub tasks: HashMap<SectorCoord, Task<Option<Arc<CompressedChunkData>>>>,
+    pub(crate) tasks: HashMap<SectorCoord, Arc<std::sync::Mutex<Option<SectorLoadOutcome>>>>,
 }
 
 /// Marker component for sectors currently in the load pipeline.
 #[derive(Debug, Component)]
 #[component(storage = "SparseSet")]
 pub struct Loading;
+
+/// True when every palette `BlockId` falls inside the live registry.
+fn palette_block_ids_valid(palette: &SectorPalette, registry: &BlockRegistry) -> bool {
+    let n = registry.count();
+    palette.entries().iter().all(|id| (id.0 as usize) < n)
+}
 
 /// Strata world-generation plugin (M5).
 ///
@@ -150,7 +181,12 @@ fn spawn_world_gen_tasks(
     streaming: Option<Res<StreamingManager>>,
     q_new: Query<
         (Entity, &SectorCoord),
-        (Without<Generated>, Without<Generating>, Without<Loading>),
+        (
+            Without<Generated>,
+            Without<Generating>,
+            Without<Loading>,
+            Without<LoadFailed>,
+        ),
     >,
 ) {
     let mut budget = WORLDGEN_SPAWN_BUDGET;
@@ -231,7 +267,13 @@ fn apply_world_gen_tasks(
                 .or_else(|| unbound_entities.get(&coord).copied());
             if let Some(e) = target {
                 let t0 = std::time::Instant::now();
-                let (map, palette) = data.unpack(&mut pool);
+                let (map, palette) = match data.unpack(&mut pool) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        bevy::log::error!("worldgen unpack failed for {coord:?}: {err:?}");
+                        continue;
+                    }
+                };
                 timers.apply_us += t0.elapsed().as_micros() as u64;
                 commands
                     .entity(e)
@@ -259,7 +301,12 @@ fn spawn_sector_load_tasks(
     generator_pool: Res<GeneratorPool>,
     q_new: Query<
         (Entity, &SectorCoord),
-        (Without<Generated>, Without<Generating>, Without<Loading>),
+        (
+            Without<Generated>,
+            Without<Generating>,
+            Without<Loading>,
+            Without<LoadFailed>,
+        ),
     >,
 ) {
     let Some(mgr) = manager else {
@@ -269,52 +316,111 @@ fn spawn_sector_load_tasks(
         return;
     };
     let pool = &generator_pool.0;
+    let mut budget = LOAD_SPAWN_BUDGET;
+    let tokio_handle = tokio::runtime::Handle::try_current().ok();
 
     for (e, coord) in &q_new {
         if pending.tasks.contains_key(coord) {
             commands.entity(e).insert(Loading);
             continue;
         }
+        if budget == 0 {
+            break;
+        }
 
         let coord_val = *coord;
         let bk_val = bk.0.clone();
         let metadata_store = mgr.metadata.clone();
+        let slot: Arc<std::sync::Mutex<Option<SectorLoadOutcome>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot_writer = slot.clone();
 
-        let task = pool.spawn(async move {
-            match metadata_store.get(coord_val).await {
-                Ok(Some(_meta)) => match bk_val.read_sector(coord_val).await {
-                    Ok(payload) => match postcard::from_bytes::<CompressedChunkData>(&payload) {
-                        Ok(data) => Some(Arc::new(data)),
-                        Err(e) => {
+        let load_fut = async move {
+            let outcome = match metadata_store.get(coord_val).await {
+                Ok(Some(meta)) => match bk_val.read_sector(coord_val).await {
+                    Ok(payload) => {
+                        let actual: [u8; 32] = blake3::hash(&payload).into();
+                        if actual != meta.hash {
                             bevy::log::error!(
-                                "Failed to deserialize loaded sector {coord_val:?}: {e}"
+                                "Sector {coord_val:?} blake3 mismatch (disk corrupt); fail closed"
                             );
-                            None
+                            SectorLoadOutcome::Failed
+                        } else {
+                            match postcard::from_bytes::<CompressedChunkData>(&payload) {
+                                Ok(data) => SectorLoadOutcome::Loaded(Arc::new(data)),
+                                Err(err) => {
+                                    bevy::log::error!(
+                                        "Failed to deserialize loaded sector {coord_val:?}: {err}"
+                                    );
+                                    SectorLoadOutcome::Failed
+                                }
+                            }
                         }
-                    },
-                    Err(e) => {
-                        bevy::log::error!(
-                            "Failed to read loaded sector {coord_val:?} from disk: {e}"
+                    }
+                    Err(strata_storage::StorageError::NotFound(_)) => {
+                        // Metadata row without a region payload: treat as Missing so
+                        // PCG can regenerate (not fail-closed forever).
+                        bevy::log::warn!(
+                            "Sector {coord_val:?} has metadata but no region payload; regenerating"
                         );
-                        None
+                        SectorLoadOutcome::Missing
+                    }
+                    Err(err) => {
+                        // Corrupt / bad zstd / IO while metadata claimed the sector:
+                        // fail closed (F2/F4) — never PCG-overwrite valid hashed data.
+                        bevy::log::error!(
+                            "Failed to read loaded sector {coord_val:?} from disk: {err}"
+                        );
+                        SectorLoadOutcome::Failed
                     }
                 },
-                _ => None,
+                Ok(None) => SectorLoadOutcome::Missing,
+                Err(err) => {
+                    bevy::log::error!("Metadata lookup failed for {coord_val:?}: {err}");
+                    SectorLoadOutcome::Failed
+                }
+            };
+            if let Ok(mut guard) = slot_writer.lock() {
+                *guard = Some(outcome);
             }
-        });
+        };
 
-        pending.tasks.insert(coord_val, task);
+        if let Some(handle) = tokio_handle.as_ref() {
+            handle.spawn(load_fut);
+        } else {
+            // No process runtime (unusual): block on a private runtime inside
+            // the worldgen pool so the slot is filled when the job returns.
+            pool.spawn(async move {
+                match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => {
+                        rt.block_on(load_fut);
+                    }
+                    Err(_) => {}
+                }
+            })
+            .detach();
+        }
+
+        pending.tasks.insert(coord_val, slot);
         commands.entity(e).insert(Loading);
+        budget -= 1;
     }
 }
 
-/// Checks completed loading tasks and applies them. If the task returned None (not in save/failed),
-/// it removes the Loading marker so that PCG terrain generation can run.
+/// Checks completed loading tasks and applies them.
+///
+/// - [`SectorLoadOutcome::Loaded`]: unpack + mark `Generated`.
+/// - [`SectorLoadOutcome::Missing`]: drop `Loading` so PCG may run.
+/// - [`SectorLoadOutcome::Failed`]: insert [`LoadFailed`] — never PCG-overwrite.
 #[allow(clippy::type_complexity)]
 fn apply_sector_load_tasks(
     mut commands: Commands,
     mut pending: ResMut<PendingSectorLoad>,
     mut pool: ResMut<GlobalBrickPool>,
+    registry: Res<BlockRegistry>,
     q_loading: Query<(Entity, &SectorCoord), With<Loading>>,
     q_unbound: Query<(Entity, &SectorCoord), Without<Generated>>,
 ) {
@@ -332,29 +438,71 @@ fn apply_sector_load_tasks(
     }
 
     let coords: Vec<SectorCoord> = pending.tasks.keys().copied().collect();
+    let mut apply_budget = LOAD_APPLY_BUDGET;
     for coord in coords {
-        let mut task = pending.tasks.remove(&coord).unwrap();
-        if let Some(ready_result) = check_ready(&mut task) {
-            let target = loading_entities
-                .get(&coord)
-                .copied()
-                .or_else(|| unbound_entities.get(&coord).copied());
-            if let Some(e) = target {
-                commands.entity(e).remove::<Loading>();
-                if let Some(data) = ready_result {
-                    let (map, palette) = data.unpack(&mut pool);
-                    commands
-                        .entity(e)
-                        .insert(map)
-                        .insert(palette)
-                        .insert(SectorSnapshot(data))
-                        .insert(Generated);
-                } else {
-                    // Not in save file or failed to load. Fallback to PCG generation by removing Loading marker.
+        if apply_budget == 0 {
+            break;
+        }
+        let Some(slot) = pending.tasks.get(&coord).cloned() else {
+            continue;
+        };
+        let ready = slot.lock().ok().and_then(|mut g| g.take());
+        let Some(outcome) = ready else {
+            continue;
+        };
+        pending.tasks.remove(&coord);
+
+        let target = loading_entities
+            .get(&coord)
+            .copied()
+            .or_else(|| unbound_entities.get(&coord).copied());
+        let Some(e) = target else {
+            continue;
+        };
+        commands.entity(e).remove::<Loading>();
+        match outcome {
+            SectorLoadOutcome::Loaded(data) => {
+                if !data
+                    .palette
+                    .iter()
+                    .all(|id| (id.0 as usize) < registry.count())
+                {
+                    bevy::log::error!("Sector {coord:?} palette has unknown BlockIds; fail closed");
+                    commands.entity(e).insert(LoadFailed);
+                    apply_budget -= 1;
+                    continue;
                 }
+                let (map, palette) = match data.unpack(&mut pool) {
+                    Ok(v) => v,
+                    Err(err) => {
+                        bevy::log::error!("Sector {coord:?} unpack failed ({err:?}); fail closed");
+                        commands.entity(e).insert(LoadFailed);
+                        apply_budget -= 1;
+                        continue;
+                    }
+                };
+                if !palette_block_ids_valid(&palette, &registry) {
+                    bevy::log::error!("Sector {coord:?} unpacked palette invalid; fail closed");
+                    map.free(&mut pool);
+                    commands.entity(e).insert(LoadFailed);
+                    apply_budget -= 1;
+                    continue;
+                }
+                commands
+                    .entity(e)
+                    .insert(map)
+                    .insert(palette)
+                    .insert(SectorSnapshot(data))
+                    .insert(Generated);
+                apply_budget -= 1;
             }
-        } else {
-            pending.tasks.insert(coord, task);
+            SectorLoadOutcome::Missing => {
+                apply_budget -= 1;
+            }
+            SectorLoadOutcome::Failed => {
+                commands.entity(e).insert(LoadFailed);
+                apply_budget -= 1;
+            }
         }
     }
 }

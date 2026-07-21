@@ -57,15 +57,13 @@ pub mod debug_dump {
 /// (`ao_curve_q8`) so a single byte maps 0..3 to a multiplier in [0,1].
 ///
 /// The four values correspond to the four possible corner-AO values that the
-/// `PackedQuad::ao` byte can hold (`0..3` in 2-bit fields). The M10a.3 default
-/// matches the Exile / 0fps.net curve at the endpoints (0 → 0.18, 3 → 1.0)
-/// and a smooth ramp in between, so the lit color matches the SOTA reference
-/// for indoor scenes without per-artist tuning.
+/// `PackedQuad::ao` byte can hold (`0..3` in 2-bit fields). Plan 09 / Exile
+/// approximate stops: 0.75 / 0.825 / 0.9 / 1.0 → `[191, 210, 230, 255]`.
 ///
 /// The curve is uploaded as a tiny uniform slot of the resolve pipeline and
 /// applied after bi-linear AO interpolation, so a single uniform change
 /// re-themes the entire world for an artist without touching the mesher.
-pub const AO_CURVE_DEFAULT: [u8; 4] = [46, 64, 100, 255];
+pub const AO_CURVE_DEFAULT: [u8; 4] = [191, 210, 230, 255];
 
 /// Encode a `[0..=3]` AO corner byte for the resolve shader's 4-bit lookup
 /// table (`AO_CURVE_DEFAULT` is the default). The two `select`s rebuild the
@@ -370,10 +368,19 @@ fn get_world_space_uv(world_pos: vec3<f32>, normal: u32) -> vec2<f32> {
   return fract(uv);
 }
 
+// Full-texel inset: Linear min+mip kernels are wider than half a texel at
+// distant LODs, so 0.5/16 still bled across the fract wrap / dark stone edge
+// and read as a grainy black grid. Clamp first — expanded prepass geometry can
+// reconstruct UV slightly outside [0,1].
+fn inset_block_uv(uv: vec2<f32>) -> vec2<f32> {
+  let inset = 1.0 / 16.0;
+  return clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (1.0 - 2.0 * inset) + inset;
+}
+
 fn get_quad_space_uv(world_pos: vec3<f32>, quad_id: u32) -> vec2<f32> {
   // Out-of-range quad_id (e.g. a sky pixel where the resolve still
   // reaches this helper) returns a safe zero UV instead of indexing
-  // out of bounds. The pre-pass packs quad_id in 16 bits; we treat
+  // out of bounds. The pre-pass packs quad_id in 21 bits; we treat
   // any index past `arrayLength(quads)` as undefined and clamp to
   // the safe zero default.
   let qn = arrayLength(&quads);
@@ -382,14 +389,18 @@ fn get_quad_space_uv(world_pos: vec3<f32>, quad_id: u32) -> vec2<f32> {
   }
   let q = quads[quad_id].data;
   let geom = q[0];
-  let face = (geom >> 27u) & 0x7u;
-  let w = f32((geom >> 15u) & 0x3Fu);
-  let h = f32((geom >> 21u) & 0x3Fu);
+  let qx = f32(geom & 0x1Fu);
+  let qy = f32((geom >> 5u) & 0x1Fu);
+  let qz = f32((geom >> 10u) & 0x1Fu);
+  let w = max(f32((geom >> 15u) & 0x3Fu), 1.0);
+  let h = max(f32((geom >> 21u) & 0x3Fu), 1.0);
+   let face = (geom >> 27u) & 0x7u;
+   let safe_face = min(face, 5u);
 
-  let origin = origins[quad_id].xyz;
-  let local_pos = world_pos - origin;
+   let origin = origins[quad_id].xyz;
+   let local_pos = world_pos - origin - vec3<f32>(qx, qy, qz);
 
-  let axis = face / 2u;
+   let axis = safe_face / 2u;
   let uaxis = (axis + 1u) % 3u;
   let vaxis = (axis + 2u) % 3u;
 
@@ -398,71 +409,38 @@ fn get_quad_space_uv(world_pos: vec3<f32>, quad_id: u32) -> vec2<f32> {
   return vec2<f32>(u, v);
 }
 
-// Bi-linear AO: 4 corner values are stored in `ao_corners` (c0[0:2], c1[2:4],
-// c2[4:6], c3[6:8]) and the per-pixel (u, v) coords from `get_quad_space_uv`
-// pick a smooth value across the quad. The same 0fps.net `needs_flip` rule
-// picks the diagonal (CPU-side, see `PackedQuad::needs_flip` + the prepass
-// shader), so the two triangles interpolate consistently along the seam and
-// the dark-corner pair sits on the same triangle (no crease). This is the
-// Exile / Andre Blunt "Quadrilateral Interpolation" pattern.
+// Bi-linear AO over the 4 packed corners (c0..c3). FLIP is applied only in
+// the prepass triangle split (`FLIP_FLAG`); re-swapping corners here corrupts
+// the smooth field. Plain bilinear on c0,c1,c2,c3.
 fn sample_ao(ao_corners: u32, uv: vec2<f32>) -> f32 {
   let c0 = f32(ao_corners & 0x3u);
   let c1 = f32((ao_corners >> 2u) & 0x3u);
   let c2 = f32((ao_corners >> 4u) & 0x3u);
   let c3 = f32((ao_corners >> 6u) & 0x3u);
-  // Compute (u, v) in the local quad frame (the same coords used for texture
-  // sampling, so texture and AO always agree on which sub-pixel they cover).
   let wu = clamp(uv.x, 0.0, 1.0);
   let wv = clamp(uv.y, 0.0, 1.0);
-  // 0fps.net flip rule mirrored in WGSL: same `(a00 + a11) > (a01 + a10)`
-  // check decides the diagonal. CPU pre-decides the flip bit and the
-  // prepass shader uses `select` on it, so by the time we land here the GPU
-  // only sees the linear mix. We still need to know which diagonal the
-  // triangles were split along in order to interpolate correctly along it;
-  // the safer bi-linear form is the average of the two possible diagonals'
-  // interpolation, which is itself a smooth, branchless mix.
-  let flip = (c0 + c3) > (c1 + c2);
-  // Two candidate bi-linear samples (one per diagonal). Each is the standard
-  // 4-corner bilinear interpolation across the quad, just with a different
-  // assignment of corners to the (u, v) basis. `select` chooses the
-  // CPU-decided one — fully branchless.
-  let top_left_a = c0;
-  let top_right_a = c1;
-  let bottom_left_a = c2;
-  let bottom_right_a = c3;
-  let top_left_b = c0;
-  let top_right_b = c1;
-  let bottom_left_b = c3;
-  let bottom_right_b = c2;
-  let top_left = select(top_left_a, top_left_b, flip);
-  let top_right = select(top_right_a, top_right_b, flip);
-  let bottom_left = select(bottom_left_a, bottom_left_b, flip);
-  let bottom_right = select(bottom_right_a, bottom_right_b, flip);
-  // The CPU already decided the flip bit; the prepass shader used that bit to
-  // pick the diagonal triangles. We could replicate the bit exactly here, but
-  // it's simpler and just as smooth to re-derive the same flip from the four
-  // corner values, since the rule is fully deterministic and branchless. The
-  // two paths produce visually identical results for the standard 16-state
-  // corner table (see 0fps.net test fixtures).
-  let top = mix(top_left, top_right, wu);
-  let bottom = mix(bottom_left, bottom_right, wu);
+  let top = mix(c0, c1, wu);
+  let bottom = mix(c2, c3, wu);
   return mix(top, bottom, wv);
 }
 
-// AO curve LUT (4 bytes packed into a u32). The byte at the AO-corner index
-// (0..3) is divided by `1/255` to land in [0, 1]. Multiplied with the lit
-// color. Default curve is `AO_CURVE_DEFAULT = [46, 64, 100, 255]` from the
-// resolve module (46/255 ≈ 0.18, 64/255 ≈ 0.25, 100/255 ≈ 0.39, 1.0). The
-// 0.18 floor is the Exile "most occluded" baseline; the 0.39 / 1.0 stops
-// match the 0fps.net reference curve.
-fn ao_curve_lookup(ao_packed: u32, curve_packed: u32) -> f32 {
-  let i = (ao_packed & 0x3u);
-  // Index 0 → byte 0, index 1 → byte 1, etc. The 0fps curve uses 4 entries
-  // (one per AO corner level), and a lookup is cheaper than a `pow(2, x)`
-  // approximation. We read 1 byte at a time with a shift.
-  let shift = i * 8u;
-  let byte = (curve_packed >> shift) & 0xFFu;
-  return f32(byte) * (1.0 / 255.0);
+// AO curve LUT (4 bytes packed into a u32). Continuous smooth interpolation
+// between LUT values eliminates discrete step-banding and quantization seams.
+fn ao_curve_lookup(ao_smooth: f32, curve_packed: u32) -> f32 {
+  let lut = vec4<f32>(
+    f32(curve_packed & 0xFFu),
+    f32((curve_packed >> 8u) & 0xFFu),
+    f32((curve_packed >> 16u) & 0xFFu),
+    f32((curve_packed >> 24u) & 0xFFu)
+  ) * (1.0 / 255.0);
+
+  let t = clamp(ao_smooth, 0.0, 3.0);
+  let i = u32(floor(t));
+  let frac = fract(t);
+
+  let v0 = lut[i];
+  let v1 = lut[min(i + 1u, 3u)];
+  return mix(v0, v1, frac);
 }
 
 @fragment
@@ -484,19 +462,18 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   let sky_mix = smoothstep(0.0, 0.3, t);
   var sky = mix(params.horizon.rgb, params.zenith.rgb, sky_mix);
 
-  // Soft sun disc: pow(max(0, dot(view, sun)), sharpness). With sun_size=0.0046
+  // Soft sun disc: pow(max(0, dot(sky_dir, sun)), sharpness). With sun_size=0.0046
   // (~15 arcmin visual radius) the exponent is ~47000, giving a near-disc
   // bright spot surrounded by a short falloff glow.
-  // `view` here is the world-space direction the pixel looks at: reconstructed
-  // from the visbuf's reversed-Z depth + the screen position. For sky pixels
-  // (`entry == 0`) we don't have a real depth, so we treat them as if looking
-  // at the far plane and use the screen-y normalized direction. That is good
-  // enough for the sun-disc shape because the user expects "sun above the
-  // horizon at the configured `sun_dir`" — not a perspective-correct sun.
-  let view_dir = normalize(vec3<f32>((f32(px) - f32(width) * 0.5) / f32(height),
-                                      f32(height) * 0.5 - f32(py),
-                                      -f32(width)));
-  let sun_dot = max(dot(view_dir, sd), 0.0);
+  // Sky direction reconstructed from NDC at the far plane (z = 0.999) through
+  // the inverse view-projection, yielding a proper world-space direction that
+  // correctly dots with the world-space sun-direction vector `sd`.
+  let ndc_x = (f32(px) / f32(width)) * 2.0 - 1.0;
+  let ndc_y = (1.0 - (f32(py) / f32(height))) * 2.0 - 1.0;
+  let sky_ndc = vec4<f32>(ndc_x, ndc_y, 0.999, 1.0);
+  let sky_world = cam.inv_view_proj * sky_ndc;
+  let sky_dir = normalize(sky_world.xyz / sky_world.w - cam.eye.xyz);
+  let sun_dot = max(dot(sky_dir, sd), 0.0);
   let sun_sharp = 1.0 / max(params.sun_dir.w * params.sun_dir.w, 1.0e-8);
   let disc = pow(sun_dot, sun_sharp);
   // The horizon glow brightens the sky towards the sun: 1 + a soft function
@@ -508,30 +485,26 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   // Empty == cleared sentinel (0). select(false, true, cond).
   let is_empty = select(0.0, 1.0, entry == u64(0));
 
-  // Decode visbuf fields (13-bit depth, 16-bit quad_id).
-  //  - voxel_pos:  bit[0:16]   (16 bits)
-  //  - block_id:   bit[16:20]  (4 bits)
-  //  - sector_id:  bit[20:24]  (4 bits)
-  //  - ao_corners: bit[24:32]  (8 bits, 4 corners x 2 bits)
-  //  - quad_id:    bit[32:48]  (16 bits)
+  // Decode visbuf fields (v5: 13-bit depth, 21-bit quad_id).
+  //  - voxel_pos:  bit[0:15]   (15 bits)
+  //  - block_id:   bit[15:19]  (4 bits)
+  //  - ao_corners: bit[19:27]  (8 bits, 4 corners x 2 bits)
+  //  - quad_id:    bit[27:48]  (21 bits, global SSBO / lightmap slot)
   //  - normal:     bit[48:51]  (3 bits)
   //  - depth:      bit[51:64]  (13 bits, reversed-Z)
-  let block_id = u32((entry >> u32(16)) & u64(0xFu));
-  let sector_id = u32((entry >> u32(20)) & u64(0xFu));
-  let ao_corners = u32((entry >> u32(24)) & u64(0xFFu));
-  let quad_id = u32((entry >> u32(32)) & u64(0xFFFFu));
-  let n_idx = u32((entry >> u32(48)) & u64(0x7u));
+  let block_id = u32((entry >> u32(15)) & u64(0xFu));
+  let ao_corners = u32((entry >> u32(19)) & u64(0xFFu));
+  let quad_id = u32((entry >> u32(27)) & u64(0x1FFFFFu));
+  // Face normal is 3 bits (0..7) but only 6 faces exist — clamp before indexing
+  // the 6-element normals / textures / face_colors arrays.
+  let n_idx = min(u32((entry >> u32(48)) & u64(0x7u)), 5u);
   let stored_depth = u32((entry >> u32(51)) & u64(0x1FFFu));
   let depth_n = f32(stored_depth) / 8191.0; // 0..1, 0=far, 1=near
-  let depth_range = max(params.camera_far - params.camera_near, 1.0e-3);
-  let inv_d = select(1.0e6, 1.0 / max(depth_n, 1.0e-3), depth_n > 0.0);
-  let world_depth = params.camera_near * inv_d * depth_range * 0.02;
-  let fog_factor = 1.0 - exp(-params.fog_density * world_depth);
+  let linear_depth = params.camera_near / (1.0 - depth_n * (1.0 - params.camera_near / params.camera_far));
+  let fog_factor = 1.0 - exp(-params.fog_density * linear_depth);
 
   // Reconstruct exact world position using depth and camera inverse view projection
-  let ndc_x = (f32(px) / f32(width)) * 2.0 - 1.0;
-  let ndc_y = (1.0 - (f32(py) / f32(height))) * 2.0 - 1.0;
-  let ndc_z = depth_n;
+  let ndc_z = 1.0 - depth_n;
   let clip_pos = vec4<f32>(ndc_x, ndc_y, ndc_z, 1.0);
   let world_pos_w = cam.inv_view_proj * clip_pos;
   let world_pos = world_pos_w.xyz / world_pos_w.w;
@@ -546,9 +519,11 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   );
   let n = normals[n_idx];
 
-  // Constant sun + ambient Lambert term.
-  let sun = normalize(vec3<f32>(0.4, 0.85, 0.3));
-  let ambient = 0.28;
+  // Hemispheric ambient is independent of the lightmap so sky=0 never paints
+  // pure black. Lambert (sun) is gated by sky/block below — keeps caves darker
+  // than the old additive +0.15 wash without reintroducing dig-hole glow.
+  let sun = sd;
+  let ambient = 0.14;
   let lambert = max(dot(n, sun), 0.0);
 
   // Albedo: registry block color and texture layer, masked to a power-of-two slot count
@@ -569,6 +544,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   } else {
       uv = get_world_space_uv(world_pos, n_idx);
   }
+  uv = inset_block_uv(uv);
 
   let tex_layer = block_prop.textures[n_idx];
   let tex_color = textureSample(block_textures, block_sampler, uv, i32(tex_layer));
@@ -580,51 +556,20 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   let tint_scalar = 0.85 * up + 0.45 * down + 0.95 * side;
   let albedo = base_color * tex_color.rgb * tint_scalar;
 
-  // AO multiplier (M10a.3 bi-linear path, Exile / 0fps.net reference):
-  //   1) `sample_ao` reads the 4 corner AOs from the visbuf and does a
-  //      branchless bi-linear interpolation across the quad, using the same
-  //      `(u, v)` we use for the texture sample. The 0fps.net flip rule
-  //      is re-evaluated here for the smooth form; the actual diagonal split
-  //      happened in the pre-pass on the CPU's `flip_bit` (see packed_quad.rs).
-  //   2) `ao_curve_lookup` then maps the integer AO value to a [0, 1]
-  //      multiplier through the 4-byte `AO_CURVE_DEFAULT` LUT (or whatever
-  //      curve the renderer uploaded). The default curve sits at
-  //      0.18 / 0.25 / 0.39 / 1.0 — the Exile "fully occluded" floor is 0.18
-  //      and the "fully open" is 1.0, with a 0.39 mid-tone.
-  // Both calls are branchless; the whole AO path costs a handful of u32
-  // shifts + 1 vec2 mix. No divergent `if` on the pixel path.
-  //
-  // The smooth AO value is bi-linearly interpolated from the 4 corner values,
-  // but the *application* to the lit color goes through the AO curve LUT
-  // (4 entries) on the integer corner indices — the curve defines the
-  // brightness steps for the 4 corner levels. We use the smooth value to
-  // decide which of the 4 indices the pixel is in (round-to-nearest), so a
-  // smooth gradient through 1.5 picks the "1.5 → 1 or 2" level based on
-  // distance. The visual result is smooth, no banding.
-  //
-  // A simpler design would be: `ao_mult = mix(ao_curve[0], ao_curve[3], ao_smooth / 3.0)`,
-  // but the per-pixel multiplicative ratio then depends on the *absolute*
-  // corner value (e.g. ao=0.5 means "halfway between fully occluded and fully
-  // open"), which is the Minecraft curve the user complained looked wrong.
-  // The 4-step LUT with a smooth-to-integer index gives the Exile /
-  // 0fps.net reference shape: distinct bands for the 4 corner levels, but
-  // the bands blend smoothly as a quad's pixel crosses a corner.
-  let ao_smooth = sample_ao(ao_corners, uv);
-  // Round to the nearest of the 4 integer AO indices (0, 1, 2, 3) so the
-  // curve LUT is indexed by a real corner. `round(0.5)` rounds to 1 in WGSL,
-  // which keeps the bottom-band (ao_smooth in [0.0, 0.5)) on byte 0 of the
-  // curve and the top-band (ao_smooth in [2.5, 3.0]) on byte 3 — matching
-  // the 0fps.net reference implementation.
-  let ao_i = u32(clamp(round(ao_smooth), 0.0, 3.0));
-  let ao_mult = ao_curve_lookup(ao_i, ao_curve_packed);
+  // AO always uses quad-space UV (0..1 across the face). Texture may use
+  // world UV above; mixing fract(world) into sample_ao tears soft AO.
+  let ao_uv = get_quad_space_uv(world_pos, safe_quad_id);
+  let ao_smooth = sample_ao(ao_corners, ao_uv);
+  // Continuous smooth curve LUT interpolation removes discrete step-banding
+  // and quantization seams across quad faces. Soften AO with distance so
+  // dark corner samples don't alias into 1px black grid lines when a block
+  // is sub-pixel (near lighting unchanged).
+  let ao_raw = ao_curve_lookup(ao_smooth, ao_curve_packed);
+  let ao_dist_fade = clamp(linear_depth * (1.0 / 96.0), 0.0, 1.0);
+  let ao_mult = mix(ao_raw, 1.0, ao_dist_fade * 0.55);
 
   // Lightmap lookup (M10a.4): one byte per quad, packed as (sky<<4)|block.
-  // The byte is indexed by `quad_id & lightmap_mask`; a zero byte (no light
-  // baked yet) yields `light = 0` and the pixel goes fully dark.
-  // Guard against an out-of-range `quad_id` (e.g. sky pixels where the
-  // visbuf entry is still non-zero due to the pre-pass's `select` for the
-  // empty case) so `lightmap[lidx >> 2u]` doesn't index past the end of
-  // the array. Sky pixels report a 0 lbyte, which is fine.
+  // Indexed by global SSBO slot (`quad_id` == instance_index from prepass).
   let lightmap_mask = lightmap_meta.y;
   let safe_lidx = quad_id & lightmap_mask;
   var lbyte = 0u;
@@ -636,12 +581,12 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   }
   let sky_l = f32((lbyte >> 4u) & 0xFu) / 15.0;
   let block_l = f32(lbyte & 0xFu) / 15.0;
-  // Block light is the dominant indoor signal; sky light is a baseline that
-  // the constant ambient would otherwise supply. Blend them so outdoor and
-  // indoor surfaces are both well-lit.
-  let light = clamp(sky_l * 0.85 + block_l * 0.95 + 0.05, 0.0, 1.5);
+  // Prefer the stronger of sky/block. Tiny floor only softens near-zero
+  // samples; ambient above already prevents void-black slabs.
+  let light = clamp(max(sky_l, block_l), 0.0, 1.0);
+  let light_term = 0.05 + 0.95 * light;
 
-  let lit = albedo * (ambient + (1.0 - ambient) * lambert) * ao_mult * light;
+  let lit = albedo * (ambient + (1.0 - ambient) * lambert * light_term) * ao_mult;
   // M10b: emit LINEAR HDR. ACES + sRGB encode live in the present blit so
   // brightness > 1.0 survives the resolve pass and reaches the bloom blur.
   // M10b exposure is applied here so bloom and tonemap see the same scaled
@@ -692,7 +637,7 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     var d2 = 0.0;
     var d3 = 0.0;
     if ((dump_mask & 0x01u) != 0u) { d0 = ao_smooth; }
-    if ((dump_mask & 0x02u) != 0u) { d1 = f32(ao_i); }
+    if ((dump_mask & 0x02u) != 0u) { d1 = ao_smooth; }
     if ((dump_mask & 0x04u) != 0u) { d2 = ao_mult; }
     if ((dump_mask & 0x08u) != 0u) { d3 = f32(ao_corners); }
     debug_dump[0] = vec4<f32>(d0, d1, d2, d3);
@@ -1111,14 +1056,12 @@ mod tests {
         .with_ao_curve(default);
         assert_eq!(m.ao_curve_q16, packed);
 
-        // The default curve must respect the M10a.3 spec:
-        //   byte 0 = most occluded (~0.18, 46/255)
-        //   byte 1 = mid-occluded (~0.25, 64/255)
-        //   byte 2 = mid-open     (~0.39, 100/255)
-        //   byte 3 = fully open   (1.0, 255/255)
+        // The default curve must respect plan 09 Exile approx:
+        //   byte 0 ≈ 0.75 (191/255), byte 3 = 1.0 (255)
         // Each byte must be > 0 (no black-AO collapse) and monotonic
         // non-decreasing (more open = brighter).
         assert!(default[0] > 0, "fully occluded AO must be > 0 (not black)");
+        assert_eq!(default, [191, 210, 230, 255], "Exile AO_CURVE_DEFAULT");
         assert!(default[3] == 255, "fully open AO must be 1.0");
         for w in default.windows(2) {
             assert!(
@@ -1129,10 +1072,8 @@ mod tests {
         }
     }
 
-    /// M10a.3 bi-linear AO CPU mirror: the WGSL `sample_ao` re-evaluates the
-    /// 0fps.net flip rule and does a bi-linear mix across the quad. The
-    /// CPU test exercises the 16 corner configurations (each corner is
-    /// 0..3) and confirms the formula stays in [0, 3] for every (u, v).
+    /// M10a.3 bi-linear AO CPU mirror: plain bilinear on c0..c3 (no FLIP
+    /// corner swap — that lives in prepass triangle split only).
     #[test]
     fn sample_ao_bilinear_in_bounds() {
         // CPU mirror of `sample_ao` in the WGSL.
@@ -1142,15 +1083,9 @@ mod tests {
             let c1 = ((ao >> 2) & 0x3) as f32;
             let c2 = ((ao >> 4) & 0x3) as f32;
             let c3 = ((ao >> 6) & 0x3) as f32;
-            let flip = (c0 + c3) > (c1 + c2);
-            let (tl, tr, bl, br) = if flip {
-                (c0, c3, c1, c2)
-            } else {
-                (c0, c1, c2, c3)
-            };
             let (wu, wv) = (uv.0.clamp(0.0, 1.0), uv.1.clamp(0.0, 1.0));
-            let top = tl + (tr - tl) * wu;
-            let bottom = bl + (br - bl) * wu;
+            let top = c0 + (c1 - c0) * wu;
+            let bottom = c2 + (c3 - c2) * wu;
             top + (bottom - top) * wv
         };
 
@@ -1218,15 +1153,75 @@ mod tests {
     }
 
     #[test]
-    fn test_sample_ao_corner_swap_assignment() {
+    fn test_sample_ao_no_flip_corner_swap() {
         assert!(
-            RESOLVE_WGSL.contains("let top_right_b = c1;")
-                && RESOLVE_WGSL.contains("let bottom_left_b = c3;"),
-            "RESOLVE_WGSL sample_ao must assign c1 to top_right_b and c3 to bottom_left_b when flip is true"
+            RESOLVE_WGSL.contains("let top = mix(c0, c1, wu);")
+                && RESOLVE_WGSL.contains("let bottom = mix(c2, c3, wu);"),
+            "RESOLVE_WGSL sample_ao must use plain bilinear on c0,c1,c2,c3"
         );
         assert!(
-            !RESOLVE_WGSL.contains("let top_right_b = c3;"),
-            "RESOLVE_WGSL sample_ao must not assign c3 to top_right_b"
+            !RESOLVE_WGSL.contains("let flip = (c0 + c3)"),
+            "RESOLVE_WGSL sample_ao must not re-apply FLIP corner swap"
         );
+        assert!(
+            RESOLVE_WGSL.contains("let ao_uv = get_quad_space_uv"),
+            "RESOLVE_WGSL must sample AO with quad-space UV"
+        );
+        assert!(
+            RESOLVE_WGSL.contains("fn inset_block_uv")
+                && RESOLVE_WGSL.contains("uv = inset_block_uv(uv);")
+                && RESOLVE_WGSL.contains("let inset = 1.0 / 16.0;"),
+            "RESOLVE_WGSL must inset block UVs before textureSample"
+        );
+        assert!(
+            RESOLVE_WGSL.contains("ao_dist_fade")
+                && RESOLVE_WGSL.contains("mix(ao_raw, 1.0, ao_dist_fade"),
+            "RESOLVE_WGSL must soften AO with distance to avoid aliased edge lines"
+        );
+        assert!(
+            RESOLVE_WGSL.contains("let ambient = 0.14;")
+                && RESOLVE_WGSL.contains("max(sky_l, block_l)")
+                && RESOLVE_WGSL.contains("lambert * light_term")
+                && RESOLVE_WGSL.contains("0.05 + 0.95 * light"),
+            "RESOLVE_WGSL must keep ambient ungated and gate only lambert by lightmap"
+        );
+    }
+
+    #[test]
+    fn clamp_face_n_idx_rejects_out_of_range() {
+        let clamp = |n: u32| n.min(5);
+        assert_eq!(clamp(0), 0);
+        assert_eq!(clamp(5), 5);
+        assert_eq!(clamp(6), 5);
+        assert_eq!(clamp(7), 5);
+        assert!(
+            RESOLVE_WGSL.contains("min(u32((entry >> u32(48)) & u64(0x7u)), 5u)"),
+            "resolve WGSL must clamp n_idx before indexing 6-element arrays"
+        );
+    }
+
+    /// Sky=0 must not crush outdoor faces to void-black; sunlit must stay brighter.
+    #[test]
+    fn compose_keeps_readable_floor_without_wash() {
+        let ambient = 0.14_f32;
+        let lambert = 0.85; // +Y under typical sun
+        let ao = 191.0 / 255.0; // AO_CURVE_DEFAULT[0]
+        let shade = |light: f32| {
+            let light_term = 0.05 + 0.95 * light;
+            (ambient + (1.0 - ambient) * lambert * light_term) * ao
+        };
+        let dark = shade(0.0);
+        let lit = shade(1.0);
+        assert!(
+            dark > 0.08,
+            "sky=0 outdoor face must stay readable, got {dark}"
+        );
+        assert!(
+            lit > dark * 2.5,
+            "full sky must be clearly brighter than sky=0 ({lit} vs {dark})"
+        );
+        // Old wash was +0.15 on the lightmap channel itself; caves with that
+        // looked nearly as bright as dim outdoor. Keep dark well below mid-grey.
+        assert!(dark < 0.20, "cave/sky=0 must stay clearly dim, got {dark}");
     }
 }

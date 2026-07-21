@@ -235,6 +235,104 @@ async fn flush_syncs_region_files() {
     cleanup(&dir);
 }
 
+/// Write Ok means durable: sector must be readable from disk immediately after Ok.
+#[tokio::test]
+async fn write_sector_awaits_durable_completion() {
+    let dir = temp_dir("write_durable");
+    let backend = TokioBackend::new(dir.clone()).unwrap();
+    let coord = SectorCoord(4, 5, 6);
+    let payload = sample_payload(99, 512);
+
+    backend.write_sector(coord, payload.clone()).await.unwrap();
+
+    // No sleep / no flush — Ok implies the region file already has the sector.
+    let path = strata_storage::backend::region_path_for(&dir, coord);
+    let rf = RegionFile::open(&path).unwrap();
+    let (_h, on_disk) = rf.read_sector(coord).expect("durable write must be on disk");
+    let decompressed = strata_storage::compress::decompress(&on_disk).unwrap();
+    assert_eq!(decompressed, payload);
+
+    cleanup(&dir);
+}
+
+/// F6 shutdown API: sync drains in-flight work before returning.
+#[tokio::test]
+async fn sync_drains_pending_writes() {
+    let dir = temp_dir("sync_drain");
+    let backend = TokioBackend::new(dir.clone()).unwrap();
+    let coord = SectorCoord(0, 0, 1);
+    let payload = sample_payload(1, 256);
+
+    backend.write_sector(coord, payload.clone()).await.unwrap();
+    backend.sync().await.unwrap();
+
+    let read = backend.read_sector(coord).await.unwrap();
+    assert_eq!(read, payload);
+
+    cleanup(&dir);
+}
+
+/// Truncated/corrupt zstd frame (magic present) must fail closed — never raw garbage.
+#[tokio::test]
+async fn read_rejects_corrupt_zstd_frame_no_garbage_fallback() {
+    let dir = temp_dir("bad_zstd");
+    let path = dir.join(RegionCoord { x: 0, y: 0, z: 0 }.file_name());
+    let coord = SectorCoord(1, 1, 1);
+
+    // Valid magic + truncated body: integrity (hash of stored bytes) passes,
+    // but decode must surface Decompress — not return the truncated bytes as raw.
+    let full = strata_storage::compress::compress(&[0u8; 256], Tier::Warm).unwrap();
+    assert!(strata_storage::compress::is_zstd_frame(&full));
+    let truncated = full[..8.min(full.len())].to_vec();
+    assert!(strata_storage::compress::is_zstd_frame(&truncated));
+    let header = SectorHeader::new(coord, Tier::Warm, &truncated);
+    {
+        let mut rf = RegionFile::open(&path).unwrap();
+        rf.write_sector(coord, &header, &truncated).unwrap();
+    }
+
+    let backend = TokioBackend::new(dir.clone()).unwrap();
+    let err = backend
+        .read_sector(coord)
+        .await
+        .expect_err("corrupt zstd must not return Ok(raw)");
+    assert!(
+        matches!(
+            err,
+            strata_storage::StorageError::Decompress(_)
+                | strata_storage::StorageError::CorruptPayload { .. }
+        ),
+        "expected Decompress/Corrupt, got {err:?}"
+    );
+
+    cleanup(&dir);
+}
+
+/// Legacy uncompressed region payloads (no zstd magic) must round-trip via backend read.
+#[tokio::test]
+async fn read_accepts_legacy_uncompressed_payload() {
+    let dir = temp_dir("legacy_raw");
+    let path = dir.join(RegionCoord { x: 0, y: 0, z: 0 }.file_name());
+    let coord = SectorCoord(2, 3, 4);
+    let payload = sample_payload(77, 1024);
+    assert!(
+        !strata_storage::compress::is_zstd_frame(&payload),
+        "sample must not accidentally look like zstd"
+    );
+
+    let header = SectorHeader::new(coord, Tier::Warm, &payload);
+    {
+        let mut rf = RegionFile::open(&path).unwrap();
+        rf.write_sector(coord, &header, &payload).unwrap();
+    }
+
+    let backend = TokioBackend::new(dir.clone()).unwrap();
+    let read = backend.read_sector(coord).await.expect("legacy raw must load");
+    assert_eq!(read, payload);
+
+    cleanup(&dir);
+}
+
 /// Minimal blocking executor for the `async_trait` metadata calls in tests.
 fn futures_lite_block_on<F: std::future::Future>(fut: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()

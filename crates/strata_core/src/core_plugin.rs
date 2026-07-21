@@ -1,5 +1,6 @@
 //! Core scheduling plugin: `StrataSet` chain, no-op stubs, and the filter-first demo.
 
+use bevy::ecs::schedule::ScheduleBuildSettings;
 use bevy::prelude::*;
 
 use crate::component::{
@@ -17,6 +18,9 @@ impl StrataPlugin for StrataSchedulingPlugin {
     }
 
     fn build(&self, app: &mut App) {
+        // Ensure `Update` exists first: `configure_schedules` only mutates
+        // schedules already present (Bevy 0.18), so calling it before
+        // `configure_sets` would leave a later-created Update on Ignore.
         app.configure_sets(
             Update,
             (
@@ -30,6 +34,19 @@ impl StrataPlugin for StrataSchedulingPlugin {
             )
                 .chain(),
         );
+        app.edit_schedule(Update, |schedule| {
+            schedule.set_build_settings(ScheduleBuildSettings {
+                ambiguity_detection: bevy::ecs::schedule::LogLevel::Warn,
+                auto_insert_apply_deferred: true,
+                ..default()
+            });
+        });
+        // Also stamp any other schedules DefaultPlugins already registered.
+        app.configure_schedules(ScheduleBuildSettings {
+            ambiguity_detection: bevy::ecs::schedule::LogLevel::Warn,
+            auto_insert_apply_deferred: true,
+            ..default()
+        });
 
         app.add_systems(
             Update,
@@ -40,16 +57,12 @@ impl StrataPlugin for StrataSchedulingPlugin {
                 stub_meshing.in_set(StrataSet::Meshing),
                 stub_physics.in_set(StrataSet::Physics),
                 stub_lighting.in_set(StrataSet::Lighting),
+                stub_render_update.in_set(StrataSet::RenderUpdate),
             ),
         );
-        app.add_systems(Update, clear_dirty_markers.after(StrataSet::Lighting));
+        // `ChunkDirty` is owned by remesh/physics/save consumers — do not
+        // blanket-clear it here (they insert and remove on their own cadence).
         app.add_systems(Startup, hello_system);
-    }
-}
-
-fn clear_dirty_markers(mut commands: Commands, dirty: Query<Entity, With<ChunkDirty>>) {
-    for entity in &dirty {
-        commands.entity(entity).remove::<ChunkDirty>();
     }
 }
 
@@ -59,6 +72,7 @@ fn stub_worldgen() {}
 fn stub_meshing() {}
 fn stub_physics() {}
 fn stub_lighting() {}
+fn stub_render_update() {}
 
 fn hello_system() {
     info!("Strata: core pipeline booted (StrataSet chain active)");

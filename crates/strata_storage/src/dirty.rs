@@ -74,8 +74,11 @@ impl DirtyTracker {
         }
     }
 
-    /// Pop up to `n` dirty coords for flushing, clearing each one's sticky bit
-    /// as it leaves the queue. A later `mark_dirty` re-sets the bit (§1.1.3).
+    /// Pop up to `n` dirty coords for flushing.
+    ///
+    /// Removes them from the flush queue so they can be re-enqueued if edited
+    /// again while inflight. Does **not** clear the sticky bit — that happens
+    /// only in [`clear`] after a durable commit (plan 15 §1.1.3).
     pub fn consume_dirty_batch(&self, n: usize) -> Vec<SectorCoord> {
         let mut q = self.queue.lock().unwrap();
         let mut out = Vec::with_capacity(n.min(q.queue.len()));
@@ -83,11 +86,9 @@ impl DirtyTracker {
             let Some(coord) = q.queue.pop_front() else {
                 break;
             };
+            // Drop queue membership so a concurrent `mark_dirty` can re-enqueue,
+            // but leave the sticky bit set until `clear` post-commit.
             q.set.remove(&coord);
-            let (shard, bit) = self.locate(coord);
-            if !q.set.iter().any(|c| self.locate(*c) == (shard, bit)) {
-                self.shards[shard].fetch_and(!bit, Ordering::Release);
-            }
             out.push(coord);
         }
         out
@@ -95,24 +96,24 @@ impl DirtyTracker {
 
     /// Clear the sticky bit only after a *durable* commit (plan 15 §1.1.3).
     ///
-    /// This is distinct from `consume_dirty_batch`: consumption takes a coord
-    /// off the queue, but the bit is only cleared post-commit here.
+    /// If `coord` was re-dirtied (and re-queued) while inflight, this is a no-op
+    /// so the new edit is not lost.
     pub fn clear(&self, coord: SectorCoord) {
-        let mut q = self.queue.lock().unwrap();
-        q.set.remove(&coord);
+        let q = self.queue.lock().unwrap();
+        if q.set.contains(&coord) {
+            // Re-dirtied while inflight — keep sticky bit / queue entry.
+            return;
+        }
         let (shard, bit) = self.locate(coord);
         if !q.set.iter().any(|c| self.locate(*c) == (shard, bit)) {
             self.shards[shard].fetch_and(!bit, Ordering::Release);
         }
     }
 
-    /// True if `coord` is currently flagged dirty.
+    /// True if `coord` is flagged dirty (queued or inflight awaiting `clear`).
     pub fn is_dirty(&self, coord: SectorCoord) -> bool {
         let (shard, bit) = self.locate(coord);
-        if self.shards[shard].load(Ordering::Acquire) & bit == 0 {
-            return false;
-        }
-        self.queue.lock().unwrap().set.contains(&coord)
+        self.shards[shard].load(Ordering::Acquire) & bit != 0
     }
 
     /// Number of coords currently waiting in the flush queue.
@@ -155,5 +156,43 @@ mod tests {
         assert_eq!(batch.len(), 2);
         assert!(batch.contains(&c1));
         assert!(batch.contains(&c2));
+        // Sticky bits survive consume; clear after durable commit.
+        assert!(tracker.is_dirty(c1));
+        assert!(tracker.is_dirty(c2));
+        tracker.clear(c1);
+        tracker.clear(c2);
+        assert!(!tracker.is_dirty(c1));
+        assert!(!tracker.is_dirty(c2));
+    }
+
+    /// Bit stays set through consume; only `clear` (post-commit) drops it.
+    #[test]
+    fn consume_does_not_clear_sticky_bit() {
+        let tracker = DirtyTracker::new(64);
+        let coord = SectorCoord(7, 8, 9);
+        tracker.mark_dirty(coord);
+        assert!(tracker.is_dirty(coord));
+
+        let batch = tracker.consume_dirty_batch(1);
+        assert_eq!(batch, vec![coord]);
+        assert!(
+            tracker.is_dirty(coord),
+            "consume must not clear sticky bit before durable commit"
+        );
+        assert_eq!(tracker.pending(), 0);
+
+        // Re-dirty while inflight must re-enqueue.
+        tracker.mark_dirty(coord);
+        assert_eq!(tracker.pending(), 1);
+
+        tracker.clear(coord);
+        // Still queued from re-dirty → clear must leave bit set.
+        assert!(
+            tracker.is_dirty(coord),
+            "clear must no-op when coord was re-dirtied"
+        );
+        let _ = tracker.consume_dirty_batch(1);
+        tracker.clear(coord);
+        assert!(!tracker.is_dirty(coord));
     }
 }

@@ -123,3 +123,56 @@ fn empty_sector_round_trip() {
     header.verify(&c).expect("empty sector header verifies");
     assert_eq!(decompress(&c).unwrap(), payload.to_vec());
 }
+
+/// Compression bomb: decompressed size past the sector cap must Error (not OOM).
+#[test]
+fn decompress_rejects_over_max_decompressed_size() {
+    use strata_storage::compress::{decompress_with_limit, MAX_DECOMPRESSED_SECTOR_BYTES};
+    use strata_storage::envelope::compress as env_compress;
+
+    // Highly compressible zeros — tiny on disk, huge when decoded.
+    let huge = vec![0u8; 256 * 1024];
+    let compressed = env_compress(&huge, Tier::Warm).unwrap();
+    assert!(compressed.len() < huge.len());
+
+    let tiny_cap = 64 * 1024;
+    assert!(tiny_cap < huge.len());
+    let err = decompress_with_limit(&compressed, tiny_cap).expect_err("must cap output");
+    assert!(
+        matches!(err, strata_storage::StorageError::Decompress(_)),
+        "expected Decompress error, got {err:?}"
+    );
+
+    // Default API must accept a normal sector-sized blob under the public cap.
+    assert!(huge.len() < MAX_DECOMPRESSED_SECTOR_BYTES);
+    assert_eq!(
+        strata_storage::compress::decompress(&compressed).unwrap(),
+        huge
+    );
+}
+
+#[test]
+fn zstd_magic_detection_and_decode_stored_payload() {
+    use strata_storage::compress::{
+        decode_stored_payload, is_zstd_frame, ZSTD_MAGIC,
+    };
+
+    assert!(!is_zstd_frame(&[]));
+    assert!(!is_zstd_frame(&[0x28, 0xB5]));
+    assert!(!is_zstd_frame(b"postcard-ish-bytes"));
+    assert!(is_zstd_frame(&ZSTD_MAGIC));
+
+    let raw = sample_payload(3, 128);
+    assert!(!is_zstd_frame(&raw));
+    assert_eq!(decode_stored_payload(&raw).unwrap(), raw);
+
+    let compressed = compress(&raw, Tier::Warm).unwrap();
+    assert!(is_zstd_frame(&compressed));
+    assert_eq!(decode_stored_payload(&compressed).unwrap(), raw);
+
+    // Magic present but truncated frame → fail closed (not raw truncated bytes).
+    let truncated = compressed[..6.min(compressed.len())].to_vec();
+    assert!(is_zstd_frame(&truncated));
+    let err = decode_stored_payload(&truncated).expect_err("bad frame must error");
+    assert!(matches!(err, strata_storage::StorageError::Decompress(_)));
+}

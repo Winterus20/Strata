@@ -47,6 +47,13 @@ pub struct BloomPipelines {
     pub blur_h_pipelines: [RenderPipeline; DEFAULT_MIP_COUNT as usize],
     /// Vertical-blur pipelines, parallel to `blur_h_pipelines`.
     pub blur_v_pipelines: [RenderPipeline; DEFAULT_MIP_COUNT as usize],
+    /// Downsample pipeline (fullscreen bilinear: reads mip i → writes mip i+1).
+    /// Runs between bright-extract and the per-mip blur loop so that each mip
+    /// has valid data from its parent before the Gaussian blur is applied.
+    pub downsample_pipeline: RenderPipeline,
+    /// Per-mip downsample bind groups (one per mip except the last). Entry `i`
+    /// reads from `mip_views[i]` via the blur bind group layout (binding 3/4).
+    pub downsample_bgs: Vec<BindGroup>,
     /// Composite pipeline (samples all mips, writes the additive bloom term
     /// back into the HDR target).
     pub composite_pipeline: RenderPipeline,

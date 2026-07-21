@@ -5,49 +5,46 @@
 //! buffer from these values. All packing is branchless bit arithmetic so the same
 //! shifts can be mirrored verbatim in the shader.
 //!
-//! Bit layout (M12 visbuf v4 — 13-bit reversed-Z depth for high precision):
-//! * `bit[0:16]`   voxel_pos    (16 bits, sector-local 5+5+5+1 reserved; 0..65535)
-//! * `bit[16:20]`  block_id     (4 bits, copied from `PackedQuad::data[4]`, 0..15)
-//! * `bit[20:24]`  sector_id    (4 bits; owning sector index in per-frame AOI, 0..15)
-//! * `bit[24:32]`  ao_corners   (8 bits, 4 corners x 2 bits — c0[0:2] c1[2:4] c2[4:6] c3[6:8])
+//! Bit layout (M12 visbuf v5 — 21-bit global quad_id for >64K SSBO slots):
+//! * `bit[0:15]`   voxel_pos    (15 bits, sector-local 5+5+5; 0..32767)
+//! * `bit[15:19]`  block_id     (4 bits, copied from `PackedQuad::data[4]`, 0..15)
+//! * `bit[19:27]`  ao_corners   (8 bits, 4 corners x 2 bits — c0[0:2] c1[2:4] c2[4:6] c3[6:8])
 //!   0 = most occluded, 3 = fully open. The fragment shader
 //!   does bi-linear interpolation across the quad via the UV
 //!   coords reconstructed in `get_quad_space_uv`.
-//! * `bit[32:48]`  quad_id      (16 bits, global quad index in SSBO; supports up to 65K quads)
+//! * `bit[27:48]`  quad_id      (21 bits, global SSBO / lightmap slot; up to 2M quads)
 //! * `bit[48:51]`  normal       (3 bits, 0..7)
 //! * `bit[51:64]`  depth        (13 bits, reversed-Z; clear = 0)
-//!   (13-bit depth = 8192 levels, giving ~0.03 m precision at 250 m for high reversed-Z depth precision)
+//!   (13-bit depth = 8192 levels, giving ~0.03 m precision at 250 m)
 //!
-//! The 4-bit `sector_id` lets the resolve shader disambiguate per-sector pixels
-//! when a single frame's visbuf receives quads from multiple sectors (AOI
-//! overlap). It is decoded for verification only; per-sector palette work
-//! comes in a later milestone. The current `BlockRegistry` tops out at 16 blocks,
-//! which fits the 4-bit `block_id`; a 17th block will require either a layout
-//! bump or a palette mask fallback.
+//! v4 stored a 4-bit `sector_id` and only 16-bit `quad_id`. With streaming AOI
+//! caches past ~65K quads, truncated `quad_id` made resolve sample the wrong
+//! lightmap byte (sector-aligned dark slabs until a remesh reshuffled slots).
+//! `sector_id` was unused in resolve; those bits now extend `quad_id`.
+//! The current `BlockRegistry` tops out at 16 blocks, which fits the 4-bit
+//! `block_id`; a 17th block will require either a layout bump or a palette
+//! mask fallback.
 
 use bytemuck::{Pod, Zeroable};
 
 use crate::meshing::{MeshData, PackedQuad};
 
-/// `voxel_pos` occupies the low 16 bits.
-pub const VOXEL_POS_MASK: u64 = (1u64 << 16) - 1;
-/// `block_id` occupies 4 bits starting at bit 16.
+/// `voxel_pos` occupies the low 15 bits (5+5+5 packing).
+pub const VOXEL_POS_MASK: u64 = (1u64 << 15) - 1;
+/// `block_id` occupies 4 bits starting at bit 15.
 pub const BLOCK_ID_MASK: u64 = (1u64 << 4) - 1;
-/// `sector_id` occupies 4 bits starting at bit 20.
-pub const SECTOR_ID_MASK: u64 = (1u64 << 4) - 1;
-/// `ao_corners` occupies 8 bits starting at bit 24 (4 corners x 2 bits).
+/// `ao_corners` occupies 8 bits starting at bit 19 (4 corners x 2 bits).
 pub const AO_CORNERS_MASK: u64 = (1u64 << 8) - 1;
-/// `quad_id` occupies 16 bits starting at bit 32.
-pub const QUAD_ID_MASK: u64 = (1u64 << 16) - 1;
+/// `quad_id` occupies 21 bits starting at bit 27 (global SSBO slot, up to 2M).
+pub const QUAD_ID_MASK: u64 = (1u64 << 21) - 1;
 /// `normal` occupies 3 bits starting at bit 48.
 pub const NORMAL_MASK: u64 = 0x7;
 /// `depth` occupies 13 bits starting at bit 51 (reversed-Z depth precision).
 pub const DEPTH_MASK: u64 = (1u64 << 13) - 1;
 
-const BLOCK_ID_SHIFT: u32 = 16;
-const SECTOR_ID_SHIFT: u32 = 20;
-const AO_CORNERS_SHIFT: u32 = 24;
-const QUAD_ID_SHIFT: u32 = 32;
+const BLOCK_ID_SHIFT: u32 = 15;
+const AO_CORNERS_SHIFT: u32 = 19;
+const QUAD_ID_SHIFT: u32 = 27;
 const NORMAL_SHIFT: u32 = 48;
 const DEPTH_SHIFT: u32 = 51;
 
@@ -72,7 +69,6 @@ impl VisBufEntry {
     pub fn pack(
         voxel_pos: u32,
         block_id: u32,
-        sector_id: u32,
         ao_corners: u8,
         quad_id: u32,
         normal: u8,
@@ -80,7 +76,6 @@ impl VisBufEntry {
     ) -> Self {
         let v = (voxel_pos as u64 & VOXEL_POS_MASK)
             | ((block_id as u64 & BLOCK_ID_MASK) << BLOCK_ID_SHIFT)
-            | ((sector_id as u64 & SECTOR_ID_MASK) << SECTOR_ID_SHIFT)
             | ((ao_corners as u64 & AO_CORNERS_MASK) << AO_CORNERS_SHIFT)
             | ((quad_id as u64 & QUAD_ID_MASK) << QUAD_ID_SHIFT)
             | ((normal as u64 & NORMAL_MASK) << NORMAL_SHIFT)
@@ -107,11 +102,6 @@ impl VisBufEntry {
     #[inline]
     pub fn block_id(&self) -> u32 {
         ((self.0 >> BLOCK_ID_SHIFT) & BLOCK_ID_MASK) as u32
-    }
-
-    #[inline]
-    pub fn sector_id(&self) -> u32 {
-        ((self.0 >> SECTOR_ID_SHIFT) & SECTOR_ID_MASK) as u32
     }
 
     /// 4 corner AO values (0=occluded .. 3=open), c0..c3.
@@ -187,11 +177,10 @@ fn pack_batch(batch: &[PackedQuad]) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    const MAX_VOXEL_POS: u32 = (1u32 << 16) - 1;
+    const MAX_VOXEL_POS: u32 = (1u32 << 15) - 1;
     const MAX_BLOCK_ID: u32 = (1u32 << 4) - 1;
-    const MAX_SECTOR_ID: u32 = (1u32 << 4) - 1;
     const MAX_AO_CORNERS: u8 = 0xFF;
-    const MAX_QUAD_ID: u32 = (1u32 << 16) - 1;
+    const MAX_QUAD_ID: u32 = (1u32 << 21) - 1;
     const MAX_NORMAL: u8 = 0x7;
     const MAX_DEPTH: u32 = (1u32 << 13) - 1;
 
@@ -199,7 +188,6 @@ mod tests {
         VisBufEntry::pack(
             MAX_VOXEL_POS,
             MAX_BLOCK_ID,
-            MAX_SECTOR_ID,
             MAX_AO_CORNERS,
             MAX_QUAD_ID,
             MAX_NORMAL,
@@ -212,7 +200,6 @@ mod tests {
         let e = pack_max_all();
         assert_eq!(e.voxel_pos(), MAX_VOXEL_POS);
         assert_eq!(e.block_id(), MAX_BLOCK_ID);
-        assert_eq!(e.sector_id(), MAX_SECTOR_ID);
         // 4 corner AO values; each is max (3), so ao_corners() returns [3,3,3,3].
         let ao = e.ao_corners();
         assert_eq!(ao, [3, 3, 3, 3]);
@@ -225,10 +212,9 @@ mod tests {
 
     #[test]
     fn test_visbuf_round_trip_zero() {
-        let e = VisBufEntry::pack(0, 0, 0, 0, 0, 0, 0);
+        let e = VisBufEntry::pack(0, 0, 0, 0, 0, 0);
         assert_eq!(e.voxel_pos(), 0);
         assert_eq!(e.block_id(), 0);
-        assert_eq!(e.sector_id(), 0);
         assert_eq!(e.ao_corners(), [0, 0, 0, 0]);
         assert_eq!(e.ao_max(), 0);
         assert_eq!(e.quad_id(), 0);
@@ -239,27 +225,25 @@ mod tests {
 
     #[test]
     fn test_visbuf_round_trip_scattered() {
-        // Each tuple: (voxel_pos, block_id, sector_id, ao_corners byte, quad_id, normal, depth)
-        let cases: [(u32, u32, u32, u8, u32, u8, u32); 8] = [
-            (0xABCD, 0x5, 0xA, 0xFF, 0x1234, 0x3, 0x1FFF),
-            (1, 1, 1, 0x5A, 1, 1, 1),
-            (MAX_VOXEL_POS, 0, 0, 0, 0, 0, 0),
-            (0, MAX_BLOCK_ID, 0, 0, 0, 0, 0),
-            (0, 0, MAX_SECTOR_ID, 0, 0, 0, 0),
-            (0, 0, 0, MAX_AO_CORNERS, 0, 0, 0),
-            (0, 0, 0, 0, MAX_QUAD_ID, 0, 0),
-            (0, 0, 0, 0, 0, MAX_NORMAL, 0),
+        // Each tuple: (voxel_pos, block_id, ao_corners byte, quad_id, normal, depth)
+        let cases: [(u32, u32, u8, u32, u8, u32); 8] = [
+            (0x3BCD, 0x5, 0xFF, 0x1234, 0x3, 0x1FFF),
+            (1, 1, 0x5A, 1, 1, 1),
+            (MAX_VOXEL_POS, 0, 0, 0, 0, 0),
+            (0, MAX_BLOCK_ID, 0, 0, 0, 0),
+            (0, 0, MAX_AO_CORNERS, 0, 0, 0),
+            (0, 0, 0, MAX_QUAD_ID, 0, 0),
+            (0, 0, 0, 0, MAX_NORMAL, 0),
+            (0, 0, 0, 0, 0, MAX_DEPTH),
         ];
-        for (vp, bid, sid, ao, qid, n, d) in cases {
-            let e = VisBufEntry::pack(vp, bid, sid, ao, qid, n, d);
+        for (vp, bid, ao, qid, n, d) in cases {
+            let e = VisBufEntry::pack(vp, bid, ao, qid, n, d);
             assert_eq!(e.voxel_pos(), vp, "voxel_pos round-trip");
             assert_eq!(e.block_id(), bid, "block_id round-trip");
-            assert_eq!(e.sector_id(), sid, "sector_id round-trip");
-            // Round-trip the AO corners: extract each 2-bit field and compare.
-            let ao_byte = e.ao_corners();
-            let recovered =
-                (ao_byte[0]) | (ao_byte[1] << 2) | (ao_byte[2] << 4) | (ao_byte[3] << 6);
-            assert_eq!(recovered, ao, "ao_corners round-trip");
+            assert_eq!(e.ao_corners(), {
+                let a = ao;
+                [a & 0x3, (a >> 2) & 0x3, (a >> 4) & 0x3, (a >> 6) & 0x3]
+            });
             assert_eq!(e.quad_id(), qid, "quad_id round-trip");
             assert_eq!(e.normal(), n, "normal round-trip");
             assert_eq!(e.depth(), d, "depth round-trip");
@@ -268,109 +252,62 @@ mod tests {
 
     #[test]
     fn test_visbuf_field_boundaries_no_bleed() {
-        // Each field set to its max independently; only the corresponding bits
-        // should be set. Shifting/ORing them together must not overlap.
-        let vp = VisBufEntry::pack(MAX_VOXEL_POS, 0, 0, 0, 0, 0, 0).raw();
-        let bid = VisBufEntry::pack(0, MAX_BLOCK_ID, 0, 0, 0, 0, 0).raw();
-        let sid = VisBufEntry::pack(0, 0, MAX_SECTOR_ID, 0, 0, 0, 0).raw();
-        let ao = VisBufEntry::pack(0, 0, 0, MAX_AO_CORNERS, 0, 0, 0).raw();
-        let qid = VisBufEntry::pack(0, 0, 0, 0, MAX_QUAD_ID, 0, 0).raw();
-        let n = VisBufEntry::pack(0, 0, 0, 0, 0, MAX_NORMAL, 0).raw();
-        let d = VisBufEntry::pack(0, 0, 0, 0, 0, 0, MAX_DEPTH).raw();
-
-        // No two single-field values should overlap when ANDed.
+        let vp = VisBufEntry::pack(MAX_VOXEL_POS, 0, 0, 0, 0, 0).raw();
+        let bid = VisBufEntry::pack(0, MAX_BLOCK_ID, 0, 0, 0, 0).raw();
+        let ao = VisBufEntry::pack(0, 0, MAX_AO_CORNERS, 0, 0, 0).raw();
+        let qid = VisBufEntry::pack(0, 0, 0, MAX_QUAD_ID, 0, 0).raw();
+        let n = VisBufEntry::pack(0, 0, 0, 0, MAX_NORMAL, 0).raw();
+        let d = VisBufEntry::pack(0, 0, 0, 0, 0, MAX_DEPTH).raw();
         assert_eq!(vp & bid, 0, "voxel_pos/block_id overlap");
-        assert_eq!(vp & sid, 0, "voxel_pos/sector_id overlap");
         assert_eq!(vp & ao, 0, "voxel_pos/ao_corners overlap");
         assert_eq!(vp & qid, 0, "voxel_pos/quad_id overlap");
         assert_eq!(vp & n, 0, "voxel_pos/normal overlap");
         assert_eq!(vp & d, 0, "voxel_pos/depth overlap");
-        assert_eq!(bid & sid, 0, "block_id/sector_id overlap");
         assert_eq!(bid & ao, 0, "block_id/ao_corners overlap");
         assert_eq!(bid & qid, 0, "block_id/quad_id overlap");
         assert_eq!(bid & n, 0, "block_id/normal overlap");
         assert_eq!(bid & d, 0, "block_id/depth overlap");
-        assert_eq!(sid & ao, 0, "sector_id/ao_corners overlap");
-        assert_eq!(sid & qid, 0, "sector_id/quad_id overlap");
-        assert_eq!(sid & n, 0, "sector_id/normal overlap");
-        assert_eq!(sid & d, 0, "sector_id/depth overlap");
         assert_eq!(ao & qid, 0, "ao_corners/quad_id overlap");
         assert_eq!(ao & n, 0, "ao_corners/normal overlap");
         assert_eq!(ao & d, 0, "ao_corners/depth overlap");
         assert_eq!(qid & n, 0, "quad_id/normal overlap");
         assert_eq!(qid & d, 0, "quad_id/depth overlap");
         assert_eq!(n & d, 0, "normal/depth overlap");
-
-        // Combined OR equals the fully-packed max entry.
-        let combined = vp | bid | sid | ao | qid | n | d;
-        let full = pack_max_all().raw();
-        assert_eq!(combined, full, "combined fields differ from packed max");
     }
 
     #[test]
-    fn test_visbuf_empty_is_max_depth() {
+    fn test_visbuf_empty_is_far_depth() {
         let e = VisBufEntry::empty();
+        assert_eq!(e.depth(), MAX_DEPTH);
         assert_eq!(e.voxel_pos(), 0);
         assert_eq!(e.block_id(), 0);
-        assert_eq!(e.sector_id(), 0);
         assert_eq!(e.ao_corners(), [0, 0, 0, 0]);
-        assert_eq!(e.ao_max(), 0);
         assert_eq!(e.quad_id(), 0);
         assert_eq!(e.normal(), 0);
-        assert_eq!(
-            e.depth(),
-            MAX_DEPTH,
-            "clear depth must be max for reversed-Z"
-        );
-        assert_eq!(e.raw(), DEPTH_MASK << DEPTH_SHIFT);
     }
 
     #[test]
-    fn test_visbuf_overflow_masked() {
-        // Over-wide inputs must truncate to their field width without bleeding.
-        let e = VisBufEntry::pack(u32::MAX, u32::MAX, u32::MAX, 0xFF, u32::MAX, 0xFF, u32::MAX);
+    fn test_visbuf_masks_overwide_inputs() {
+        let e = VisBufEntry::pack(u32::MAX, u32::MAX, 0xFF, u32::MAX, 0xFF, u32::MAX);
         assert_eq!(e.voxel_pos(), MAX_VOXEL_POS);
         assert_eq!(e.block_id(), MAX_BLOCK_ID);
-        assert_eq!(e.sector_id(), MAX_SECTOR_ID);
-        assert_eq!(e.ao_corners(), [3, 3, 3, 3]);
-        assert_eq!(e.ao_max(), 3);
         assert_eq!(e.quad_id(), MAX_QUAD_ID);
         assert_eq!(e.normal(), MAX_NORMAL);
         assert_eq!(e.depth(), MAX_DEPTH);
     }
 
+    /// Regression: global SSBO slots past 64K must survive packing. v4's 16-bit
+    /// `quad_id` truncated these, so resolve sampled lightmap[id & 0xFFFF]
+    /// (sector-aligned dark slabs until a remesh reshuffled the slot).
     #[test]
-    fn test_visbuf_sector_id_independent_field() {
-        // Regression for the M11 visbuf v2 layout: sector_id must occupy its
-        // own 4-bit field at bit 20, independent of block_id (bit 16..20) and
-        // ao_corners (bit 24..32). Back-to-back max values must round-trip
-        // without bleeding into either neighbour.
-        for sid in [0u32, 1, 5, 0xA, MAX_SECTOR_ID] {
-            let e = VisBufEntry::pack(0x1234, 0xC, sid, 0x5A, 0x4242, 5, 0x1FFF);
-            assert_eq!(e.sector_id(), sid, "sector_id={sid} round-trip");
-            assert_eq!(e.block_id(), 0xC, "block_id drift on sector_id={sid}");
-            assert_eq!(
-                e.ao_corners(),
-                [2, 2, 1, 1],
-                "ao_corners drift on sector_id={sid}"
-            );
-            assert_eq!(e.voxel_pos(), 0x1234, "voxel_pos drift on sector_id={sid}");
-            assert_eq!(e.quad_id(), 0x4242, "quad_id drift on sector_id={sid}");
-            assert_eq!(e.normal(), 5, "normal drift on sector_id={sid}");
-            assert_eq!(e.depth(), 0x1FFF, "depth drift on sector_id={sid}");
+    fn test_visbuf_quad_id_past_64k_round_trips() {
+        for qid in [65_536u32, 100_000, 318_259, MAX_QUAD_ID] {
+            let e = VisBufEntry::pack(0x1234, 0xC, 0x5A, qid, 5, 0x1FFF);
+            assert_eq!(e.quad_id(), qid, "quad_id={qid} must not truncate");
+            assert_eq!(e.voxel_pos(), 0x1234);
+            assert_eq!(e.block_id(), 0xC);
+            assert_eq!(e.depth(), 0x1FFF);
         }
-    }
-
-    #[test]
-    fn test_packed_quad_gpu_layout() {
-        assert_eq!(std::mem::size_of::<PackedQuadGpu>(), 8);
-        assert_eq!(
-            std::mem::size_of::<PackedQuadGpu>(),
-            std::mem::size_of::<PackedQuad>()
-        );
-        let q = PackedQuad::new(1, 2, 3, 4, 5, 0, 7, 0, 0, 0);
-        let g = PackedQuadGpu::from_packed_quad(&q);
-        assert_eq!(g.data, q.data);
     }
 
     #[test]
@@ -396,10 +333,44 @@ mod tests {
 
     #[test]
     fn test_visbuf_13bit_depth_precision() {
-        assert_eq!(DEPTH_MASK, 8191, "13-bit depth mask must be 8191");
         assert_eq!(DEPTH_SHIFT, 51, "depth shift must start at bit 51");
-        assert_eq!(QUAD_ID_MASK, 65535, "16-bit quad_id mask must be 65535");
-        let entry = VisBufEntry::pack(0, 0, 0, 0, 0, 0, 8191);
+        assert_eq!(QUAD_ID_MASK, (1 << 21) - 1, "21-bit quad_id mask");
+        let entry = VisBufEntry::pack(0, 0, 0, 0, 0, 8191);
         assert_eq!(entry.depth(), 8191);
+    }
+
+    /// Verify the CPU bit layout matches the GPU packing in prepass.rs.
+    #[test]
+    fn test_visbuf_cpu_gpu_layout_consistency() {
+        assert_eq!(BLOCK_ID_SHIFT, 15, "block_id shift must be 15 (GPU << 15u)");
+        assert_eq!(
+            AO_CORNERS_SHIFT, 19,
+            "ao_corners shift must be 19 (GPU << 19u)"
+        );
+        assert_eq!(QUAD_ID_SHIFT, 27, "quad_id shift must be 27 (GPU << 27u)");
+        assert_eq!(NORMAL_SHIFT, 48, "normal shift must be 48 (GPU << 48u)");
+        assert_eq!(DEPTH_SHIFT, 51, "depth shift must be 51 (GPU << 51u)");
+
+        assert_eq!(
+            VOXEL_POS_MASK, 0x7FFF,
+            "voxel_pos mask must be 0x7FFF (GPU)"
+        );
+        assert_eq!(BLOCK_ID_MASK, 0xF, "block_id mask must be 0xF (GPU)");
+        assert_eq!(AO_CORNERS_MASK, 0xFF, "ao_corners mask must be 0xFF (GPU)");
+        assert_eq!(
+            QUAD_ID_MASK, 0x1F_FFFF,
+            "quad_id mask must be 0x1FFFFF (GPU)"
+        );
+        assert_eq!(NORMAL_MASK, 0x7, "normal mask must be 0x7 (GPU)");
+        assert_eq!(DEPTH_MASK, 0x1FFF, "depth mask must be 0x1FFF (GPU)");
+
+        let e = VisBufEntry::pack(0x3BCD, 0xC, 0x5A, 0x1_4242, 5, 0x1FFF);
+        let raw = e.raw();
+        assert_eq!(raw & 0x7FFF, 0x3BCD, "voxel_pos at bit[0:15]");
+        assert_eq!((raw >> 15) & 0xF, 0xC, "block_id at bit[15:19]");
+        assert_eq!((raw >> 19) & 0xFF, 0x5A, "ao_corners at bit[19:27]");
+        assert_eq!((raw >> 27) & 0x1F_FFFF, 0x1_4242, "quad_id at bit[27:48]");
+        assert_eq!((raw >> 48) & 0x7, 5, "normal at bit[48:51]");
+        assert_eq!((raw >> 51) & 0x1FFF, 0x1FFF, "depth at bit[51:64]");
     }
 }

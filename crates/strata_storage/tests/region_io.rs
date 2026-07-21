@@ -211,6 +211,41 @@ fn region_malicious_sector_count_no_dos() {
     cleanup(&dir);
 }
 
+/// Undersized slot (size < SectorHeader) must Error in parse_slots — never slice-panic.
+#[test]
+fn region_undersized_slot_rejected_no_panic() {
+    let dir = temp_dir("region_undersized_slot");
+    let path = dir.join("r.0.0.0.strata");
+
+    // Craft: valid region magic/version, one slot with size=8 (< SectorHeader len).
+    let sector_header_len = std::mem::size_of::<SectorHeader>();
+    assert!(sector_header_len > 8);
+
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"STRG");
+    bytes.extend_from_slice(&1u16.to_le_bytes()); // version
+    bytes.extend_from_slice(&[0u8; 2]); // pad
+    bytes.extend_from_slice(&1u32.to_le_bytes()); // sector_count = 1
+    bytes.extend_from_slice(&20u64.to_le_bytes()); // payload_base (HEADER_LEN)
+    // Slot: offset=0, size=8 (too small for SectorHeader)
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&8u32.to_le_bytes());
+    // Tiny fake payload so EOF checks pass before header parse.
+    bytes.extend_from_slice(&[0u8; 8]);
+
+    fs::write(&path, &bytes).unwrap();
+
+    let result = std::panic::catch_unwind(|| RegionFile::open(&path));
+    assert!(result.is_ok(), "parse must not panic");
+    let open = result.unwrap();
+    assert!(
+        open.is_err(),
+        "slot size < SectorHeader must be rejected"
+    );
+
+    cleanup(&dir);
+}
+
 // Bug 5/6: read_sector on a file that became smaller than header must not panic.
 #[test]
 fn region_read_sector_truncated_file_no_panic() {

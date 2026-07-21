@@ -8,6 +8,64 @@ use crate::core_plugin::{FilterFirstDemoPlugin, StrataSchedulingPlugin};
 use crate::plugin::{AddStrataPlugin, RegisteredPlugins, StrataCorePlugins};
 use crate::sets::StrataSet;
 
+#[derive(Resource, Default)]
+struct SetOrder(Vec<StrataSet>);
+
+fn record_set(which: StrataSet) -> impl FnMut(ResMut<SetOrder>) {
+    move |mut order: ResMut<SetOrder>| {
+        order.0.push(which);
+    }
+}
+
+#[test]
+fn set_ordering_matches_plan() {
+    let mut app = App::new();
+    app.insert_resource(SetOrder::default());
+    app.configure_sets(
+        Update,
+        (
+            StrataSet::Streaming,
+            StrataSet::Input,
+            StrataSet::WorldGen,
+            StrataSet::Meshing,
+            StrataSet::Physics,
+            StrataSet::Lighting,
+            StrataSet::RenderUpdate,
+        )
+            .chain(),
+    );
+
+    app.add_systems(
+        Update,
+        (
+            record_set(StrataSet::Streaming).in_set(StrataSet::Streaming),
+            record_set(StrataSet::Input).in_set(StrataSet::Input),
+            record_set(StrataSet::WorldGen).in_set(StrataSet::WorldGen),
+            record_set(StrataSet::Meshing).in_set(StrataSet::Meshing),
+            record_set(StrataSet::Physics).in_set(StrataSet::Physics),
+            record_set(StrataSet::Lighting).in_set(StrataSet::Lighting),
+            record_set(StrataSet::RenderUpdate).in_set(StrataSet::RenderUpdate),
+        ),
+    );
+
+    app.update();
+
+    let order = &app.world().resource::<SetOrder>().0;
+    assert_eq!(
+        order,
+        &[
+            StrataSet::Streaming,
+            StrataSet::Input,
+            StrataSet::WorldGen,
+            StrataSet::Meshing,
+            StrataSet::Physics,
+            StrataSet::Lighting,
+            StrataSet::RenderUpdate,
+        ],
+        "System set execution order must match the plan"
+    );
+}
+
 #[test]
 fn filter_first_counts_only_dirty_sectors() {
     let mut app = App::new();
@@ -105,4 +163,21 @@ fn scheduling_sets_configured_and_run() {
     app.update();
     // If the StrataSet chain were misconfigured this would panic on ambiguity.
     let _ = StrataSet::RenderUpdate;
+}
+
+/// Remesh/physics/save consumers must still see `ChunkDirty` after a full
+/// Update cycle — blanket clearing before those processors is forbidden.
+#[test]
+fn chunk_dirty_survives_scheduling_update() {
+    let mut app = App::new();
+    app.add_strata_plugin(StrataSchedulingPlugin);
+    let e = app
+        .world_mut()
+        .spawn((SectorCoord(0, 0, 0), ChunkDirty))
+        .id();
+    app.update();
+    assert!(
+        app.world().get::<ChunkDirty>(e).is_some(),
+        "ChunkDirty must not be blanket-cleared every frame"
+    );
 }

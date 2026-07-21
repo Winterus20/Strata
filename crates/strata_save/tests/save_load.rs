@@ -143,3 +143,69 @@ fn migration_v1_to_v2() {
     let _ = path;
     cleanup(&dir);
 }
+
+/// Hash covers canonical header fields ‖ payload: mutating header must fail verify.
+#[test]
+fn envelope_hash_covers_header_fields() {
+    let payload = b"hello-save-payload";
+    let env = SaveEnvelope::pack(CURRENT_SAVE_VERSION, 3, payload).unwrap();
+    env.verify().unwrap();
+
+    let mut tampered_gen = env.clone();
+    tampered_gen.generator_version = 99;
+    assert!(
+        tampered_gen.verify().is_err(),
+        "mutating generator_version with same payload must fail verify"
+    );
+
+    let mut tampered_ver = env.clone();
+    tampered_ver.save_version = env.save_version.wrapping_add(10);
+    assert!(
+        tampered_ver.verify().is_err(),
+        "mutating save_version with same payload must fail verify"
+    );
+
+    let mut tampered_size = env.clone();
+    tampered_size.payload_size = env.payload_size.wrapping_add(1);
+    assert!(
+        tampered_size.verify().is_err(),
+        "mutating payload_size with same payload must fail verify"
+    );
+}
+
+/// Legacy v1 (payload-only hash) still opens; migrate/re-pack uses header‖payload domain.
+#[test]
+fn legacy_v1_payload_only_hash_still_loads() {
+    let payload = postcard::to_allocvec(&WorldMetadata {
+        seed: 1,
+        spawn_point: [0.0, 1.0, 2.0],
+        time_played: 0,
+        world_version: 1,
+        generator_version: 1,
+        last_modified: 0,
+    })
+    .unwrap();
+
+    // Simulate a hand-built v1 envelope with the old payload-only BLAKE3.
+    let legacy = SaveEnvelope {
+        magic: strata_save::envelope::MAGIC,
+        save_version: 1,
+        generator_version: 1,
+        payload_hash: blake3::hash(&payload).into(),
+        payload_size: payload.len() as u32,
+        signature: [0u8; 32],
+        payload: payload.clone(),
+    };
+    legacy
+        .verify()
+        .expect("v1 payload-only hash must still verify");
+
+    let dir = temp_dir("legacy_v1");
+    let path = dir.join("world.dat");
+    legacy.save(&path).unwrap();
+    let loaded = SaveEnvelope::open(&path).unwrap();
+    assert_eq!(loaded.save_version, 1);
+    assert_eq!(loaded.payload, payload);
+
+    cleanup(&dir);
+}

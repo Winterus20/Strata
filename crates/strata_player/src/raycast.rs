@@ -1,9 +1,9 @@
 //! Branchless voxel raycast over a single sector's [`XBrickMap`] (plan 06 §B.4).
 //!
 //! Uses an Amanatides-Woo (DDA) traversal in world space, converting to the
-//! sector's local voxel coordinates via its [`SectorCoord`]. Occupancy is tested
-//! with the branchless bitmask `XBrickMap::is_occupied` — no divergent `if` per
-//! voxel on the hot path.
+//! sector's local voxel coordinates via its [`SectorCoord`]. Hit testing is
+//! caller-supplied (typically [`BlockRegistry::is_solid`]) so break/place matches
+//! movement collision and skips liquids — no divergent `if` beyond the solid check.
 
 use bevy::prelude::*;
 use strata_core::prelude::*;
@@ -67,21 +67,23 @@ pub fn look_direction(look: &PlayerLook) -> Vec3 {
     Vec3::new(-cp * sy, sp, -cp * cy).normalize()
 }
 
-/// Cast a ray through `xbrick` from `origin` along `dir`, returning the first
-/// solid voxel (sector-local [`VoxelCoord`]) and the [`FaceNormal`] it was hit on.
+/// Cast a ray through `xbrick` from `origin` along `dir` (must be normalized),
+/// returning the first solid voxel (sector-local [`VoxelCoord`]) and the
+/// [`FaceNormal`] it was hit on.
 ///
-/// The traversal is confined to the sector's 32³ box; a ray that never enters or
-/// exits the sector without hitting solid returns `None`. Branchless occupancy is
-/// resolved via `is_occupied`; axis-step selection uses `select`-style min-of-t.
+/// `is_solid` decides whether a voxel stops the ray — use registry solidity
+/// (not raw `is_occupied`) so water/liquids are not break targets. The traversal
+/// is confined to the sector's 32³ box; axis-step selection uses `select`-style
+/// min-of-t.
 pub fn raycast_voxel(
     xbrick: &XBrickMap,
-    pool: &GlobalBrickPool,
+    _pool: &GlobalBrickPool,
     origin: Vec3,
     dir: Vec3,
     max_dist: f32,
+    is_solid: impl Fn(VoxelCoord) -> bool,
 ) -> Option<(VoxelCoord, FaceNormal, f32)> {
     let dim = SECTOR_DIM as f32;
-    let dir = dir.normalize();
     if dir == Vec3::ZERO {
         return None;
     }
@@ -115,8 +117,8 @@ pub fn raycast_voxel(
             entry_axis = axis as i32;
             entry_step = if d > 0.0 { 1 } else { -1 };
         }
-        if t1 < t_enter {
-            return None; // ray exits before entering -> box missed
+        if t1 <= t_enter {
+            return None; // ray exits before or at entry -> box missed
         }
     }
     if t_enter > max_dist {
@@ -198,7 +200,7 @@ pub fn raycast_voxel(
             return None; // ray left the sector without a hit
         }
         let c = VoxelCoord::new(vx as u32, vy as u32, vz as u32);
-        if xbrick.is_occupied(pool, c) {
+        if is_solid(c) {
             return Some((c, normal, t_enter + traveled));
         }
 
@@ -246,11 +248,19 @@ mod tests {
             &mut palette,
             VoxelCoord::new(5, 7, 3),
             BlockId(1),
-        );
+        )
+        .expect("test set_block");
         (map, pool, palette)
     }
 
     const REACH: f32 = 16.0;
+
+    fn occupied<'a>(
+        map: &'a XBrickMap,
+        pool: &'a GlobalBrickPool,
+    ) -> impl Fn(VoxelCoord) -> bool + 'a {
+        move |c| map.is_occupied(pool, c)
+    }
 
     #[test]
     fn hits_block_from_positive_x_face() {
@@ -258,7 +268,8 @@ mod tests {
         // Eye in air just outside the +X face, looking toward -X.
         let origin = Vec3::new(6.5, 7.5, 3.5);
         let dir = Vec3::new(-1.0, 0.0, 0.0);
-        let (v, n, _t) = raycast_voxel(&map, &pool, origin, dir, REACH).unwrap();
+        let (v, n, _t) =
+            raycast_voxel(&map, &pool, origin, dir, REACH, occupied(&map, &pool)).unwrap();
         assert_eq!(v, VoxelCoord::new(5, 7, 3));
         assert_eq!(n, FaceNormal::PosX); // entered through +X face
     }
@@ -268,7 +279,8 @@ mod tests {
         let (map, pool, _) = single_block_sector();
         let origin = Vec3::new(5.5, 7.5, 6.5);
         let dir = Vec3::new(0.0, 0.0, -1.0);
-        let (v, n, _t) = raycast_voxel(&map, &pool, origin, dir, REACH).unwrap();
+        let (v, n, _t) =
+            raycast_voxel(&map, &pool, origin, dir, REACH, occupied(&map, &pool)).unwrap();
         assert_eq!(v, VoxelCoord::new(5, 7, 3));
         // Player at +Z looking toward -Z sees the block's +Z face.
         assert_eq!(n, FaceNormal::PosZ);
@@ -279,7 +291,8 @@ mod tests {
         let (map, pool, _) = single_block_sector();
         let origin = Vec3::new(5.5, 5.5, 3.5);
         let dir = Vec3::new(0.0, 1.0, 0.0);
-        let (v, n, _t) = raycast_voxel(&map, &pool, origin, dir, REACH).unwrap();
+        let (v, n, _t) =
+            raycast_voxel(&map, &pool, origin, dir, REACH, occupied(&map, &pool)).unwrap();
         assert_eq!(v, VoxelCoord::new(5, 7, 3));
         assert_eq!(n, FaceNormal::NegY);
     }
@@ -289,7 +302,8 @@ mod tests {
         let (map, pool, _) = single_block_sector();
         let origin = Vec3::new(5.5, 9.5, 3.5);
         let dir = Vec3::new(0.0, -1.0, 0.0);
-        let (v, n, _t) = raycast_voxel(&map, &pool, origin, dir, REACH).unwrap();
+        let (v, n, _t) =
+            raycast_voxel(&map, &pool, origin, dir, REACH, occupied(&map, &pool)).unwrap();
         assert_eq!(v, VoxelCoord::new(5, 7, 3));
         assert_eq!(n, FaceNormal::PosY);
     }
@@ -299,6 +313,61 @@ mod tests {
         let (map, pool, _) = single_block_sector();
         let origin = Vec3::new(0.5, 7.5, 10.5);
         let dir = Vec3::new(1.0, 0.0, 0.0);
-        assert!(raycast_voxel(&map, &pool, origin, dir, REACH).is_none());
+        assert!(raycast_voxel(&map, &pool, origin, dir, REACH, occupied(&map, &pool)).is_none());
+    }
+
+    #[test]
+    fn misses_when_ray_starts_on_sector_face_pointing_outward() {
+        let (map, pool, _) = single_block_sector();
+        let origin = Vec3::new(32.0, 7.5, 3.5);
+        let dir = Vec3::new(1.0, 0.0, 0.0);
+        assert!(raycast_voxel(&map, &pool, origin, dir, REACH, occupied(&map, &pool)).is_none());
+    }
+
+    #[test]
+    fn skips_non_solid_liquid_to_hit_solid_behind() {
+        // Water is occupied but not solid (movement uses is_solid). Break/raycast
+        // must match so liquids are not false break targets.
+        let registry = load_block_registry();
+        let water = registry
+            .id_by_name("water")
+            .expect("water block in default registry");
+        let stone = registry.id_by_name("stone").unwrap_or(BlockId(1));
+        assert!(
+            !registry.is_solid(water),
+            "precondition: water must not be solid"
+        );
+
+        let mut pool = GlobalBrickPool::new();
+        let mut palette = SectorPalette::new();
+        let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+        map.set_block(
+            &mut pool,
+            &mut palette,
+            VoxelCoord::new(5, 7, 3),
+            water,
+        )
+        .expect("test water set_block");
+        map.set_block(
+            &mut pool,
+            &mut palette,
+            VoxelCoord::new(3, 7, 3),
+            stone,
+        )
+        .expect("test stone set_block");
+
+        let origin = Vec3::new(8.5, 7.5, 3.5);
+        let dir = Vec3::new(-1.0, 0.0, 0.0);
+        let is_solid = |c: VoxelCoord| {
+            let id = map.get_block(&pool, &palette, c);
+            id != BlockId::AIR && registry.is_solid(id)
+        };
+        let (v, _n, _t) = raycast_voxel(&map, &pool, origin, dir, REACH, is_solid)
+            .expect("must hit solid stone behind water");
+        assert_eq!(
+            v,
+            VoxelCoord::new(3, 7, 3),
+            "ray must skip water and hit stone"
+        );
     }
 }

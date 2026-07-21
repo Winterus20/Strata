@@ -43,9 +43,81 @@ use crate::pipeline::resolve::{
 /// `rgba16float` uses 8 bytes per texel (4 channels × half-float).
 const BYTES_PER_PIXEL: u32 = 8;
 
-/// Fullscreen-triangle blit that samples the offscreen HDR target and writes it
-/// to the window surface (M9b). Linear color is written directly (no tonemap);
-/// the surface format performs the final encoding conversion.
+/// Block albedo atlas tile size (texels). All registry PNGs are resized here.
+const BLOCK_TEX_SIZE: u32 = 16;
+
+/// Full mip chain length for a power-of-two square (`16 → 5` levels).
+#[inline]
+fn block_tex_mip_count(size: u32) -> u32 {
+    size.ilog2() + 1
+}
+
+/// Build mip 0..=N for a block albedo layer (box/triangle downsample).
+fn generate_block_tex_mips(base: &image::RgbaImage) -> Vec<image::RgbaImage> {
+    let mut mips = Vec::with_capacity(block_tex_mip_count(base.width().max(1)) as usize);
+    mips.push(base.clone());
+    let mut w = base.width().max(1);
+    let mut h = base.height().max(1);
+    while w > 1 || h > 1 {
+        w = (w / 2).max(1);
+        h = (h / 2).max(1);
+        let prev = mips.last().expect("mip0 present");
+        mips.push(image::imageops::resize(
+            prev,
+            w,
+            h,
+            image::imageops::FilterType::Triangle,
+        ));
+    }
+    mips
+}
+
+/// Bytes per entry in the fattest per-quad storage buffer bound as an entire
+/// SSBO in the resolve pass (`origins` = `vec4<f32>` at binding 8). Growth must
+/// keep `capacity * ORIGIN_BYTES_PER_QUAD ≤ max_storage_buffer_binding_size`.
+pub const ORIGIN_BYTES_PER_QUAD: usize = std::mem::size_of::<[f32; 4]>();
+
+/// Hard upper bound on global quad SSBO slots — matches visbuf `quad_id`
+/// (21 bits, up to 2M addressable indices). Growing past this is useless
+/// (ids wrap in the packer) and, for origins, exceeds common 128 MiB binding
+/// limits once capacity reaches 2²⁴ (256 MiB).
+pub const MAX_QUAD_SSBO_SLOTS: usize = 1 << 21;
+
+/// Largest power-of-two quad capacity that fits both the device storage
+/// binding limit (origins are the widest per-slot buffer) and
+/// [`MAX_QUAD_SSBO_SLOTS`].
+pub fn max_quad_ssbo_capacity(max_storage_buffer_binding_size: u64) -> usize {
+    let by_binding =
+        (max_storage_buffer_binding_size as usize) / ORIGIN_BYTES_PER_QUAD.max(1);
+    let capped = by_binding.min(MAX_QUAD_SSBO_SLOTS).max(1);
+    1usize << capped.ilog2()
+}
+
+/// Round SSBO quad capacity up to a power of two so
+/// `lightmap_mask = capacity - 1` is a valid bitmask index (not a soft clamp).
+/// Never exceeds `max_cap` (device + visbuf limit).
+pub(crate) fn next_quad_capacity(needed: usize, old_cap: usize, max_cap: usize) -> usize {
+    let max_cap = max_cap.max(1);
+    let raw = needed
+        .max(old_cap.saturating_mul(2))
+        .max(1)
+        .next_power_of_two();
+    raw.min(max_cap)
+}
+
+/// Inclusive end (byte/quad index, 4-aligned) of a lightmap region upload at
+/// global SSBO slot `base`. Callers must grow the lightmap to at least this
+/// before `Queue::write_buffer`.
+#[inline]
+pub(crate) fn lightmap_region_end(base: u32, byte_len: usize) -> usize {
+    let end = (base as usize).saturating_add(byte_len);
+    end.saturating_add(3) & !3
+}
+
+/// Fullscreen-triangle blit that samples the offscreen HDR target, applies
+/// ACES tonemapping + sRGB encoding, and writes the result to the window
+/// surface (M10b). Uses `textureLoad` (no sampler) so it works on adapters
+/// that lack `FLOAT16_FILTERABLE`.
 const BLIT_WGSL: &str = r#"
 @group(0) @binding(0) var src: texture_2d<f32>;
 
@@ -68,6 +140,24 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
     return out;
 }
 
+// Approximate filmic ACES tonemap (Narkowicz fit), branchless.
+fn aces(x: vec3<f32>) -> vec3<f32> {
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e), vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+// Linear -> sRGB transfer, branchless.
+fn linear_to_srgb(x: vec3<f32>) -> vec3<f32> {
+    let cutoff = vec3<f32>(0.0031308);
+    let lo = x * 12.92;
+    let hi = 1.055 * pow(x, vec3<f32>(0.41666)) - 0.055;
+    return select(hi, lo, x < cutoff);
+}
+
 // Filtering-independent blit: `src` is rgba16float which is non-filterable on
 // adapters without FLOAT16_FILTERABLE, so sampling with a filtering sampler
 // fails validation and the pass is silently skipped (black screen). textureLoad
@@ -75,7 +165,10 @@ fn vs(@builtin(vertex_index) vi: u32) -> VsOut {
 @fragment
 fn fs(in: VsOut) -> @location(0) vec4<f32> {
     let coord = vec2<i32>(i32(in.pos.x), i32(in.pos.y));
-    return textureLoad(src, coord, 0);
+    let hdr = textureLoad(src, coord, 0).rgb;
+    let mapped = aces(hdr);
+    let srgb = linear_to_srgb(mapped);
+    return vec4<f32>(srgb, 1.0);
 }
 "#;
 
@@ -101,6 +194,9 @@ pub struct Renderer {
     offscreen_view: TextureView,
     staging: Buffer,
     bytes_per_row: u32,
+    /// Cap for quad/origins/lightmap SSBO growth (device binding limit ∩
+    /// [`MAX_QUAD_SSBO_SLOTS`]). `ensure_quad_capacity` never allocates past this.
+    max_quad_capacity: usize,
     /// When true the resolve pass colors each voxel face by its direction
     /// (+X red, +Y green, ...) instead of Lambert shading — a debug aid for
     /// spotting missing/wrong faces.
@@ -248,6 +344,9 @@ impl Renderer {
             mapped_at_creation: false,
         });
 
+        let max_quad_capacity =
+            max_quad_ssbo_capacity(u64::from(device.limits().max_storage_buffer_binding_size));
+
         Self {
             device,
             queue,
@@ -257,6 +356,7 @@ impl Renderer {
             offscreen_view,
             staging,
             bytes_per_row,
+            max_quad_capacity,
             debug_faces: false,
             last_debug_dump: None,
             prepass: None,
@@ -276,6 +376,14 @@ impl Renderer {
     /// Borrow the GPU device (used by the client to configure its surface).
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Maximum quad SSBO slots this renderer will allocate (device binding
+    /// limit ∩ [`MAX_QUAD_SSBO_SLOTS`]). Slot allocators must not request past
+    /// this — origins at binding 8 are 16 B/slot and will fail validation.
+    #[inline]
+    pub fn max_quad_capacity(&self) -> usize {
+        self.max_quad_capacity
     }
 
     /// Lazily build the pre-pass GPU resources (pipeline, buffers, bind group)
@@ -362,8 +470,8 @@ impl Renderer {
             palette_size: 1,
             lightmap_mask: (SECTOR_LIGHTMAP_QUADS - 1) as u32,
             // M10a.3: pack the 4-byte AO curve into the high half of the
-            // uniform field. The default curve is the Exile / 0fps.net
-            // 0.18 / 0.25 / 0.39 / 1.0 stops. Without this, `ao_curve_lookup`
+            // uniform field. Default is plan 09 Exile approx
+            // [191, 210, 230, 255]. Without this, `ao_curve_lookup`
             // sees `lightmap_meta.z == 1 << 16` and indexes the wrong LUT
             // slot, producing a near-black multiplier and a fully black
             // frame. The fix: pre-pack `AO_CURVE_DEFAULT` via `pack_ao_curve`
@@ -422,14 +530,17 @@ impl Renderer {
                 ..wgpu::TextureViewDescriptor::default()
             });
 
+        // Mag Nearest keeps close-up pixel art; Linear min+mip kills distant
+        // moiré/ants. ClampToEdge (UV is already fract'd into [0,1)) avoids
+        // wrap bleed that reads as growing black grid lines at block edges.
         let block_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("strata_block_sampler"),
-            address_mode_u: wgpu::AddressMode::Repeat,
-            address_mode_v: wgpu::AddressMode::Repeat,
-            address_mode_w: wgpu::AddressMode::Repeat,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Linear,
             ..wgpu::SamplerDescriptor::default()
         });
 
@@ -733,6 +844,65 @@ impl Renderer {
         let blur_bgs: [BlurBindGroups; DEFAULT_MIP_COUNT as usize] =
             blur_bgs.try_into().expect("mip count matches");
 
+        // Downsample: fullscreen bilinear mip i → mip i+1. Uses the same
+        // bind group layout as blur (blur_src @3, blur_sampler @4) and a
+        // trivial fragment shader that just samples at the UV.
+        let downsample_pipeline = self
+            .device
+            .create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("strata_bloom_downsample_pipeline"),
+                layout: Some(&blur_pl),
+                vertex: VertexState {
+                    module: &module,
+                    entry_point: Some("vs_fullscreen"),
+                    buffers: &[],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(FragmentState {
+                    module: &module,
+                    entry_point: Some("fs_downsample"),
+                    targets: &[Some(ColorTargetState {
+                        format: TextureFormat::Rgba16Float,
+                        blend: None,
+                        write_mask: ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+        // Downsample bind groups: one per mip except the last. Entry i reads
+        // mip_views[i] (the source) via the blur BGL bindings (3=texture, 4=sampler).
+        let mut downsample_bgs: Vec<BindGroup> = Vec::with_capacity(mip_count.saturating_sub(1));
+        for (mip, view) in mip_views
+            .iter()
+            .enumerate()
+            .take(mip_count.saturating_sub(1))
+        {
+            let bg = self.device.create_bind_group(&BindGroupDescriptor {
+                label: Some(&format!("strata_bloom_downsample_bg_{mip}")),
+                layout: &blur_bgl,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 3,
+                        resource: BindingResource::TextureView(view),
+                    },
+                    BindGroupEntry {
+                        binding: 4,
+                        resource: BindingResource::Sampler(&sampler),
+                    },
+                ],
+            });
+            downsample_bgs.push(bg);
+        }
+
         // Composite: 5 mip textures + params + sampler.
         let composite_bgl = composite_bind_group_layout(&self.device, DEFAULT_MIP_COUNT);
         let composite_pl = self
@@ -827,6 +997,8 @@ impl Renderer {
             bright_pipeline,
             blur_h_pipelines,
             blur_v_pipelines,
+            downsample_pipeline,
+            downsample_bgs,
             composite_pipeline,
             mip_textures,
             mip_views,
@@ -981,11 +1153,21 @@ impl Renderer {
         // Grow the quad + origins + quad_ids + sector_ids SSBOs (and the
         // bind group) if the batch no longer fits.
         if quad_count > prepass.quad_capacity {
-            prepass.quad_buffer = make_quad_buffer(&self.device, quad_count);
-            prepass.origins_buffer = make_origins_buffer(&self.device, quad_count);
-            prepass.quad_ids_buffer = make_quad_ids_buffer(&self.device, quad_count);
-            prepass.sector_ids_buffer = make_sector_ids_buffer(&self.device, quad_count);
-            prepass.quad_capacity = quad_count;
+            let cap = next_quad_capacity(
+                quad_count,
+                prepass.quad_capacity,
+                self.max_quad_capacity,
+            );
+            if cap < quad_count {
+                // Past device/visbuf cap — refuse rather than allocate an
+                // illegal origins SSBO (resolve binding 8).
+                return;
+            }
+            prepass.quad_buffer = make_quad_buffer(&self.device, cap);
+            prepass.origins_buffer = make_origins_buffer(&self.device, cap);
+            prepass.quad_ids_buffer = make_quad_ids_buffer(&self.device, cap);
+            prepass.sector_ids_buffer = make_sector_ids_buffer(&self.device, cap);
+            prepass.quad_capacity = cap;
             prepass.bind_group = Self::make_bind_group(
                 &self.device,
                 &prepass.bgl,
@@ -1122,11 +1304,19 @@ impl Renderer {
         }
         let quad_count = bytes.len() / std::mem::size_of::<PackedQuadGpu>();
         if quad_count > prepass.quad_capacity {
-            prepass.quad_buffer = make_quad_buffer(&self.device, quad_count);
-            prepass.origins_buffer = make_origins_buffer(&self.device, quad_count);
-            prepass.quad_ids_buffer = make_quad_ids_buffer(&self.device, quad_count);
-            prepass.sector_ids_buffer = make_sector_ids_buffer(&self.device, quad_count);
-            prepass.quad_capacity = quad_count;
+            let cap = next_quad_capacity(
+                quad_count,
+                prepass.quad_capacity,
+                self.max_quad_capacity,
+            );
+            if cap < quad_count {
+                return;
+            }
+            prepass.quad_buffer = make_quad_buffer(&self.device, cap);
+            prepass.origins_buffer = make_origins_buffer(&self.device, cap);
+            prepass.quad_ids_buffer = make_quad_ids_buffer(&self.device, cap);
+            prepass.sector_ids_buffer = make_sector_ids_buffer(&self.device, cap);
+            prepass.quad_capacity = cap;
             prepass.bind_group = Self::make_bind_group(
                 &self.device,
                 &prepass.bgl,
@@ -1222,34 +1412,64 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
-    /// Upload a pre-flattened opaque-quad batch (and its parallel per-quad world
-    /// origins) into the GPU SSBOs, growing/rebinding the buffers if needed. No
-    /// camera or visbuf clear is touched — callers drive those separately so the
-    /// renderer can cache the buffer across frames and only re-upload on change.
+    /// Grow the quad + origins + lightmap SSBOs to hold at least `needed` quads,
+    /// rebuilding the bind group. Call before [`Renderer::upload_quad_region`] /
+    /// [`Renderer::upload_lightmap_region`] when the per-sector slot allocator
+    /// needs more room.
     ///
-    /// `origins` must be parallel to `bytes` (`quad_count` entries of `[f32;4]`,
-    /// `.xyz` = sector world offset).
-    /// Grow the quad + origins SSBOs to hold at least `needed` quads, rebuilding
-    /// the bind group. Call before [`Renderer::upload_quad_region`] when the
-    /// per-sector slot allocator needs more room; growing invalidates existing
-    /// slot contents, so the caller must re-upload all live sectors afterwards.
+    /// Capacity is the min of CPU staging and live GPU buffer sizes. After
+    /// [`Renderer::resize`] the pre-pass is dropped while staging stays large;
+    /// a staging-only check would early-return and leave the recreated lightmap
+    /// at its 32 KB default — then a global-slot `write_buffer` overruns.
+    ///
+    /// Never grows past [`Renderer::max_quad_capacity`] (device
+    /// `max_storage_buffer_binding_size` ÷ 16 B origins ∩ 21-bit visbuf). Requests
+    /// above the cap are clamped; the caller must recycle slots instead.
     pub fn ensure_quad_capacity(&mut self, needed: u32) {
-        let needed = needed as usize;
-        let old_cap = self.quad_upload_staging.len() / 8;
-        if needed <= old_cap {
+        let max_cap = self.max_quad_capacity;
+        let needed = (needed as usize).min(max_cap);
+        self.ensure_prepass();
+
+        let staging_cap = self.quad_upload_staging.len() / 8;
+        let (gpu_quad_cap, lightmap_cap) = match self.prepass.as_ref() {
+            Some(p) => (p.quad_capacity, p.lightmap.buffer().size() as usize),
+            None => {
+                // Pre-pass unavailable (missing device features). Still grow
+                // staging so a later successful ensure_prepass can catch up.
+                if needed > staging_cap {
+                    let new_cap = next_quad_capacity(needed, staging_cap, max_cap);
+                    self.quad_upload_staging.resize(new_cap * 8, 0);
+                    self.origin_upload_staging.resize(new_cap, [0.0; 4]);
+                    self.quad_id_upload_staging.resize(new_cap, 0);
+                    self.sector_id_upload_staging.resize(new_cap, 0);
+                }
+                return;
+            }
+        };
+
+        if needed <= staging_cap && needed <= gpu_quad_cap && needed <= lightmap_cap {
             return;
         }
-        let new_cap = needed.max(old_cap * 2).max(1);
-        self.quad_upload_staging.resize(new_cap * 8, 0);
-        self.origin_upload_staging.resize(new_cap, [0.0; 4]);
-        self.quad_id_upload_staging.resize(new_cap, 0);
-        self.sector_id_upload_staging.resize(new_cap, 0);
 
-        self.ensure_prepass();
-        let prepass = match self.prepass.as_mut() {
-            Some(p) => p,
-            None => return,
-        };
+        let new_cap = next_quad_capacity(
+            needed,
+            staging_cap.max(gpu_quad_cap).max(lightmap_cap),
+            max_cap,
+        );
+        // Already at the hard cap — refuse further growth (origins binding 8
+        // would exceed max_storage_buffer_binding_size past this point).
+        if new_cap <= gpu_quad_cap && new_cap <= staging_cap && new_cap <= lightmap_cap {
+            return;
+        }
+
+        if new_cap > staging_cap {
+            self.quad_upload_staging.resize(new_cap * 8, 0);
+            self.origin_upload_staging.resize(new_cap, [0.0; 4]);
+            self.quad_id_upload_staging.resize(new_cap, 0);
+            self.sector_id_upload_staging.resize(new_cap, 0);
+        }
+
+        let prepass = self.prepass.as_mut().expect("prepass checked above");
 
         let new_quad_buffer = make_quad_buffer(&self.device, new_cap);
         let new_origins_buffer = make_origins_buffer(&self.device, new_cap);
@@ -1257,47 +1477,56 @@ impl Renderer {
         let new_sector_ids_buffer = make_sector_ids_buffer(&self.device, new_cap);
         let new_lightmap = LightmapSSBO::new(&self.device, new_cap);
 
-        if old_cap > 0 {
+        // Copy only what the *GPU* buffers actually hold — never staging_cap
+        // (after resize, staging can be 2M while fresh GPU buffers are tiny).
+        let copy_quads = gpu_quad_cap.min(new_cap);
+        let copy_lightmap = (lightmap_cap.min(new_cap)) as u64;
+        if copy_quads > 0 || copy_lightmap > 0 {
             let mut encoder = self
                 .device
                 .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                     label: Some("strata_grow_copy"),
                 });
-            encoder.copy_buffer_to_buffer(
-                &prepass.quad_buffer,
-                0,
-                &new_quad_buffer,
-                0,
-                (old_cap as u64) * 8,
-            );
-            encoder.copy_buffer_to_buffer(
-                &prepass.origins_buffer,
-                0,
-                &new_origins_buffer,
-                0,
-                (old_cap as u64) * std::mem::size_of::<[f32; 4]>() as u64,
-            );
-            encoder.copy_buffer_to_buffer(
-                &prepass.quad_ids_buffer,
-                0,
-                &new_quad_ids_buffer,
-                0,
-                (old_cap as u64) * std::mem::size_of::<u32>() as u64,
-            );
-            encoder.copy_buffer_to_buffer(
-                &prepass.sector_ids_buffer,
-                0,
-                &new_sector_ids_buffer,
-                0,
-                (old_cap as u64) * std::mem::size_of::<u32>() as u64,
-            );
-            encoder.copy_buffer_to_buffer(
-                prepass.lightmap.buffer(),
-                0,
-                new_lightmap.buffer(),
-                0,
-                prepass.lightmap.buffer().size(),
-            );
+            if copy_quads > 0 {
+                let n = copy_quads as u64;
+                encoder.copy_buffer_to_buffer(
+                    &prepass.quad_buffer,
+                    0,
+                    &new_quad_buffer,
+                    0,
+                    n * 8,
+                );
+                encoder.copy_buffer_to_buffer(
+                    &prepass.origins_buffer,
+                    0,
+                    &new_origins_buffer,
+                    0,
+                    n * std::mem::size_of::<[f32; 4]>() as u64,
+                );
+                encoder.copy_buffer_to_buffer(
+                    &prepass.quad_ids_buffer,
+                    0,
+                    &new_quad_ids_buffer,
+                    0,
+                    n * std::mem::size_of::<u32>() as u64,
+                );
+                encoder.copy_buffer_to_buffer(
+                    &prepass.sector_ids_buffer,
+                    0,
+                    &new_sector_ids_buffer,
+                    0,
+                    n * std::mem::size_of::<u32>() as u64,
+                );
+            }
+            if copy_lightmap > 0 {
+                encoder.copy_buffer_to_buffer(
+                    prepass.lightmap.buffer(),
+                    0,
+                    new_lightmap.buffer(),
+                    0,
+                    copy_lightmap,
+                );
+            }
             self.queue.submit(std::iter::once(encoder.finish()));
         }
 
@@ -1308,8 +1537,10 @@ impl Renderer {
         prepass.lightmap = new_lightmap;
         prepass.quad_capacity = new_cap;
 
-        // Update lightmap mask to match new capacity
-        prepass.lightmap_meta.lightmap_mask = (new_cap - 1) as u32;
+        // Update lightmap mask to match new capacity (capacity is power-of-two
+        // so `quad_id & (cap - 1)` is a valid index, never past the array).
+        debug_assert!(new_cap.is_power_of_two() || new_cap == 0);
+        prepass.lightmap_meta.lightmap_mask = new_cap.saturating_sub(1) as u32;
         self.queue.write_buffer(
             &prepass.lightmap_meta_buffer,
             0,
@@ -1605,24 +1836,31 @@ impl Renderer {
                     image::RgbaImage::from_fn(16, 16, |_, _| image::Rgba([255, 0, 255, 255]))
                 }
             };
-            let img = if img.width() != 16 || img.height() != 16 {
-                image::imageops::resize(&img, 16, 16, image::imageops::FilterType::Nearest)
+            let img = if img.width() != BLOCK_TEX_SIZE || img.height() != BLOCK_TEX_SIZE {
+                image::imageops::resize(
+                    &img,
+                    BLOCK_TEX_SIZE,
+                    BLOCK_TEX_SIZE,
+                    image::imageops::FilterType::Nearest,
+                )
             } else {
                 img
             };
             layers.push(img);
         }
 
-        // 3. Create the 2D Texture Array
+        // 3. Create the 2D Texture Array with a full mip chain (16→8→4→2→1).
+        // Without mips, distant faces alias into grainy "ants" under Nearest.
         let layer_count = layers.len().max(1);
+        let mip_count = block_tex_mip_count(BLOCK_TEX_SIZE);
         let textures_array = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("strata_block_textures_array"),
             size: wgpu::Extent3d {
-                width: 16,
-                height: 16,
+                width: BLOCK_TEX_SIZE,
+                height: BLOCK_TEX_SIZE,
                 depth_or_array_layers: layer_count as u32,
             },
-            mip_level_count: 1,
+            mip_level_count: mip_count,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8UnormSrgb,
@@ -1631,52 +1869,59 @@ impl Renderer {
         });
 
         if layers.is_empty() {
-            // Write fallback magenta
-            let magenta_data = vec![255u8, 0, 255, 255].repeat(16 * 16);
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &textures_array,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                &magenta_data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(16 * 4),
-                    rows_per_image: Some(16),
-                },
-                wgpu::Extent3d {
-                    width: 16,
-                    height: 16,
-                    depth_or_array_layers: 1,
-                },
+            let magenta = image::RgbaImage::from_pixel(
+                BLOCK_TEX_SIZE,
+                BLOCK_TEX_SIZE,
+                image::Rgba([255, 0, 255, 255]),
             );
-        } else {
-            for (i, layer) in layers.iter().enumerate() {
+            for (level, mip) in generate_block_tex_mips(&magenta).iter().enumerate() {
                 self.queue.write_texture(
                     wgpu::TexelCopyTextureInfo {
                         texture: &textures_array,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d {
-                            x: 0,
-                            y: 0,
-                            z: i as u32,
-                        },
+                        mip_level: level as u32,
+                        origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
-                    layer.as_raw(),
+                    mip.as_raw(),
                     wgpu::TexelCopyBufferLayout {
                         offset: 0,
-                        bytes_per_row: Some(16 * 4),
-                        rows_per_image: Some(16),
+                        bytes_per_row: Some(mip.width() * 4),
+                        rows_per_image: Some(mip.height()),
                     },
                     wgpu::Extent3d {
-                        width: 16,
-                        height: 16,
+                        width: mip.width(),
+                        height: mip.height(),
                         depth_or_array_layers: 1,
                     },
                 );
+            }
+        } else {
+            for (i, layer) in layers.iter().enumerate() {
+                for (level, mip) in generate_block_tex_mips(layer).iter().enumerate() {
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &textures_array,
+                            mip_level: level as u32,
+                            origin: wgpu::Origin3d {
+                                x: 0,
+                                y: 0,
+                                z: i as u32,
+                            },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        mip.as_raw(),
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(mip.width() * 4),
+                            rows_per_image: Some(mip.height()),
+                        },
+                        wgpu::Extent3d {
+                            width: mip.width(),
+                            height: mip.height(),
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
             }
         }
 
@@ -1727,9 +1972,18 @@ impl Renderer {
         self.upload_lightmap_region(0, bytes);
     }
 
-    /// Upload one sector's per-quad lightmap to the GPU at the specified slot base offset.
+    /// Upload one sector's per-quad lightmap at global SSBO slot `base`.
+    ///
+    /// `base` is the same bump-allocator offset used by [`Self::upload_quad_region`],
+    /// not a sector-local index. Grows the lightmap SSBO when `base + len` exceeds
+    /// the current buffer (initial size is only [`SECTOR_LIGHTMAP_QUADS`]).
     pub fn upload_lightmap_region(&mut self, base: u32, bytes: &[LightmapEntry]) {
-        self.ensure_prepass();
+        if bytes.is_empty() {
+            return;
+        }
+        let needed = lightmap_region_end(base, bytes.len());
+        self.ensure_quad_capacity(needed as u32);
+
         let prepass = match self.prepass.as_mut() {
             Some(p) => p,
             None => return,
@@ -1750,12 +2004,10 @@ impl Renderer {
         }
     }
 
-    /// Upload a batch of per-quad ids (`quad_id_in_sector`) into the SSBO. The
-    /// pre-pass shader reads `quad_ids[instance_index]` to look up the
-    /// lightmap. The renderer auto-fills this buffer in its draw paths
-    /// (`render_frame`, `draw_quad_ranges`, `run_prepass`) with sequential
-    /// `0..N-1` ids, so the client only needs this entry point if it streams
-    /// quads into arbitrary SSBO slots.
+    /// Upload a batch of per-quad ids into the SSBO. Prefer identity: the
+    /// pre-pass writes `out.quad_id = instance_index` (global SSBO slot), which
+    /// matches `draw_quad_ranges` / `upload_lightmap_region` addressing. This
+    /// entry point remains for optional non-identity remaps.
     pub fn upload_quad_ids(&mut self, base: u32, ids: &[u32]) {
         self.ensure_prepass();
         let prepass = match self.prepass.as_mut() {
@@ -2236,7 +2488,30 @@ fn run_bloom(
         pass.draw(0..3, 0..1);
     }
 
-    // 2) Per-mip separable Gaussian. For each mip, alternate ping-pong so
+    // 2) Downsample chain: mip 0 → mip 1 → mip 2 → … so each mip has
+    // valid bright-extract data from its parent before the Gaussian blur
+    // is applied. The linear sampler does 2×2 bilinear averaging at half
+    // resolution, which is the standard half-res bloom downsample.
+    for mip in 0..mip_count.saturating_sub(1) {
+        let mut pass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some(&format!("strata_bloom_downsample_{mip}")),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &bloom.mip_views[mip + 1],
+                resolve_target: None,
+                depth_slice: None,
+                ops: Operations {
+                    load: LoadOp::Clear(Color::TRANSPARENT),
+                    store: StoreOp::Store,
+                },
+            })],
+            ..Default::default()
+        });
+        pass.set_pipeline(&bloom.downsample_pipeline);
+        pass.set_bind_group(0, &bloom.downsample_bgs[mip], &[]);
+        pass.draw(0..3, 0..1);
+    }
+
+    // 3) Per-mip separable Gaussian. For each mip, alternate ping-pong so
     // H reads mip_textures[i] and writes ping_textures[i], V reads
     // ping_textures[i] and writes mip_textures[i]. After both passes
     // mip_textures[i] holds the blurred output and is sampled by the
@@ -2283,7 +2558,7 @@ fn run_bloom(
         }
     }
 
-    // 3) Composite: additive blend of the mip pyramid into the HDR target.
+    // 4) Composite: additive blend of the mip pyramid into the HDR target.
     // The composite pipeline reads each mip at full-rate (it samples every
     // pixel) and writes a final color value with `intensity` baked in. We
     // use the standard blend equation (one / one) to add to whatever the
@@ -2753,7 +3028,7 @@ mod tests {
     /// M10a.4-dbg: round-trip for the resolve-fragment debug dump.
     /// Configures the dump on a 2x2x2 voxel, runs a frame, and asserts
     /// the SSBO receives the expected signals (lbyte non-zero, n_idx in
-    /// [0, 6), ao_mult in the [0.18, 1.0] AO-curve band).
+    /// [0, 6), ao_mult in the Exile AO-curve band ≈ [0.75, 1.0]).
     #[test]
     fn test_debug_dump_round_trip() {
         use crate::pipeline::resolve::debug_dump;
@@ -2859,8 +3134,8 @@ mod tests {
         let result = renderer
             .dump_debug("center")
             .expect("dump_debug returns Some when the pre-pass is available");
-        // ao_smooth in [0, 3], ao_i in {0,1,2,3}, ao_mult in [0.18, 1.0]
-        // (the 0fps curve endpoints), quad_id non-zero (the cube has at
+        // ao_smooth in [0, 3], ao_i in {0,1,2,3}, ao_mult in Exile band
+        // ≈ [0.75, 1.0] (AO_CURVE_DEFAULT), quad_id non-zero (the cube has at
         // least one quad), lbyte 0 (no light baked yet by the test).
         assert!(
             result[0] >= 0.0 && result[0] <= 3.0,
@@ -2872,9 +3147,10 @@ mod tests {
             "ao_i={} (must be 0..=3 after round)",
             result[1]
         );
+        let ao_floor = 191.0 / 255.0;
         assert!(
-            result[2] >= 0.18 - 1e-3 && result[2] <= 1.0 + 1e-3,
-            "ao_mult={} outside the [0.18, 1.0] AO-curve band",
+            result[2] >= ao_floor - 1e-3 && result[2] <= 1.0 + 1e-3,
+            "ao_mult={} outside the [{ao_floor}, 1.0] Exile AO-curve band",
             result[2]
         );
         // ao_corners is the packed 4-corner byte (4×2 bits, 0..255).
@@ -3071,5 +3347,200 @@ mod tests {
             renderer.quad_upload_staging.len() >= 102 * 8,
             "upload_quad_region must auto-grow staging to accommodate base + count"
         );
+    }
+
+    #[test]
+    fn lightmap_region_end_matches_panic_offsets() {
+        // Regression: Queue::write_buffer 1456936..1463624 into a 32768-byte
+        // lightmap — global slot base must force grow past SECTOR_LIGHTMAP_QUADS.
+        let base = 1_456_936u32;
+        let len = 1_463_624usize - 1_456_936;
+        let end = lightmap_region_end(base, len);
+        assert_eq!(end, 1_463_624);
+        assert!(
+            end > SECTOR_LIGHTMAP_QUADS,
+            "global slot uploads must exceed the legacy 32KB per-sector lightmap"
+        );
+        assert_eq!(lightmap_region_end(0, 1), 4, "wgpu COPY_BUFFER_ALIGNMENT pad");
+        assert_eq!(lightmap_region_end(100, 4), 104);
+    }
+
+    #[test]
+    fn upload_lightmap_region_grows_after_resize_drops_prepass() {
+        // Staging stays large across resize; GPU lightmap resets to 32KB.
+        // upload_lightmap_region at a high global base must re-grow, not panic.
+        let instance = Instance::new(&InstanceDescriptor {
+            backends: Backends::all(),
+            ..Default::default()
+        });
+        let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let (device, queue) = match pollster::block_on(adapter.request_device(&DeviceDescriptor {
+            label: Some("strata_test_device"),
+            required_features: prepass_features(),
+            ..Default::default()
+        })) {
+            Ok(dq) => dq,
+            Err(_) => return,
+        };
+        let mut renderer = Renderer::new(device, queue, 64, 64);
+        renderer.ensure_quad_capacity(1 << 20);
+        let staging_before = renderer.quad_upload_staging.len();
+        assert!(staging_before >= (1 << 20) * 8);
+
+        // Drop pre-pass (same as window resize); staging intentionally kept.
+        renderer.resize(128, 128);
+        assert!(renderer.prepass.is_none());
+        assert_eq!(renderer.quad_upload_staging.len(), staging_before);
+
+        let base = 100_000u32;
+        let data = vec![LightmapEntry(0x3C); 64];
+        renderer.upload_lightmap_region(base, &data);
+
+        let prepass = match renderer.prepass.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+        assert!(
+            prepass.lightmap.buffer().size() as usize >= lightmap_region_end(base, data.len()),
+            "lightmap must cover global slot base after resize recreate"
+        );
+    }
+
+    #[test]
+    fn ensure_quad_capacity_clamps_past_binding_limit() {
+        // Regression: requesting 2^24 slots used to allocate origins at
+        // 256 MiB and crash create_bind_group (binding 8 > 128 MiB limit).
+        let instance = Instance::new(&InstanceDescriptor {
+            backends: Backends::all(),
+            ..Default::default()
+        });
+        let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let (device, queue) = match pollster::block_on(adapter.request_device(&DeviceDescriptor {
+            label: Some("strata_test_device"),
+            required_features: prepass_features(),
+            ..Default::default()
+        })) {
+            Ok(dq) => dq,
+            Err(_) => return,
+        };
+        let limit = u64::from(device.limits().max_storage_buffer_binding_size);
+        let mut renderer = Renderer::new(device, queue, 64, 64);
+        let max = renderer.max_quad_capacity();
+        assert!(max * ORIGIN_BYTES_PER_QUAD <= limit as usize);
+        renderer.ensure_quad_capacity((1u32 << 24).max(max as u32 + 1));
+        let prepass = match renderer.prepass.as_ref() {
+            Some(p) => p,
+            None => return,
+        };
+        assert!(
+            prepass.quad_capacity <= max,
+            "cap {} must stay ≤ max {}",
+            prepass.quad_capacity,
+            max
+        );
+        assert!(
+            prepass.origins_buffer.size() as usize <= limit as usize,
+            "origins binding 8 size {} exceeds device limit {}",
+            prepass.origins_buffer.size(),
+            limit
+        );
+    }
+
+    #[test]
+    fn next_quad_capacity_is_always_power_of_two() {
+        // Non-PoT needed must round up so lightmap_mask = cap-1 is a bitmask.
+        let max = MAX_QUAD_SSBO_SLOTS;
+        assert_eq!(next_quad_capacity(100, 0, max), 128);
+        assert_eq!(next_quad_capacity(1, 0, max), 1);
+        assert_eq!(next_quad_capacity(2048, 0, max), 2048);
+        assert_eq!(next_quad_capacity(100, 64, max), 128);
+        assert_eq!(next_quad_capacity(300, 128, max), 512); // max(300, 256) → 512
+        for needed in [3usize, 7, 9, 100, 1000, 3000] {
+            let cap = next_quad_capacity(needed, 0, max);
+            assert!(
+                cap.is_power_of_two() && cap >= needed,
+                "cap={cap} needed={needed}"
+            );
+            let mask = cap.saturating_sub(1);
+            assert_eq!(
+                9999 & mask,
+                9999 % cap,
+                "mask must equal capacity-1 for PoT"
+            );
+        }
+    }
+
+    #[test]
+    fn next_quad_capacity_never_exceeds_max() {
+        let max = MAX_QUAD_SSBO_SLOTS;
+        // Doubling past 2M (the crash path: 2^21 → 2^22 → … → 2^24 origins = 256 MiB)
+        // must clamp instead of allocating past the device binding limit.
+        assert_eq!(next_quad_capacity(1 << 24, 0, max), max);
+        assert_eq!(next_quad_capacity(1 << 22, 1 << 21, max), max);
+        assert_eq!(next_quad_capacity(100, 0, 64), 64);
+        assert!(next_quad_capacity(1 << 20, 1 << 20, max) <= max);
+    }
+
+    #[test]
+    fn max_quad_ssbo_capacity_keeps_origins_under_binding_limit() {
+        // Default wgpu limit on many adapters (matches the crash report).
+        let limit = 134_217_728u64; // 128 MiB
+        let cap = max_quad_ssbo_capacity(limit);
+        assert!(cap.is_power_of_two());
+        assert!(cap <= MAX_QUAD_SSBO_SLOTS);
+        assert!(
+            cap * ORIGIN_BYTES_PER_QUAD <= limit as usize,
+            "origins SSBO (binding 8) must fit: {cap}×16 > {limit}"
+        );
+        // Tiny limit floors to a PoT that still fits.
+        let tiny = max_quad_ssbo_capacity(16 * 1024);
+        assert!(tiny * ORIGIN_BYTES_PER_QUAD <= 16 * 1024);
+        assert!(tiny.is_power_of_two());
+    }
+
+    #[test]
+    fn prepass_wgsl_quad_id_is_instance_index() {
+        use crate::pipeline::prepass::PREPASS_WGSL;
+        assert!(
+            PREPASS_WGSL.contains("out.quad_id = ii;"),
+            "prepass must assign global SSBO slot (instance_index) as quad_id \
+             so lightmap[base+i] matches visbuf.quad_id under draw_quad_ranges"
+        );
+        assert!(
+            !PREPASS_WGSL.contains("quad_ids[min(ii"),
+            "prepass must not index the (unfilled) quad_ids SSBO for lightmap id"
+        );
+        assert!(
+            PREPASS_WGSL.contains("let expand = 0.01 + 0.04 * clamp(dist")
+                && PREPASS_WGSL.contains("p[uaxis] = p[uaxis] + f32(du * w)"),
+            "prepass must distance-expand greedy faces to close sub-pixel cracks"
+        );
+    }
+
+    #[test]
+    fn block_tex_mips_cover_full_chain() {
+        assert_eq!(block_tex_mip_count(16), 5);
+        let base = image::RgbaImage::from_pixel(16, 16, image::Rgba([10, 20, 30, 255]));
+        let mips = generate_block_tex_mips(&base);
+        assert_eq!(mips.len(), 5);
+        assert_eq!((mips[0].width(), mips[0].height()), (16, 16));
+        assert_eq!((mips[1].width(), mips[1].height()), (8, 8));
+        assert_eq!((mips[2].width(), mips[2].height()), (4, 4));
+        assert_eq!((mips[3].width(), mips[3].height()), (2, 2));
+        assert_eq!((mips[4].width(), mips[4].height()), (1, 1));
     }
 }

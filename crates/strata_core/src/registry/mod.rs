@@ -260,6 +260,10 @@ impl crate::plugin::StrataPlugin for BlockRegistryPlugin {
 
 // ── Sector-local palette (XBrickMap bridge, plan 05 §14 / 06 §1.4) ──────────
 
+/// Returned when a sector already holds 256 distinct block types (plan 05 §20).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaletteFullError;
+
 /// Sector-local mapping from a compact `u8` palette index (stored per voxel in
 /// the XBrickMap) to a `BlockId`. Index 0 is permanently AIR.
 ///
@@ -306,21 +310,20 @@ impl SectorPalette {
     /// Find (or create) the local index for `block`. Returns the `u8` index that
     /// gets written into the XBrickMap. AIR always maps to 0.
     ///
-    /// Fails fast if the sector ever exceeds 255 distinct block types (plan 05 §20:
-    /// no truncation, no LRU — silent corruption of `resolve` is unacceptable).
+    /// Returns [`PaletteFullError`] when the sector would exceed 255 distinct
+    /// block types (plan 05 §20: no truncation, no LRU).
     #[inline]
-    pub fn get_or_insert(&mut self, block: BlockId) -> u8 {
+    pub fn get_or_insert(&mut self, block: BlockId) -> Result<u8, PaletteFullError> {
         if let Some(&idx) = self.reverse.get(&block) {
-            return idx;
+            return Ok(idx);
         }
-        assert!(
-            self.entries.len() < 256,
-            "SectorPalette full: >255 distinct block types in one 32³ sector (plan 05 §20)"
-        );
+        if self.entries.len() >= 256 {
+            return Err(PaletteFullError);
+        }
         let idx = self.entries.len() as u8;
         self.entries.push(block);
         self.reverse.insert(block, idx);
-        idx
+        Ok(idx)
     }
 
     /// Resolve a local index back to a `BlockId`.
@@ -438,14 +441,28 @@ mod tests {
     #[test]
     fn sector_palette_get_or_insert_unique() {
         let mut p = SectorPalette::new();
-        assert_eq!(p.get_or_insert(BlockId::AIR), 0);
-        let s = p.get_or_insert(BlockId(1));
-        let s2 = p.get_or_insert(BlockId(1));
+        assert_eq!(p.get_or_insert(BlockId::AIR).unwrap(), 0);
+        let s = p.get_or_insert(BlockId(1)).unwrap();
+        let s2 = p.get_or_insert(BlockId(1)).unwrap();
         assert_eq!(s, s2, "same block must reuse index");
-        let d = p.get_or_insert(BlockId(2));
+        let d = p.get_or_insert(BlockId(2)).unwrap();
         assert_ne!(s, d);
         assert_eq!(p.resolve(s), BlockId(1));
         assert_eq!(p.resolve(d), BlockId(2));
         assert_eq!(p.resolve(0), BlockId::AIR);
+    }
+
+    #[test]
+    fn sector_palette_full_returns_err() {
+        let mut p = SectorPalette::new();
+        for i in 1u16..256 {
+            p.get_or_insert(BlockId(i)).unwrap();
+        }
+        assert_eq!(p.len(), 256);
+        assert_eq!(
+            p.get_or_insert(BlockId(999)),
+            Err(PaletteFullError),
+            "256th distinct non-AIR insert must fail closed (plan 05 §20)"
+        );
     }
 }

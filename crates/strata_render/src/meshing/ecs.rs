@@ -138,6 +138,9 @@ struct PendingMeshTask {
     task: Task<MeshData>,
     /// Neighbor-residency mask captured at spawn time (drives `remesh-on-load`).
     present_mask: u8,
+    /// True when neighbor planes were skipped despite some neighbors being
+    /// resident — apply re-queues `NeedsRemesh` so a repair pass fills them.
+    planes_skipped: bool,
 }
 
 /// Meshing plugin: registers the spawn + apply systems in the `Meshing` set.
@@ -175,6 +178,48 @@ fn neighbor_offsets(coord: SectorCoord) -> [SectorCoord; 6] {
     ]
 }
 
+/// Pack a residency bit per neighbor direction (bit `i` = neighbor `i` present).
+/// Always computed from live residency — even when plane fill is skipped — so
+/// `remesh-on-load` can see which neighbors existed at mesh time.
+pub(crate) fn neighbor_present_mask(neighbor_resident: [bool; 6]) -> u8 {
+    let mut mask = 0u8;
+    for (i, present) in neighbor_resident.iter().enumerate() {
+        if *present {
+            mask |= 1u8 << i;
+        }
+    }
+    mask
+}
+
+/// Skip filling neighbor boundary planes only on the *first* mesh of a sector
+/// during a streaming burst. Repair remeshes (`already_meshed`) always fill
+/// planes so dual-skip cannot leave permanent seams.
+pub(crate) fn should_skip_neighbor_planes(
+    already_meshed: bool,
+    shell_incomplete: bool,
+    pending_nonempty: bool,
+) -> bool {
+    if already_meshed {
+        return false;
+    }
+    shell_incomplete || pending_nonempty
+}
+
+/// Re-queue boundary remesh when planes were skipped while neighbors were present.
+pub(crate) fn needs_boundary_repair(planes_skipped: bool, present_mask: u8) -> bool {
+    planes_skipped && present_mask != 0
+}
+
+/// Drop mesh bookkeeping for sectors that are no longer resident.
+pub(crate) fn retain_resident_mesh_state(
+    storage: &mut MeshStorage,
+    is_resident: impl Fn(&SectorCoord) -> bool,
+) {
+    storage.meshes.retain(|c, _| is_resident(c));
+    storage.neighbor_mask.retain(|c, _| is_resident(c));
+    storage.dirty.retain(|c| is_resident(c));
+}
+
 /// Snapshot dirty sectors into owned buffers and spawn background meshing tasks.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_mesh_tasks(
@@ -185,6 +230,7 @@ pub fn spawn_mesh_tasks(
     dirty: Query<(Entity, &SectorCoord, &XBrickMap, &SectorPalette), With<NeedsRemesh>>,
     all: Query<(Entity, &SectorCoord, &XBrickMap, &SectorPalette)>,
     mut pending: ResMut<PendingMesh>,
+    storage: Res<MeshStorage>,
     mut timers: ResMut<MeshingTimers>,
     wg_timers: Option<Res<strata_world::plugin::WorldGenTimers>>,
     stream_timers: Option<Res<strata_world::streaming::StreamingTimers>>,
@@ -234,10 +280,9 @@ pub fn spawn_mesh_tasks(
     } else {
         MESH_BUDGET
     };
-    let skip_neighbor_planes = streaming
+    let shell_incomplete = streaming
         .as_ref()
-        .is_some_and(|s| s.resident_count() < FULL_SHELL_SECTORS)
-        || !pending.tasks.is_empty();
+        .is_some_and(|s| s.resident_count() < FULL_SHELL_SECTORS);
     let snapshot_deadline =
         std::time::Instant::now() + std::time::Duration::from_micros(SNAPSHOT_BUDGET_US);
     for (entity, coord, sector, palette) in work {
@@ -255,6 +300,7 @@ pub fn spawn_mesh_tasks(
                 PendingMeshTask {
                     task,
                     present_mask: 0,
+                    planes_skipped: false,
                 },
             );
             commands.entity(entity).remove::<NeedsRemesh>();
@@ -262,6 +308,13 @@ pub fn spawn_mesh_tasks(
             timers.spawned += 1;
             continue;
         }
+
+        let already_meshed = storage.meshes.contains_key(coord);
+        let skip_neighbor_planes = should_skip_neighbor_planes(
+            already_meshed,
+            shell_incomplete,
+            !pending.tasks.is_empty(),
+        );
 
         let pool_guard = pool.read_inner();
         let snap: Arc<[BlockId; SNAPSHOT_LEN]> = MESH_SCRATCH.with(|cell| {
@@ -271,28 +324,30 @@ pub fn spawn_mesh_tasks(
         });
         let mut planes: [BoundaryPlane; 6] = [[BlockId::AIR; PLANE_LEN]; 6];
         let mut plane_present = [false; 6];
-        let mut present_mask: u8 = 0;
-        if !skip_neighbor_planes {
-            let offsets = neighbor_offsets(*coord);
-            for i in 0..6 {
-                let ne = if let Some(ref sm) = streaming {
-                    sm.entity_for(&offsets[i])
-                } else {
-                    all.iter()
-                        .find(|(_, c, _, _)| **c == offsets[i])
-                        .map(|(e, _, _, _)| e)
-                };
-                if let Some(ne) = ne
-                    && let Ok((_, _, m, p)) = all.get(ne)
-                {
-                    present_mask |= 1u8 << i;
-                    if m.sector_mask != 0 {
-                        fill_boundary_plane_locked(m, &pool_guard, p, i, &mut planes[i]);
-                        plane_present[i] = true;
-                    }
+        let mut neighbor_resident = [false; 6];
+        let offsets = neighbor_offsets(*coord);
+        for i in 0..6 {
+            let ne = if let Some(ref sm) = streaming {
+                sm.entity_for(&offsets[i])
+            } else {
+                all.iter()
+                    .find(|(_, c, _, _)| **c == offsets[i])
+                    .map(|(e, _, _, _)| e)
+            };
+            if let Some(ne) = ne
+                && let Ok((_, _, m, p)) = all.get(ne)
+            {
+                neighbor_resident[i] = true;
+                // Plane fill may be skipped for streaming FPS, but residency
+                // bits must still be recorded for remesh-on-load.
+                if !skip_neighbor_planes && m.sector_mask != 0 {
+                    fill_boundary_plane_locked(m, &pool_guard, p, i, &mut planes[i]);
+                    plane_present[i] = true;
                 }
             }
         }
+        let present_mask = neighbor_present_mask(neighbor_resident);
+        let planes_skipped = needs_boundary_repair(skip_neighbor_planes, present_mask);
         drop(pool_guard);
 
         let reg = registry_arc.clone();
@@ -310,9 +365,14 @@ pub fn spawn_mesh_tasks(
             mesher.mesh_sector_planes(&snap, &plane_refs, &reg, None)
         });
 
-        pending
-            .tasks
-            .insert(*coord, PendingMeshTask { task, present_mask });
+        pending.tasks.insert(
+            *coord,
+            PendingMeshTask {
+                task,
+                present_mask,
+                planes_skipped,
+            },
+        );
         commands.entity(entity).remove::<NeedsRemesh>();
         budget -= 1;
         timers.spawned += 1;
@@ -376,6 +436,12 @@ pub fn apply_mesh_tasks(
         };
         if let Some(ne) = entity {
             commands.entity(ne).insert(Meshed);
+            // First-pass mesh skipped neighbor planes while neighbors were
+            // resident: re-queue so the repair pass (already_meshed → no skip)
+            // fills boundary faces and clears permanent seams.
+            if needs_boundary_repair(mt.planes_skipped, mt.present_mask) {
+                commands.entity(ne).insert(NeedsRemesh);
+            }
         }
 
         // remesh-on-load: any resident neighbor that was built while WE were
@@ -419,8 +485,7 @@ fn cleanup_unloaded_meshes(
     if storage.meshes.len() <= sm.resident_count() {
         return;
     }
-    storage.meshes.retain(|c, _| sm.is_resident(c));
-    storage.neighbor_mask.retain(|c, _| sm.is_resident(c));
+    retain_resident_mesh_state(&mut storage, |c| sm.is_resident(c));
 }
 
 #[cfg(test)]
@@ -436,6 +501,61 @@ mod tests {
             // worker tasks can share it without an extra Box allocation.
             let type_name = std::any::type_name::<Arc<[BlockId; SNAPSHOT_LEN]>>();
             assert!(std::any::type_name::<Arc<[BlockId; SNAPSHOT_LEN]>>() == type_name);
+            let _ = buf;
         });
+    }
+
+    #[test]
+    fn present_mask_records_residency_even_when_planes_skipped() {
+        // Dual-sector streaming burst: both neighbors resident, planes skipped.
+        let resident = [true, false, false, false, false, false];
+        let mask = neighbor_present_mask(resident);
+        assert_eq!(mask, 1 << 0, " +X neighbor must set bit 0");
+        assert!(
+            needs_boundary_repair(true, mask),
+            "skip + present neighbors must re-queue boundary repair"
+        );
+        assert!(
+            !needs_boundary_repair(true, 0),
+            "skip with no neighbors needs no repair"
+        );
+    }
+
+    #[test]
+    fn dual_sector_skip_then_repair_disables_skip() {
+        // First mesh during shell fill may skip planes.
+        assert!(should_skip_neighbor_planes(false, true, true));
+        // After apply inserts the mesh, repair remesh must fill planes.
+        assert!(
+            !should_skip_neighbor_planes(true, true, true),
+            "already-meshed repair pass must not skip neighbor planes"
+        );
+        // Steady state: no skip.
+        assert!(!should_skip_neighbor_planes(false, false, false));
+    }
+
+    #[test]
+    fn unload_retains_only_resident_dirty_coords() {
+        let mut storage = MeshStorage::default();
+        let keep = SectorCoord(0, 0, 0);
+        let drop = SectorCoord(1, 0, 0);
+        storage.meshes.insert(keep, MeshData::default());
+        storage.meshes.insert(drop, MeshData::default());
+        storage.neighbor_mask.insert(keep, 0x3F);
+        storage.neighbor_mask.insert(drop, 0x01);
+        storage.dirty.insert(keep);
+        storage.dirty.insert(drop);
+
+        retain_resident_mesh_state(&mut storage, |c| *c == keep);
+
+        assert!(storage.meshes.contains_key(&keep));
+        assert!(!storage.meshes.contains_key(&drop));
+        assert!(storage.neighbor_mask.contains_key(&keep));
+        assert!(!storage.neighbor_mask.contains_key(&drop));
+        assert!(storage.dirty.contains(&keep));
+        assert!(
+            !storage.dirty.contains(&drop),
+            "dirty must drop unloaded coords so the renderer never scans ghosts"
+        );
     }
 }

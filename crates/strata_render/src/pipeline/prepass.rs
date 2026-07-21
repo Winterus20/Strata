@@ -36,9 +36,10 @@ struct PackedQuad {
 // Per-quad world origin (sector_coord * 32) so every sector's local 0..31 quad
 // geometry is placed at its real world position. `.xyz` used; `.w` is padding.
 @group(0) @binding(3) var<storage, read> origins: array<vec4<f32>>;
-// `instance_index` -> per-sector quad id (0..N-1), uploaded by the renderer as
-// the quad sits in the SSBO. Used for the lightmap SSBO lookup in the resolve
-// pass; the resolve shader is otherwise blind to the SSBO offset.
+// Reserved remapping slot (identity today). Draw paths use
+// `draw(0..6, base..base+count)` so `instance_index` is already the global
+// SSBO / lightmap slot — see `out.quad_id = ii` below. Kept live so the bind
+// group layout stays stable for optional non-identity uploads.
 @group(0) @binding(4) var<storage, read> quad_ids: array<u32>;
 // M11 visbuf v2: per-quad sector id (0..N-1 over the meshes in the AOI). Lets
 // the resolve shader disambiguate pixels when multiple sectors' quads are
@@ -112,13 +113,25 @@ fn vs_main(@builtin(vertex_index) vi: u32,
   let vaxis = (axis + 2u) % 3u;
 
   var p = vec3<f32>(f32(x), f32(y), f32(z));
-  p[uaxis] = p[uaxis] + f32(du * w);
-  p[vaxis] = p[vaxis] + f32(dv * h);
   // The CPU packs the owning voxel (0..31) to keep the 5-bit position field from
   // overflowing at the sector boundary (a +d face plane would be 32). Advance +d
   // faces (even face index) by one voxel here, in float space, to reach the true
   // plane. `-d` faces (odd index) stay at the owning voxel.
   p[axis] = p[axis] + f32(1u - (face & 1u));
+  // Distance-aware UV-plane expand: adjacent greedy quads / sector T-junctions
+  // leave sub-pixel gaps under perspective. Uncovered visbuf pixels stay at the
+  // cleared sentinel → resolve draws sky/fog, which reads as a black grid that
+  // thickens with distance. 0.0015 was far too small once a voxel is ~1px.
+  // Near: ~1cm seals seams; far: up to ~5cm so coverage still spans a pixel.
+  // Expand stays in-plane (no normal push) to avoid z-fight with coplanar faces.
+  var p_est = p;
+  p_est[uaxis] = p_est[uaxis] + 0.5 * f32(w);
+  p_est[vaxis] = p_est[vaxis] + 0.5 * f32(h);
+  p_est = p_est + origins[ii].xyz;
+  let dist = length(p_est - cam.eye.xyz);
+  let expand = 0.01 + 0.04 * clamp(dist * (1.0 / 160.0), 0.0, 1.0);
+  p[uaxis] = p[uaxis] + f32(du * w) + (f32(du) * 2.0 - 1.0) * expand;
+  p[vaxis] = p[vaxis] + f32(dv * h) + (f32(dv) * 2.0 - 1.0) * expand;
   // Translate sector-local coords into world space by the per-quad origin.
   p = p + origins[ii].xyz;
 
@@ -126,11 +139,15 @@ fn vs_main(@builtin(vertex_index) vi: u32,
 
   var out: VOut;
   out.pos = clip;
-  // 15-bit local voxel position packed into the low 16 visbuf bits.
+  // 15-bit local voxel position (5+5+5) for visbuf v5.
   out.voxel_pos = x | (y << 5u) | (z << 10u);
   out.normal = face;
   out.block_id = block_id & 0xFu;
   out.ao_corners = ao_byte;
+  // Global SSBO slot == lightmap index when draws use first_instance=base.
+  // Keep quad_ids / sector_ids bindings live (layout + optional remapping).
+  let _qid_keep = arrayLength(&quad_ids);
+  let _sid_keep = arrayLength(&sector_ids);
   out.quad_id = ii;
   out.sector_id = sector_ids[ii] & 0xFu;
   return out;
@@ -140,27 +157,24 @@ fn vs_main(@builtin(vertex_index) vi: u32,
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   // WebGPU NDC depth: position.z in [0,1], 0 = near, 1 = far. Reversed-Z so a
   // nearer fragment yields a larger magnitude and wins the atomicMax.
-  // M12 visbuf v3: depth reduced from 13 → 9 bits to give quad_id 20 bits
-  // (16 was insufficient for 100K+ quads in large AOIs — the truncation caused
-  // the resolve shader to read the wrong quad's AO, producing brightness
-  // flickering on camera movement). 9 bits = 512 levels; at 250 m that is
-  // ~0.24 m precision, more than enough for the ACES-tonemap pipeline.
+  // M12 visbuf v5: 13-bit reversed-Z depth; 21-bit quad_id (up to 2M SSBO slots).
   let rev = 1.0 - in.pos.z;
   let depth = u32(rev * 8191.0);
 
-  // Visbuf layout:
-  //   bit[0:16]   voxel_pos,
-  //   bit[16:20]  block_id   (4b),
-  //   bit[20:24]  sector_id  (4b),
-  //   bit[24:32]  ao_corners (8b = 4 corners x 2b),
-  //   bit[32:48]  quad_id    (16b),
+  // Visbuf layout (v5):
+  //   bit[0:15]   voxel_pos  (15b),
+  //   bit[15:19]  block_id   (4b),
+  //   bit[19:27]  ao_corners (8b = 4 corners x 2b),
+  //   bit[27:48]  quad_id    (21b, global SSBO / lightmap slot),
   //   bit[48:51]  normal     (3b),
   //   bit[51:64]  depth      (13b, reversed-Z).
-  let entry = (u64(in.voxel_pos) & u64(0xFFFFu))
-            | ((u64(in.block_id) & u64(0xFu)) << 16u)
-            | ((u64(in.sector_id) & u64(0xFu)) << 20u)
-            | ((u64(in.ao_corners) & u64(0xFFu)) << 24u)
-            | ((u64(in.quad_id) & u64(0xFFFFu)) << 32u)
+  // sector_id stays on the interpolant for binding liveness but is not packed;
+  // those bits extend quad_id past the old 64K truncation.
+  let _sid_alive = in.sector_id;
+  let entry = (u64(in.voxel_pos) & u64(0x7FFFu))
+            | ((u64(in.block_id) & u64(0xFu)) << 15u)
+            | ((u64(in.ao_corners) & u64(0xFFu)) << 19u)
+            | ((u64(in.quad_id) & u64(0x1FFFFFu)) << 27u)
             | ((u64(in.normal) & u64(0x7u)) << 48u)
             | ((u64(depth) & u64(0x1FFFu)) << 51u);
 

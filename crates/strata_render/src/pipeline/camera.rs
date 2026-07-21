@@ -9,12 +9,13 @@ use bytemuck::{Pod, Zeroable};
 /// Host mirror of the WGSL `CameraView` uniform (see `prepass.rs`).
 ///
 /// Offsets (column-major `f32`):
-/// * `0`   — `eye`      : `vec4<f32>` (xyz used, w padding)
-/// * `16`  — `view`     : `mat4x4<f32>` (64 bytes)
-/// * `80`  — `proj`     : `mat4x4<f32>` (64 bytes)
-/// * `144` — `width`    : `u32`
-/// * `148` — `height`   : `u32`
-/// * `152` — `_pad`     : `u32` x2 (16-byte alignment)
+/// * `0`   — `eye`          : `vec4<f32>` (xyz used, w padding, 16 bytes)
+/// * `16`  — `view`         : `mat4x4<f32>` (64 bytes)
+/// * `80`  — `proj`         : `mat4x4<f32>` (64 bytes)
+/// * `144` — `inv_view_proj`: `mat4x4<f32>` (64 bytes)
+/// * `208` — `width`        : `u32` (4 bytes)
+/// * `212` — `height`       : `u32` (4 bytes)
+/// * `216` — `_pad`         : `u32` x2 (8 bytes; pads total to 224, WGSL 16-byte aligned)
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Pod, Zeroable)]
 pub struct CameraView {
@@ -80,7 +81,7 @@ fn invert_mat4(m: &[f32; 16]) -> Option<[f32; 16]> {
     let c5 = m[10] * m[15] - m[11] * m[14];
 
     let det = s0 * c5 - s1 * c4 + s2 * c3 + s3 * c2 - s4 * c1 + s5 * c0;
-    if det.abs() < 1e-8 {
+    if !det.is_finite() || det.abs() < 1e-8 {
         return None;
     }
     let inv_det = 1.0 / det;
@@ -114,6 +115,7 @@ fn invert_mat4(m: &[f32; 16]) -> Option<[f32; 16]> {
 /// Column-major `f32` array (16 elements) consumed directly by WGSL `mat4x4`.
 #[inline]
 pub fn perspective_rh_zo(fovy_rad: f32, aspect: f32, near: f32, far: f32) -> [f32; 16] {
+    debug_assert!(far > near, "perspective: far must be > near");
     let f = 1.0 / (fovy_rad * 0.5).tan();
     let mut m = [0f32; 16];
     m[0] = f / aspect;
@@ -189,6 +191,69 @@ mod tests {
     fn invert_mat4_singular_returns_none() {
         let singular = [1.0; 16];
         assert!(invert_mat4(&singular).is_none());
+    }
+
+    #[test]
+    fn invert_mat4_nan_returns_none() {
+        let nan_input = [
+            f32::NAN,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ];
+        assert!(invert_mat4(&nan_input).is_none());
+
+        let inf_input = [
+            f32::INFINITY,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ];
+        assert!(invert_mat4(&inf_input).is_none());
+
+        let neg_inf_input = [
+            f32::NEG_INFINITY,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+        ];
+        assert!(invert_mat4(&neg_inf_input).is_none());
     }
 
     #[test]

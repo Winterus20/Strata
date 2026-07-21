@@ -4,9 +4,23 @@
 //! priority channel; a spawned worker drains the channel, orders by priority
 //! (ACTIVE=0 highest … ARCHIVE=3 lowest), groups by region, and performs the
 //! file I/O inside `spawn_blocking` (buffered I/O is the default, per D4).
+//!
+//! # Durability & F6 shutdown
+//!
+//! - [`AsyncStorageBackend::write_sector`] / [`write_sector_with_priority`](AsyncStorageBackend::write_sector_with_priority)
+//!   wait for the worker oneshot before returning `Ok` (durable region write completed).
+//! - [`AsyncStorageBackend::sync`] barriers on all previously enqueued work — call
+//!   this on client shutdown (F6) after stopping new enqueue.
+//! - [`AsyncStorageBackend::flush`] fsyncs opened region files after a [`sync`].
+//!
+//! Recommended shutdown order for F6:
+//! 1. Stop enqueueing new sector saves.
+//! 2. `backend.sync().await` — drain in-flight I/O.
+//! 3. `backend.flush().await` — fsync region files (best-effort on Windows dirs).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -38,28 +52,35 @@ pub(crate) struct PriorityRequest {
     respond: Option<oneshot::Sender<StorageResult<Vec<u8>>>>,
 }
 
-/// The work to perform for a single sector.
+/// The work to perform for a single sector (or a sync barrier).
 enum Request {
     Read,
     Write(Vec<u8>),
     Delete,
+    /// Barrier: completes after reaching the worker (prior batch items run first
+    /// within a drain; callers should stop enqueueing before `sync`).
+    Sync,
 }
 
 /// Async durable-storage backend (plan 15 §1.4 / D8).
 #[async_trait]
 pub trait AsyncStorageBackend: Send + Sync {
     async fn read_sector(&self, coord: SectorCoord) -> StorageResult<Vec<u8>>;
+    /// Enqueue a write and **await durable completion** before `Ok`.
     async fn write_sector(&self, coord: SectorCoord, payload: Vec<u8>) -> StorageResult<()>;
     async fn delete_sector(&self, coord: SectorCoord) -> StorageResult<()>;
+    /// Fsync region files under the backend root (best-effort). Prefer [`sync`]
+    /// first to drain in-flight writes.
     async fn flush(&self) -> StorageResult<()>;
-    /// Write a sector with an explicit priority. Exposed so tests can assert priority
-    /// ordering (plan 15 §1.4 / D8).
+    /// Write a sector with an explicit priority. Awaits durable completion.
     async fn write_sector_with_priority(
         &self,
         coord: SectorCoord,
         payload: Vec<u8>,
         prio: u8,
     ) -> StorageResult<()>;
+    /// Drain previously enqueued requests (F6 client shutdown barrier).
+    async fn sync(&self) -> StorageResult<()>;
 }
 
 /// Bounded priority channel with a fixed `capacity`.
@@ -93,7 +114,11 @@ impl TokioBackend {
         tracer: Option<Arc<tokio::sync::Mutex<Vec<u8>>>>,
     ) -> StorageResult<Self> {
         let (tx, rx) = bounded_channel(128);
-        let worker = Arc::new(Worker { root, tracer });
+        let worker = Arc::new(Worker {
+            root,
+            tracer,
+            region_locks: Mutex::new(HashMap::new()),
+        });
         let w = worker.clone();
         tokio::spawn(async move {
             w.run(rx).await;
@@ -101,7 +126,29 @@ impl TokioBackend {
         Ok(Self { tx, worker })
     }
 
-    /// Enqueue a request, returning the response receiver (for reads).
+    /// Enqueue a write without waiting for durable completion.
+    ///
+    /// Prefer [`AsyncStorageBackend::write_sector`] / `write_sector_with_priority`
+    /// when the caller needs `Ok` ⇒ on-disk. Use this only when coalescing a
+    /// burst and completing via [`AsyncStorageBackend::sync`] (tests / F6 drain).
+    pub async fn write_sector_enqueue(
+        &self,
+        coord: SectorCoord,
+        payload: Vec<u8>,
+        prio: u8,
+    ) -> StorageResult<()> {
+        self.tx
+            .send(PriorityRequest {
+                priority: prio,
+                coord,
+                request: Request::Write(payload),
+                respond: None,
+            })
+            .await
+            .map_err(|_| StorageError::Region("backend worker closed".into()))
+    }
+
+    /// Enqueue a request, returning the response receiver.
     async fn enqueue(
         &self,
         priority: u8,
@@ -121,22 +168,11 @@ impl TokioBackend {
         Ok(respond_rx)
     }
 
-    /// Enqueue a fire-and-forget request.
-    async fn enqueue_no_reply(
-        &self,
-        priority: u8,
-        coord: SectorCoord,
-        request: Request,
-    ) -> StorageResult<()> {
-        self.tx
-            .send(PriorityRequest {
-                priority,
-                coord,
-                request,
-                respond: None,
-            })
-            .await
-            .map_err(|_| StorageError::Region("backend worker closed".into()))
+    async fn await_reply(
+        rx: oneshot::Receiver<StorageResult<Vec<u8>>>,
+    ) -> StorageResult<Vec<u8>> {
+        rx.await
+            .map_err(|_| StorageError::Region("backend worker dropped response".into()))?
     }
 }
 
@@ -144,31 +180,46 @@ impl TokioBackend {
 impl AsyncStorageBackend for TokioBackend {
     async fn read_sector(&self, coord: SectorCoord) -> StorageResult<Vec<u8>> {
         let rx = self.enqueue(priority::ACTIVE, coord, Request::Read).await?;
-        rx.await
-            .map_err(|_| StorageError::Region("backend worker dropped response".into()))?
+        Self::await_reply(rx).await
     }
 
     async fn write_sector(&self, coord: SectorCoord, payload: Vec<u8>) -> StorageResult<()> {
-        self.enqueue_no_reply(priority::WARM, coord, Request::Write(payload))
+        let rx = self
+            .enqueue(priority::WARM, coord, Request::Write(payload))
             .await?;
+        Self::await_reply(rx).await?;
         Ok(())
     }
 
-    /// Write a sector with an explicit priority (defaults differ: writes are WARM,
-    /// reads are ACTIVE). Exposed so tests can assert priority ordering (plan 15 §1.4 / D8).
+    /// Write a sector with an explicit priority. Awaits durable completion.
     async fn write_sector_with_priority(
         &self,
         coord: SectorCoord,
         payload: Vec<u8>,
         prio: u8,
     ) -> StorageResult<()> {
-        self.enqueue_no_reply(prio, coord, Request::Write(payload))
-            .await
+        let rx = self
+            .enqueue(prio, coord, Request::Write(payload))
+            .await?;
+        Self::await_reply(rx).await?;
+        Ok(())
     }
 
     async fn delete_sector(&self, coord: SectorCoord) -> StorageResult<()> {
-        self.enqueue_no_reply(priority::WARM, coord, Request::Delete)
+        let rx = self
+            .enqueue(priority::WARM, coord, Request::Delete)
             .await?;
+        Self::await_reply(rx).await?;
+        Ok(())
+    }
+
+    async fn sync(&self) -> StorageResult<()> {
+        // Lowest priority so active work in the same drain batch runs first;
+        // callers must stop enqueueing before sync for a true idle barrier.
+        let rx = self
+            .enqueue(priority::ARCHIVE, SectorCoord(0, 0, 0), Request::Sync)
+            .await?;
+        Self::await_reply(rx).await?;
         Ok(())
     }
 
@@ -176,9 +227,16 @@ impl AsyncStorageBackend for TokioBackend {
         let path = self.worker.root.clone();
         tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
             if path.is_dir() {
-                #[cfg(windows)]
-                {
-                    return Ok::<(), std::io::Error>(());
+                // Fsync each region file under root (Windows cannot fsync a directory).
+                if let Ok(entries) = std::fs::read_dir(&path) {
+                    for entry in entries.flatten() {
+                        let p = entry.path();
+                        if p.extension().and_then(|e| e.to_str()) == Some("strata") {
+                            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&p) {
+                                let _ = f.sync_all();
+                            }
+                        }
+                    }
                 }
                 #[cfg(not(windows))]
                 {
@@ -201,9 +259,18 @@ impl AsyncStorageBackend for TokioBackend {
 struct Worker {
     root: PathBuf,
     tracer: Option<Arc<tokio::sync::Mutex<Vec<u8>>>>,
+    /// Serialize concurrent I/O to the same region file.
+    region_locks: Mutex<HashMap<RegionCoord, Arc<Mutex<()>>>>,
 }
 
 impl Worker {
+    fn lock_region(&self, region: RegionCoord) -> Arc<Mutex<()>> {
+        let mut map = self.region_locks.lock().unwrap();
+        map.entry(region)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
     /// Drain the channel, ordering by priority, then execute per region inside
     /// `spawn_blocking` (buffered file I/O off the async worker, per plan 15 §1.4 / D4).
     async fn run(self: Arc<Self>, mut rx: mpsc::Receiver<PriorityRequest>) {
@@ -212,6 +279,8 @@ impl Worker {
         while let Some(first) = rx.recv().await {
             let mut batch = Vec::with_capacity(128);
             batch.push(first);
+            // Coalesce concurrent enqueues into one priority-sorted batch.
+            tokio::task::yield_now().await;
             while let Ok(req) = rx.try_recv() {
                 batch.push(req);
             }
@@ -257,14 +326,20 @@ impl Worker {
 
     /// Perform one sector's file I/O. Runs inside `spawn_blocking`.
     fn execute(&self, coord: SectorCoord, request: Request) -> StorageResult<Vec<u8>> {
+        if matches!(request, Request::Sync) {
+            return Ok(Vec::new());
+        }
         let region = RegionCoord::from_sector(coord);
+        let region_lock = self.lock_region(region);
+        let _guard = region_lock.lock().unwrap();
         let path = self.root.join(region.file_name());
         let mut rf = RegionFile::open(&path)?;
         match request {
             Request::Read => {
+                // Header verify already checked BLAKE3/xxHash of stored bytes.
+                // Legacy records may be uncompressed; only zstd-magic frames decode.
                 let (_header, payload) = rf.read_sector(coord)?;
-                let decompressed = crate::compress::decompress(&payload).unwrap_or(payload);
-                Ok(decompressed)
+                crate::compress::decode_stored_payload(&payload)
             }
             Request::Write(payload) => {
                 let compressed = crate::compress::compress(&payload, Tier::Warm)?;
@@ -276,6 +351,7 @@ impl Worker {
                 rf.delete_sector(coord)?;
                 Ok(Vec::new())
             }
+            Request::Sync => Ok(Vec::new()),
         }
     }
 }

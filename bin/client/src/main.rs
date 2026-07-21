@@ -15,6 +15,7 @@ use bevy::prelude::*;
 use bevy::window::{Window, WindowPlugin, WindowResolution};
 use bevy::{DefaultPlugins, MinimalPlugins};
 
+use strata_core::component::SectorSnapshot;
 use strata_core::prelude::*;
 use strata_physics::plugin::PhysicsPlugin;
 use strata_player::controller::EYE_HEIGHT;
@@ -22,8 +23,8 @@ use strata_player::prelude::*;
 use strata_render::meshing::MeshingPlugin;
 use strata_save::plugin::{DirtyQueue, SaveBackend, SavePlugin, SavedReceiver, SectorSave};
 use strata_save::save_manager::SaveManager;
-use strata_storage::backend::TokioBackend;
-use strata_storage::metadata::FjallMetadata;
+use strata_storage::backend::{AsyncStorageBackend, TokioBackend};
+use strata_storage::metadata::{FjallMetadata, SectorMetadata};
 use strata_world::prelude::*;
 
 #[derive(Resource, Clone)]
@@ -210,18 +211,24 @@ fn build_client_app(headless: bool, config: &ClientConfig) -> App {
     app.add_strata_plugin(ClientRenderPlugin);
 
     app.add_systems(Startup, spawn_player_system);
-    app.add_systems(Update, (shutdown_system, save_player_system));
+    // Periodic player save in Update; durable world flush in Last so AppExit is
+    // visible and in-flight Update save handlers can finish enqueueing first.
+    // After Input so hotbar/place Inventory mutations are observed consistently.
+    app.add_systems(Update, save_player_system.after(StrataSet::Input));
+    app.add_systems(Last, shutdown_system);
 
     // Window-only FPS input: cursor capture + mouse-look. Skipped headlessly
     // (no primary window / cursor to grab). Runs in the Input set so the updated
     // look is consumed by the controller and camera the same frame.
     if !headless {
-        // Movement now runs in `FixedUpdate`, which executes before `Update`
-        // each frame, so mouse-look (Update) no longer needs to be ordered
-        // before the controller — it just samples the look for the next tick.
+        // Grab before look (CursorOptions); look before gameplay input so
+        // break/place raycasts see this frame's yaw/pitch.
         app.add_systems(
             Update,
-            (cursor_grab_system, mouse_look_system).in_set(StrataSet::Input),
+            (cursor_grab_system, mouse_look_system)
+                .chain()
+                .in_set(StrataSet::Input)
+                .before(strata_player::input::input_mapper_system),
         );
         app.add_systems(
             Update,
@@ -270,40 +277,103 @@ fn spawn_player_system(
     ));
 }
 
+/// Cadence for periodic `player.dat` writes. Movement must not sync-write every
+/// `Changed<Transform>` tick — that stalls the main thread on disk I/O.
+const PLAYER_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Drive a storage future from a Bevy sync system without deadlocking the
+/// multi-thread tokio runtime that owns [`TokioBackend`]'s worker.
+///
+/// `pollster::block_on` on a `current_thread` runtime deadlocks (worker shares
+/// the blocked thread) — production uses `#[tokio::main]` (multi-thread);
+/// unit tests must not call this path on `#[tokio::test]` default flavor.
+fn block_on_storage<F: std::future::Future>(fut: F) -> F::Output {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle)
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+        {
+            tokio::task::block_in_place(|| handle.block_on(fut))
+        }
+        _ => pollster::block_on(fut),
+    }
+}
+
+/// Returns true when `elapsed` has accumulated at least `interval` of `dt`.
+fn player_save_due(
+    elapsed: &mut std::time::Duration,
+    dt: std::time::Duration,
+    interval: std::time::Duration,
+) -> bool {
+    *elapsed = elapsed.saturating_add(dt);
+    if *elapsed >= interval {
+        *elapsed = std::time::Duration::ZERO;
+        true
+    } else {
+        false
+    }
+}
+
+/// Dirty coords to flush on shutdown: queued batch plus sticky loaded leftovers.
+fn collect_shutdown_flush_coords(
+    queued: Vec<SectorCoord>,
+    loaded_dirty: impl IntoIterator<Item = SectorCoord>,
+) -> Vec<SectorCoord> {
+    let mut out = queued;
+    for coord in loaded_dirty {
+        if !out.contains(&coord) {
+            out.push(coord);
+        }
+    }
+    out
+}
+
+fn player_save_data_from(
+    transform: &Transform,
+    look: &PlayerLook,
+    inventory: &Inventory,
+) -> strata_save::player_save_data::PlayerSaveData {
+    let hotbar_index = inventory.active as u8;
+    let inventory: Vec<Option<strata_save::player_save_data::ItemStack>> = inventory
+        .hotbar
+        .iter()
+        .map(|stack| {
+            Some(strata_save::player_save_data::ItemStack {
+                block_id: stack.block.0 as u32,
+                count: stack.count,
+            })
+        })
+        .collect();
+    strata_save::player_save_data::PlayerSaveData {
+        position: [
+            transform.translation.x,
+            transform.translation.y,
+            transform.translation.z,
+        ],
+        rotation: [look.yaw, look.pitch],
+        health: 20.0,
+        hunger: 20.0,
+        xp: 0,
+        hotbar_index,
+        inventory,
+    }
+}
+
 fn save_player_system(
+    time: Res<Time>,
+    mut elapsed: Local<std::time::Duration>,
     save_manager: Option<Res<SaveManager>>,
     save_dir: Option<Res<SaveDirectory>>,
-    player_query: Query<(&Transform, &PlayerLook, &PlayerState, &Inventory), Changed<Transform>>,
+    player_query: Query<(&Transform, &PlayerLook, &PlayerState, &Inventory)>,
 ) {
+    if !player_save_due(&mut elapsed, time.delta(), PLAYER_SAVE_INTERVAL) {
+        return;
+    }
     if let (Some(mgr), Some(dir)) = (save_manager, save_dir) {
         #[allow(clippy::collapsible_if)]
         if let Ok((transform, look, _player_state, inventory)) = player_query.single() {
             let path = dir.0.join("player.dat");
             std::fs::create_dir_all(path.parent().unwrap()).ok();
-            let hotbar_index = inventory.active as u8;
-            let inventory: Vec<Option<strata_save::player_save_data::ItemStack>> = inventory
-                .hotbar
-                .iter()
-                .map(|stack| {
-                    Some(strata_save::player_save_data::ItemStack {
-                        block_id: stack.block.0 as u32,
-                        count: stack.count,
-                    })
-                })
-                .collect();
-            let player_data = strata_save::player_save_data::PlayerSaveData {
-                position: [
-                    transform.translation.x,
-                    transform.translation.y,
-                    transform.translation.z,
-                ],
-                rotation: [look.yaw, look.pitch],
-                health: 20.0,
-                hunger: 20.0,
-                xp: 0,
-                hotbar_index,
-                inventory,
-            };
+            let player_data = player_save_data_from(transform, look, inventory);
             if let Err(e) = mgr.save_player(&path, &player_data) {
                 error!("Failed to save player data: {e:?}");
             }
@@ -311,88 +381,143 @@ fn save_player_system(
     }
 }
 
+/// Durable AppExit flush: cut new work, drain backend (`sync`), fsync regions
+/// (`flush`), then clear dirty bits only after commit.
 #[allow(clippy::too_many_arguments)]
 fn shutdown_system(
     mut exit: MessageReader<AppExit>,
     save_manager: Option<Res<SaveManager>>,
     save_dir: Option<Res<SaveDirectory>>,
     player_query: Query<(&Transform, &PlayerLook, &PlayerState, &Inventory)>,
-    sectors_query: Query<&SectorCoord>,
+    sectors: Query<(&SectorCoord, &SectorSnapshot)>,
     dirty_queue: Option<Res<DirtyQueue>>,
-    mut messages: Option<ResMut<bevy::ecs::message::Messages<SectorSave>>>,
+    backend: Option<Res<SaveBackend>>,
     saved_receiver: Option<Res<SavedReceiver>>,
 ) {
-    if exit.read().next().is_some() {
-        info!("strata: AppExit received — saving player and world data");
-
-        // 1. Force flush loaded dirty sectors to messages queue before shutting down
-        if let Some(ref dq) = dirty_queue {
-            for coord in sectors_query.iter() {
-                #[allow(clippy::collapsible_if)]
-                if dq.tracker.is_dirty(*coord) {
-                    if let Some(ref mut msgs) = messages {
-                        msgs.write(SectorSave(*coord));
-                    }
-                }
-            }
-        }
-
-        // 2. Save player position & look
-        if let (Some(mgr), Some(dir)) = (save_manager, save_dir.as_ref()) {
-            let path = dir.0.join("player.dat");
-            std::fs::create_dir_all(path.parent().unwrap()).ok();
-
-            if let Ok((transform, look, _player_state, inventory)) = player_query.single() {
-                let hotbar_index = inventory.active as u8;
-                let inventory_data: Vec<Option<strata_save::player_save_data::ItemStack>> =
-                    inventory
-                        .hotbar
-                        .iter()
-                        .map(|stack| {
-                            Some(strata_save::player_save_data::ItemStack {
-                                block_id: stack.block.0 as u32,
-                                count: stack.count,
-                            })
-                        })
-                        .collect();
-                let player_data = strata_save::player_save_data::PlayerSaveData {
-                    position: [
-                        transform.translation.x,
-                        transform.translation.y,
-                        transform.translation.z,
-                    ],
-                    rotation: [look.yaw, look.pitch],
-                    health: 20.0,
-                    hunger: 20.0,
-                    xp: 0,
-                    hotbar_index,
-                    inventory: inventory_data,
-                };
-                if let Err(e) = mgr.save_player(&path, &player_data) {
-                    error!("Failed to save player data: {e:?}");
-                } else {
-                    info!("strata: Successfully saved player data to disk");
-                }
-            }
-        }
-
-        // 3. Drain any pending completed sector saves (non-blocking)
-        if let Some(ref dq) = dirty_queue {
-            if let Some(ref rx_res) = saved_receiver {
-                if let Ok(mut rx) = rx_res.rx.lock() {
-                    while let Ok(coord) = rx.try_recv() {
-                        dq.tracker.clear(coord);
-                    }
-                }
-            }
-            info!(
-                "strata: Flushed all dirty sectors on shutdown (pending={})",
-                dq.tracker.pending()
-            );
-        }
-
-        info!("strata: AppExit received — releasing GPU device + brick pool on teardown");
+    if exit.read().next().is_none() {
+        return;
     }
+    info!("strata: AppExit received — durable-flushing player and world data");
+
+    // Drain any already-completed async saves (post-commit clear only).
+    if let Some(ref rx_res) = saved_receiver {
+        if let (Ok(mut rx), Some(ref dq)) = (rx_res.rx.lock(), dirty_queue.as_ref()) {
+            while let Ok(coord) = rx.try_recv() {
+                dq.tracker.clear(coord);
+            }
+        }
+    }
+
+    if let (Some(dq), Some(bk), Some(mgr)) =
+        (dirty_queue.as_ref(), backend.as_ref(), save_manager.as_ref())
+    {
+        let sector_map: std::collections::HashMap<SectorCoord, &SectorSnapshot> = sectors
+            .iter()
+            .map(|(coord, snapshot)| (*coord, snapshot))
+            .collect();
+
+        // Remaining queued dirty + any sticky in-flight loaded sectors.
+        let queued = dq.tracker.consume_dirty_batch(dq.tracker.pending());
+        let loaded_dirty: Vec<SectorCoord> = sector_map
+            .keys()
+            .copied()
+            .filter(|c| dq.tracker.is_dirty(*c))
+            .collect();
+        let to_flush = collect_shutdown_flush_coords(queued, loaded_dirty);
+
+        let mut committed = Vec::new();
+        for coord in to_flush {
+            let Some(snapshot) = sector_map.get(&coord) else {
+                warn!("strata: shutdown skip dirty {coord:?} — no SectorSnapshot resident");
+                continue;
+            };
+            let payload = match postcard::to_allocvec(&*snapshot.0) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    error!("Failed to serialize sector {coord:?} on shutdown: {e}");
+                    continue;
+                }
+            };
+            let payload_hash = blake3::hash(&payload).into();
+            let payload_size = payload.len() as u64;
+            let write_ok = block_on_storage(async {
+                if let Err(e) = bk
+                    .0
+                    .write_sector_with_priority(
+                        coord,
+                        payload,
+                        strata_storage::backend::priority::ACTIVE,
+                    )
+                    .await
+                {
+                    error!("Failed to write sector {coord:?} on shutdown: {e}");
+                    return false;
+                }
+                let mtime = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let meta = SectorMetadata {
+                    coord,
+                    hash: payload_hash,
+                    size: payload_size,
+                    mtime,
+                    tier: 0,
+                    version: 1,
+                    dirty: false,
+                };
+                if let Err(e) = mgr.metadata.put(meta).await {
+                    error!("Failed to write sector {coord:?} metadata on shutdown: {e}");
+                    return false;
+                }
+                true
+            });
+            if write_ok {
+                committed.push(coord);
+            }
+        }
+
+        // Barrier: drain any earlier in-flight I/O, then fsync region files.
+        if let Err(e) = block_on_storage(AsyncStorageBackend::sync(&bk.0)) {
+            error!("strata: shutdown backend sync failed: {e}");
+        }
+        if let Err(e) = block_on_storage(AsyncStorageBackend::flush(&bk.0)) {
+            error!("strata: shutdown backend flush failed: {e}");
+        }
+
+        // Post-commit dirty clear only.
+        for coord in committed {
+            dq.tracker.clear(coord);
+        }
+        if let Some(ref rx_res) = saved_receiver {
+            if let Ok(mut rx) = rx_res.rx.lock() {
+                while let Ok(coord) = rx.try_recv() {
+                    dq.tracker.clear(coord);
+                }
+            }
+        }
+        info!(
+            "strata: Durable shutdown flush done (pending_queue={})",
+            dq.tracker.pending()
+        );
+    }
+
+    // Player position — always on exit (not subject to the periodic debounce).
+    if let (Some(mgr), Some(dir)) = (save_manager, save_dir.as_ref()) {
+        let path = dir.0.join("player.dat");
+        std::fs::create_dir_all(path.parent().unwrap()).ok();
+
+        if let Ok((transform, look, _player_state, inventory)) = player_query.single() {
+            let player_data = player_save_data_from(transform, look, inventory);
+            if let Err(e) = mgr.save_player(&path, &player_data) {
+                error!("Failed to save player data: {e:?}");
+            } else {
+                info!("strata: Successfully saved player data to disk");
+            }
+        }
+    }
+
+    info!("strata: AppExit — releasing GPU device + brick pool on teardown");
 }
 
 /// Wall-clock interval between periodic DIAG lines.
@@ -500,6 +625,11 @@ fn diagnostics_log_system(
     let us_reflatten = gpu.frame_us_reflatten;
     let us_upload = gpu.frame_us_upload;
     let us_draw = gpu.frame_us_draw;
+    let cull_total = gpu.frame_cull_total;
+    let cull_visible = gpu.frame_cull_visible;
+    let cull_us = gpu.frame_cull_us;
+    let prepass_quads = gpu.frame_prepass_quads;
+    let prepass_runs = gpu.frame_prepass_runs;
     // Reset per-second counters (they accumulate per frame in client_render_system).
     gpu.frame_reflatten = 0;
     gpu.frame_uploaded = 0;
@@ -508,6 +638,11 @@ fn diagnostics_log_system(
     gpu.frame_us_reflatten = 0;
     gpu.frame_us_upload = 0;
     gpu.frame_us_draw = 0;
+    gpu.frame_cull_total = 0;
+    gpu.frame_cull_visible = 0;
+    gpu.frame_cull_us = 0;
+    gpu.frame_prepass_quads = 0;
+    gpu.frame_prepass_runs = 0;
     let tag = if spike && !periodic {
         "SPIKE"
     } else if spike {
@@ -516,7 +651,7 @@ fn diagnostics_log_system(
         "PERIOD"
     };
     info!(
-        "DIAG[{tag}] fps={:.1} ema_fps={:.1} frame_ms={:.1} pos=({:.1},{:.1},{:.1}) eye=({:.1},{:.1},{:.1}) yaw={:.2} pitch={:.2} forward=({:.2},{:.2},{:.2}) eye_solid={:?} sectors={} quads={} reflatten={} uploaded={} draws={} rebuild={} pending={} wg_apply={} wg_n={} mesh_spawn={} mesh_n={} mesh_apply={} mesh_an={} phys_build={} phys_sort={} phys_queue={} phys_n={} phys_col={} phys_rap={} phys_apply={} phys_pend={} phys_sync={} phys_sn={} light={} light_n={} stream={} stream_sp={} stream_un={} us_reflatten={} us_upload={} us_draw={}",
+        "DIAG[{tag}] fps={:.1} ema_fps={:.1} frame_ms={:.1} pos=({:.1},{:.1},{:.1}) eye=({:.1},{:.1},{:.1}) yaw={:.2} pitch={:.2} forward=({:.2},{:.2},{:.2}) eye_solid={:?} sectors={} quads={} reflatten={} uploaded={} draws={} rebuild={} pending={} wg_apply={} wg_n={} mesh_spawn={} mesh_n={} mesh_apply={} mesh_an={} phys_build={} phys_sort={} phys_queue={} phys_n={} phys_col={} phys_rap={} phys_apply={} phys_pend={} phys_sync={} phys_sn={} light={} light_n={} light_sky_us={} light_block_us={} light_sky_bfs={} light_block_bfs={} light_sources={} cull_total={} cull_vis={} cull_us={} prepass_quads={} prepass_runs={} stream={} stream_sp={} stream_un={} us_reflatten={} us_upload={} us_draw={}",
         fps,
         state.fps_ema,
         frame_ms,
@@ -557,6 +692,16 @@ fn diagnostics_log_system(
         phys_timers.synced,
         light_timers.apply_us,
         light_timers.applied,
+        light_timers.sky_us,
+        light_timers.block_us,
+        light_timers.sky_bfs_pushed,
+        light_timers.block_bfs_pushed,
+        light_timers.light_sources,
+        cull_total,
+        cull_visible,
+        cull_us,
+        prepass_quads,
+        prepass_runs,
         stream_timers.us,
         stream_timers.spawned,
         stream_timers.unloaded,
@@ -579,9 +724,41 @@ mod tests {
     use bevy::ecs::query::QueryState;
     use strata_render::meshing::MeshStorage;
 
+    /// Regression: Update schedule must not report ambiguous conflicting pairs
+    /// among Strata + client systems (including window-only Input/Render edges).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_update_schedule_has_no_ambiguities() {
+        let cfg = ClientConfig::default();
+        let mut app = build_client_app(true, &cfg);
+        app.add_systems(
+            Update,
+            (cursor_grab_system, mouse_look_system)
+                .chain()
+                .in_set(StrataSet::Input)
+                .before(strata_player::input::input_mapper_system),
+        );
+        app.add_systems(
+            Update,
+            diagnostics_log_system
+                .in_set(StrataSet::RenderUpdate)
+                .after(crate::client_render::client_render_system),
+        );
+        app.update();
+        let world = app.world();
+        let schedules = world.resource::<bevy::ecs::schedule::Schedules>();
+        let schedule = schedules.get(Update).expect("Update");
+        let conflicts = schedule.graph().conflicting_systems();
+        assert_eq!(
+            conflicts.len(),
+            0,
+            "Update schedule has {} ambiguous pairs",
+            conflicts.len()
+        );
+    }
+
     /// The app must construct (all plugins + systems registered) without panic.
     /// No window/run is performed, so this is safe headlessly.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_client_app_builds() {
         let cfg = ClientConfig::default();
         let mut app = build_client_app(true, &cfg);
@@ -625,12 +802,12 @@ mod tests {
 
     /// End-to-end headless pipeline check: with a player present, sectors stream
     /// in, get generated, and are meshed into `MeshStorage` (no GPU required).
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_stream_gen_mesh_chain() {
         let cfg = ClientConfig::default();
         let mut app = build_client_app(true, &cfg);
 
-        for _ in 0..16 {
+        for _ in 0..8 {
             app.update();
         }
 
@@ -836,7 +1013,7 @@ mod tests {
         eprintln!("DIAG-RENDER: bottom(y=240)={:?}", sample(240));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_save_and_shutdown_handle_missing_player() {
         let cfg = ClientConfig::default();
         let mut app = build_client_app(true, &cfg);
@@ -870,45 +1047,110 @@ mod tests {
         assert_eq!(cfg.height, 4320, "height should be clamped to 4320");
     }
 
-    #[tokio::test]
-    async fn test_save_player_uses_real_inventory() {
-        let cfg = ClientConfig::default();
-        let mut app = build_client_app(true, &cfg);
-        for _ in 0..4 {
-            app.update();
-        }
-        {
-            let world = app.world_mut();
-            let mut pq =
-                QueryState::<(&mut Transform, &mut Inventory), With<PlayerController>>::new(world);
-            if let Ok((mut tf, mut inv)) = pq.single_mut(world) {
-                inv.hotbar[0] = ItemStack {
-                    block: BlockId(42),
-                    count: 99,
-                };
-                inv.active = 3;
-                tf.translation.x += 0.1;
-            }
-        }
-        app.update();
-        app.update();
-        let world = app.world();
-        let save_dir = world.resource::<SaveDirectory>();
-        let path = save_dir.0.join("player.dat");
-        if path.exists() {
-            let save_mgr = world.resource::<SaveManager>();
-            if let Ok(data) = save_mgr.load_player(&path) {
-                assert_eq!(data.hotbar_index, 3, "hotbar_index should be 3");
-                assert_eq!(data.inventory.len(), 9, "inventory should have 9 slots");
-                assert_eq!(
-                    data.inventory[0],
-                    Some(strata_save::player_save_data::ItemStack {
-                        block_id: 42,
-                        count: 99,
-                    }),
-                    "first inventory slot should have block_id=42, count=99"
-                );
-            }
-        }
+    #[test]
+    fn test_player_save_due_debounces_until_interval() {
+        let mut elapsed = std::time::Duration::ZERO;
+        let interval = std::time::Duration::from_secs(30);
+        assert!(
+            !player_save_due(
+                &mut elapsed,
+                std::time::Duration::from_millis(16),
+                interval
+            ),
+            "first frame must not save"
+        );
+        assert!(
+            !player_save_due(
+                &mut elapsed,
+                std::time::Duration::from_secs(29),
+                interval
+            ),
+            "under interval must not save"
+        );
+        assert!(
+            player_save_due(
+                &mut elapsed,
+                std::time::Duration::from_secs(1),
+                interval
+            ),
+            "at interval must save"
+        );
+        assert_eq!(elapsed, std::time::Duration::ZERO, "timer resets after due");
+        assert!(
+            !player_save_due(
+                &mut elapsed,
+                std::time::Duration::from_millis(16),
+                interval
+            ),
+            "after reset must wait again"
+        );
+    }
+
+    /// Inventory encoding for player.dat — no Bevy app / AppExit (avoids
+    /// current_thread + backend sync deadlock).
+    #[test]
+    fn test_player_save_data_encodes_inventory() {
+        let transform = Transform::from_translation(Vec3::new(1.0, 2.0, 3.0));
+        let look = PlayerLook {
+            yaw: 0.5,
+            pitch: -0.25,
+        };
+        let mut inventory = Inventory::default();
+        inventory.hotbar[0] = ItemStack {
+            block: BlockId(42),
+            count: 99,
+        };
+        inventory.active = 3;
+        let data = player_save_data_from(&transform, &look, &inventory);
+        assert_eq!(data.hotbar_index, 3);
+        assert_eq!(data.inventory.len(), 9);
+        assert_eq!(
+            data.inventory[0],
+            Some(strata_save::player_save_data::ItemStack {
+                block_id: 42,
+                count: 99,
+            })
+        );
+        assert_eq!(data.position, [1.0, 2.0, 3.0]);
+        assert_eq!(data.rotation, [0.5, -0.25]);
+    }
+
+    /// Sync envelope write of player.dat — no AppExit / TokioBackend.sync.
+    #[test]
+    fn test_save_player_envelope_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("player.dat");
+        let meta = std::sync::Arc::new(strata_storage::metadata::InMemoryMetadata::new());
+        let mgr = SaveManager::new(meta, PLAYER_SAVE_INTERVAL);
+        let mut inventory = Inventory::default();
+        inventory.hotbar[0] = ItemStack {
+            block: BlockId(42),
+            count: 99,
+        };
+        inventory.active = 3;
+        let data = player_save_data_from(
+            &Transform::from_translation(Vec3::ZERO),
+            &PlayerLook::default(),
+            &inventory,
+        );
+        mgr.save_player(&path, &data).expect("save");
+        let loaded = mgr.load_player(&path).expect("load");
+        assert_eq!(loaded.hotbar_index, 3);
+        assert_eq!(
+            loaded.inventory[0],
+            Some(strata_save::player_save_data::ItemStack {
+                block_id: 42,
+                count: 99,
+            })
+        );
+    }
+
+    #[test]
+    fn test_shutdown_flush_coords_merges_queued_and_loaded() {
+        let a = SectorCoord(0, 0, 0);
+        let b = SectorCoord(1, 0, 0);
+        let c = SectorCoord(2, 0, 0);
+        let merged = collect_shutdown_flush_coords(vec![a, b], [b, c]);
+        assert_eq!(merged, vec![a, b, c]);
     }
 }

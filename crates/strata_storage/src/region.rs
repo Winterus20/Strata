@@ -153,6 +153,12 @@ impl RegionFile {
             return Err(StorageError::CorruptPayload { coord });
         }
         let raw = bytes[start..end].to_vec();
+        if raw.len() < SECTOR_HEADER_LEN {
+            return Err(StorageError::Region(format!(
+                "sector record size {} < header ({SECTOR_HEADER_LEN})",
+                raw.len()
+            )));
+        }
         let header: SectorHeader = bytemuck::pod_read_unaligned(&raw[..SECTOR_HEADER_LEN]);
         header.verify(&raw[SECTOR_HEADER_LEN..])?;
         Ok((header, raw[SECTOR_HEADER_LEN..].to_vec()))
@@ -220,6 +226,11 @@ impl RegionFile {
             let offset = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap());
             let size = u32::from_le_bytes(bytes[cursor + 4..cursor + 8].try_into().unwrap());
             cursor += SLOT_LEN;
+            if (size as usize) < SECTOR_HEADER_LEN {
+                return Err(StorageError::Region(format!(
+                    "slot size {size} < sector header ({SECTOR_HEADER_LEN})"
+                )));
+            }
             let absolute_offset = payload_start + offset as usize;
             if (absolute_offset + size as usize) > bytes.len() {
                 return Err(StorageError::Region("slot points past EOF".into()));

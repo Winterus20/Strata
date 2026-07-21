@@ -124,19 +124,18 @@ async fn backend_priority_active_wins() {
     let tracer = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
     let backend = TokioBackend::with_order_tracer(dir.clone(), Some(tracer.clone())).unwrap();
 
-    // Enqueue a DISTANT write, then an ACTIVE write for the same sector.
+    // Enqueue without awaiting so both sit in the channel for one priority batch.
     let coord = SectorCoord(5, 5, 5);
     backend
-        .write_sector_with_priority(coord, sample_payload(1, 256), priority::DISTANT)
+        .write_sector_enqueue(coord, sample_payload(1, 256), priority::DISTANT)
         .await
         .unwrap();
     backend
-        .write_sector_with_priority(coord, sample_payload(2, 256), priority::ACTIVE)
+        .write_sector_enqueue(coord, sample_payload(2, 256), priority::ACTIVE)
         .await
         .unwrap();
+    backend.sync().await.unwrap();
 
-    // Give the worker time to drain both.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let order = tracer.lock().await.clone();
     assert!(!order.is_empty(), "worker processed no requests");
     // ACTIVE (0) must appear before DISTANT (2) in completion order.

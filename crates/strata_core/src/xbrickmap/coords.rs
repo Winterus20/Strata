@@ -19,18 +19,33 @@ pub struct VoxelCoord {
 }
 
 impl VoxelCoord {
+    /// Fallible constructor: `None` when any axis is outside `0..SECTOR_DIM`.
+    #[inline]
+    pub fn try_new(x: u32, y: u32, z: u32) -> Option<Self> {
+        if x < SECTOR_DIM && y < SECTOR_DIM && z < SECTOR_DIM {
+            Some(VoxelCoord { x, y, z })
+        } else {
+            None
+        }
+    }
+
     #[inline]
     pub fn new(x: u32, y: u32, z: u32) -> Self {
         // Sector-local coords must be 0..SECTOR_DIM. An out-of-range axis makes
-        // `brick_index()` exceed 63, so `sector_mask >> bi` shifts by >= 64 —
-        // a debug panic ("shift with overflow") or a silently masked, wrong
-        // result in release. Callers sampling neighbours must wrap into 0..31
-        // before constructing a `VoxelCoord` (see meshing's `sample_block`).
-        debug_assert!(
+        // `brick_index()` exceed 63 → OOB into `bricks[64]`. Prefer `try_new`
+        // at trust boundaries; callers sampling neighbours must wrap into 0..31
+        // (see meshing's `sample_block`).
+        assert!(
             x < SECTOR_DIM && y < SECTOR_DIM && z < SECTOR_DIM,
             "VoxelCoord out of range: ({x}, {y}, {z}) not in 0..{SECTOR_DIM}"
         );
         VoxelCoord { x, y, z }
+    }
+
+    /// True when every axis is in `0..SECTOR_DIM` (guards pub-field construction).
+    #[inline]
+    pub fn is_in_sector(&self) -> bool {
+        self.x < SECTOR_DIM && self.y < SECTOR_DIM && self.z < SECTOR_DIM
     }
 
     /// Brick index within the sector (0..64), matching plan 06 WGSL layout.
