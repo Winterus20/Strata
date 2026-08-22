@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 bevy = { workspace = true, features = ["keyboard", "mouse"] }
+smallvec = "1"
 strata_core = { path = "../strata_core" }
 strata_world = { path = "../strata_world" }
 strata_physics = { path = "../strata_physics" }

@@ -122,7 +122,7 @@ async fn cache_hit_rate_zipfian() {
 async fn backend_priority_active_wins() {
     let dir = temp_dir();
     let tracer = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::<u8>::new()));
-    let backend = TokioBackend::with_order_tracer(dir.clone(), Some(tracer.clone())).unwrap();
+    let backend = TokioBackend::with_order_tracer(dir.clone(), Some(tracer.clone()), None).unwrap();
 
     // Enqueue without awaiting so both sit in the channel for one priority batch.
     let coord = SectorCoord(5, 5, 5);

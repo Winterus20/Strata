@@ -84,6 +84,7 @@ pub fn raycast_voxel(
     is_solid: impl Fn(VoxelCoord) -> bool,
 ) -> Option<(VoxelCoord, FaceNormal, f32)> {
     let dim = SECTOR_DIM as f32;
+    const RAY_EPSILON: f32 = 1e-4;
     if dir == Vec3::ZERO {
         return None;
     }
@@ -124,10 +125,11 @@ pub fn raycast_voxel(
     if t_enter > max_dist {
         return None;
     }
-    if t_enter > 0.0 {
-        p += dir * t_enter;
+    let start_bias = if t_enter > 0.0 { RAY_EPSILON } else { 0.0 };
+    if t_enter + start_bias > 0.0 {
+        p += dir * (t_enter + start_bias);
     }
-    let max_t = max_dist - t_enter;
+    let max_t = max_dist - t_enter - start_bias;
     if max_t < 0.0 {
         return None;
     }
@@ -325,6 +327,35 @@ mod tests {
     }
 
     #[test]
+    fn stabilizes_hits_when_ray_lands_on_voxel_edge() {
+        let mut pool = GlobalBrickPool::new();
+        let mut palette = SectorPalette::new();
+        let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+        map.set_block(
+            &mut pool,
+            &mut palette,
+            VoxelCoord::new(5, 7, 3),
+            BlockId(1),
+        )
+        .expect("left block");
+        map.set_block(
+            &mut pool,
+            &mut palette,
+            VoxelCoord::new(5, 7, 4),
+            BlockId(1),
+        )
+        .expect("right block");
+
+        // Exact z-edge between two neighbour voxels. The ray points slightly
+        // toward +Z, so the first interior sample must land in z=4, not z=3.
+        let origin = Vec3::new(8.5, 7.5, 4.0);
+        let dir = Vec3::new(-1.0, 0.0, 0.001).normalize();
+        let (v, _n, _t) =
+            raycast_voxel(&map, &pool, origin, dir, REACH, occupied(&map, &pool)).unwrap();
+        assert_eq!(v, VoxelCoord::new(5, 7, 4));
+    }
+
+    #[test]
     fn skips_non_solid_liquid_to_hit_solid_behind() {
         // Water is occupied but not solid (movement uses is_solid). Break/raycast
         // must match so liquids are not false break targets.
@@ -341,20 +372,10 @@ mod tests {
         let mut pool = GlobalBrickPool::new();
         let mut palette = SectorPalette::new();
         let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
-        map.set_block(
-            &mut pool,
-            &mut palette,
-            VoxelCoord::new(5, 7, 3),
-            water,
-        )
-        .expect("test water set_block");
-        map.set_block(
-            &mut pool,
-            &mut palette,
-            VoxelCoord::new(3, 7, 3),
-            stone,
-        )
-        .expect("test stone set_block");
+        map.set_block(&mut pool, &mut palette, VoxelCoord::new(5, 7, 3), water)
+            .expect("test water set_block");
+        map.set_block(&mut pool, &mut palette, VoxelCoord::new(3, 7, 3), stone)
+            .expect("test stone set_block");
 
         let origin = Vec3::new(8.5, 7.5, 3.5);
         let dir = Vec3::new(-1.0, 0.0, 0.0);

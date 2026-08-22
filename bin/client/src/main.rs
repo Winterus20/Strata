@@ -1,11 +1,11 @@
-//! Strata client binary (M9b): wires every Strata plugin together, owns the
-//! single wgpu device, and PRESENTs the M4 offscreen renderer to a real window.
+//! Strata client binary (M9b): wires every Strata plugin together, borrows
+//! Bevy's `RenderDevice`/`RenderQueue` for the single wgpu device, and
+//! PRESENTs the M4 offscreen renderer to a real window.
 //!
-//! Bevy's `render` feature is disabled (see `Cargo.toml`), so the only wgpu
-//! device in the process is our `strata_render::Renderer`. `ClientRenderPlugin`
-//! creates a wgpu `Surface` from the Bevy window's raw handle once it exists,
-//! then each frame renders the resident sector meshes offscreen and blits them
-//! to the window.
+//! Per plan 31 §1.5: Bevy's `RenderPlugin` is enabled (creates the single
+//! wgpu device/surface). `ClientRenderPlugin` borrows Bevy's
+//! `RenderDevice`/`RenderQueue` to construct `strata_render::Renderer`.
+//! The GPU draw + present runs on the main app using Bevy's surface texture.
 
 mod client_input;
 mod client_render;
@@ -21,7 +21,7 @@ use strata_physics::plugin::PhysicsPlugin;
 use strata_player::controller::EYE_HEIGHT;
 use strata_player::prelude::*;
 use strata_render::meshing::MeshingPlugin;
-use strata_save::plugin::{DirtyQueue, SaveBackend, SavePlugin, SavedReceiver, SectorSave};
+use strata_save::plugin::{DirtyQueue, InFlightSaves, SaveBackend, SavePlugin, SectorSave};
 use strata_save::save_manager::SaveManager;
 use strata_storage::backend::{AsyncStorageBackend, TokioBackend};
 use strata_storage::metadata::{FjallMetadata, SectorMetadata};
@@ -131,22 +131,17 @@ fn build_client_app(headless: bool, config: &ClientConfig) -> App {
             resolution: WindowResolution::new(config.width, config.height),
             ..Default::default()
         };
-        // `RenderPlugin` normally registers the `Shader` asset type + loader and
-        // creates Bevy's own wgpu Surface on our window (which raced with
-        // ClientGpu's surface => "Native window is in use" panic). It is DISABLED
-        // so we own the only GPU device (strata_render's Renderer).
+        // Per plan 31 §1.5: Bevy's `RenderPlugin` is ENABLED — it creates the
+        // single wgpu device/surface that `ClientGpu` borrows via
+        // `RenderDevice`/`RenderQueue`. Previously it was disabled to avoid a
+        // double-device conflict; that conflict is now resolved by having
+        // `ClientGpu` use Bevy's device instead of creating its own.
         //
-        // `WindowRenderPlugin` is a sub-plugin nested *inside* `RenderPlugin`,
-        // not a member of the `DefaultPlugins` group, so it cannot be disabled
-        // directly — hence the whole `RenderPlugin` is disabled.
-        //
-        // We must still register the `Shader` asset type: other `DefaultPlugins`
-        // members (e.g. CorePipelinePlugin's TonemappingPlugin) `asset_server.load`
-        // a `Shader` at build time, which panics if the type is unregistered. So
-        // we add `AssetPlugin` + register `Shader` ourselves *before*
-        // `DefaultPlugins` (whose `AssetPlugin` we disable to avoid a duplicate),
-        // guaranteeing `AssetServer` exists when we register `Shader` and when
-        // `CorePipelinePlugin` builds.
+        // We register the `Shader` asset type ourselves *before* `DefaultPlugins`
+        // builds: some plugins (e.g. CorePipelinePlugin's TonemappingPlugin)
+        // `asset_server.load` a `Shader` at build time, which panics if the type
+        // is unregistered. We add `AssetPlugin` + register `Shader` ourselves,
+        // then disable `DefaultPlugins`' `AssetPlugin` to avoid a duplicate.
         app.add_plugins(bevy::asset::AssetPlugin::default());
         app.init_asset::<bevy::shader::Shader>()
             .init_asset_loader::<bevy::shader::ShaderLoader>();
@@ -156,8 +151,7 @@ fn build_client_app(headless: bool, config: &ClientConfig) -> App {
                     primary_window: Some(window),
                     ..Default::default()
                 })
-                .disable::<bevy::asset::AssetPlugin>()
-                .disable::<bevy::render::RenderPlugin>(),
+                .disable::<bevy::asset::AssetPlugin>(),
         );
     }
 
@@ -289,9 +283,7 @@ const PLAYER_SAVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs
 /// unit tests must not call this path on `#[tokio::test]` default flavor.
 fn block_on_storage<F: std::future::Future>(fut: F) -> F::Output {
     match tokio::runtime::Handle::try_current() {
-        Ok(handle)
-            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
-        {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
             tokio::task::block_in_place(|| handle.block_on(fut))
         }
         _ => pollster::block_on(fut),
@@ -408,9 +400,11 @@ fn shutdown_system(
         }
     }
 
-    if let (Some(dq), Some(bk), Some(mgr)) =
-        (dirty_queue.as_ref(), backend.as_ref(), save_manager.as_ref())
-    {
+    if let (Some(dq), Some(bk), Some(mgr)) = (
+        dirty_queue.as_ref(),
+        backend.as_ref(),
+        save_manager.as_ref(),
+    ) {
         let sector_map: std::collections::HashMap<SectorCoord, &SectorSnapshot> = sectors
             .iter()
             .map(|(coord, snapshot)| (*coord, snapshot))
@@ -441,9 +435,8 @@ fn shutdown_system(
             let payload_hash = blake3::hash(&payload).into();
             let payload_size = payload.len() as u64;
             let write_ok = block_on_storage(async {
-                if let Err(e) = bk
-                    .0
-                    .write_sector_with_priority(
+                if let Err(e) =
+                    bk.0.write_sector_with_priority(
                         coord,
                         payload,
                         strata_storage::backend::priority::ACTIVE,
@@ -891,12 +884,8 @@ mod tests {
         use strata_render::pipeline::{CameraView, Renderer, prepass_features};
         use wgpu::*;
 
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
-        let adapter = match instance
-            .enumerate_adapters(Backends::all())
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
+        let adapter = match pollster::block_on(instance.enumerate_adapters(Backends::all()))
             .into_iter()
             .find(|a| a.features().contains(prepass_features()))
         {
@@ -1052,36 +1041,20 @@ mod tests {
         let mut elapsed = std::time::Duration::ZERO;
         let interval = std::time::Duration::from_secs(30);
         assert!(
-            !player_save_due(
-                &mut elapsed,
-                std::time::Duration::from_millis(16),
-                interval
-            ),
+            !player_save_due(&mut elapsed, std::time::Duration::from_millis(16), interval),
             "first frame must not save"
         );
         assert!(
-            !player_save_due(
-                &mut elapsed,
-                std::time::Duration::from_secs(29),
-                interval
-            ),
+            !player_save_due(&mut elapsed, std::time::Duration::from_secs(29), interval),
             "under interval must not save"
         );
         assert!(
-            player_save_due(
-                &mut elapsed,
-                std::time::Duration::from_secs(1),
-                interval
-            ),
+            player_save_due(&mut elapsed, std::time::Duration::from_secs(1), interval),
             "at interval must save"
         );
         assert_eq!(elapsed, std::time::Duration::ZERO, "timer resets after due");
         assert!(
-            !player_save_due(
-                &mut elapsed,
-                std::time::Duration::from_millis(16),
-                interval
-            ),
+            !player_save_due(&mut elapsed, std::time::Duration::from_millis(16), interval),
             "after reset must wait again"
         );
     }

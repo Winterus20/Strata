@@ -118,18 +118,31 @@ fn vs_main(@builtin(vertex_index) vi: u32,
   // faces (even face index) by one voxel here, in float space, to reach the true
   // plane. `-d` faces (odd index) stay at the owning voxel.
   p[axis] = p[axis] + f32(1u - (face & 1u));
-  // Distance-aware UV-plane expand: adjacent greedy quads / sector T-junctions
-  // leave sub-pixel gaps under perspective. Uncovered visbuf pixels stay at the
-  // cleared sentinel → resolve draws sky/fog, which reads as a black grid that
-  // thickens with distance. 0.0015 was far too small once a voxel is ~1px.
-  // Near: ~1cm seals seams; far: up to ~5cm so coverage still spans a pixel.
-  // Expand stays in-plane (no normal push) to avoid z-fight with coplanar faces.
+  // Screen-space in-plane expand: seal sub-pixel cracks between greedy quads
+  // without the centimeter-scale protrusion a fixed world offset caused. Scale
+  // to ~35% of one pixel at `dist`, capped so near geometry never thickens.
   var p_est = p;
   p_est[uaxis] = p_est[uaxis] + 0.5 * f32(w);
   p_est[vaxis] = p_est[vaxis] + 0.5 * f32(h);
   p_est = p_est + origins[ii].xyz;
   let dist = length(p_est - cam.eye.xyz);
-  let expand = 0.01 + 0.04 * clamp(dist * (1.0 / 160.0), 0.0, 1.0);
+  let focal = cam.proj[1][1];
+  let pixel_world = (2.0 * dist) / (focal * max(f32(cam.height), 1.0));
+  let face_normals = array<vec3<f32>, 6>(
+    vec3<f32>( 1.0,  0.0,  0.0),
+    vec3<f32>(-1.0,  0.0,  0.0),
+    vec3<f32>( 0.0,  1.0,  0.0),
+    vec3<f32>( 0.0, -1.0,  0.0),
+    vec3<f32>( 0.0,  0.0,  1.0),
+    vec3<f32>( 0.0,  0.0, -1.0)
+  );
+  let face_n = face_normals[min(face, 5u)];
+  let view_dir = normalize(cam.eye.xyz - p_est);
+  let ndotv = max(dot(face_n, view_dir), 0.0);
+  let grazing = 1.0 - ndotv;
+  // Less expand when looking straight at a face (reduces coplanar overlap);
+  // more at grazing angles to seal sub-pixel cracks on flat terrain.
+  let expand = clamp(pixel_world * mix(0.35, 0.85, grazing * grazing), 0.00005, 0.012);
   p[uaxis] = p[uaxis] + f32(du * w) + (f32(du) * 2.0 - 1.0) * expand;
   p[vaxis] = p[vaxis] + f32(dv * h) + (f32(dv) * 2.0 - 1.0) * expand;
   // Translate sector-local coords into world space by the per-quad origin.
@@ -157,26 +170,24 @@ fn vs_main(@builtin(vertex_index) vi: u32,
 fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   // WebGPU NDC depth: position.z in [0,1], 0 = near, 1 = far. Reversed-Z so a
   // nearer fragment yields a larger magnitude and wins the atomicMax.
-  // M12 visbuf v5: 13-bit reversed-Z depth; 21-bit quad_id (up to 2M SSBO slots).
+  // M12 visbuf v6: 17-bit reversed-Z depth; 17-bit quad_id (131072 SSBO slots).
   let rev = 1.0 - in.pos.z;
-  let depth = u32(rev * 8191.0);
+  let depth = u32(rev * 131071.0);
 
-  // Visbuf layout (v5):
+  // Visbuf layout (v6):
   //   bit[0:15]   voxel_pos  (15b),
   //   bit[15:19]  block_id   (4b),
   //   bit[19:27]  ao_corners (8b = 4 corners x 2b),
-  //   bit[27:48]  quad_id    (21b, global SSBO / lightmap slot),
-  //   bit[48:51]  normal     (3b),
-  //   bit[51:64]  depth      (13b, reversed-Z).
-  // sector_id stays on the interpolant for binding liveness but is not packed;
-  // those bits extend quad_id past the old 64K truncation.
+  //   bit[27:43]  quad_id    (17b, global SSBO / lightmap slot),
+  //   bit[44:46]  normal     (3b),
+  //   bit[47:63]  depth      (17b, reversed-Z).
   let _sid_alive = in.sector_id;
   let entry = (u64(in.voxel_pos) & u64(0x7FFFu))
             | ((u64(in.block_id) & u64(0xFu)) << 15u)
             | ((u64(in.ao_corners) & u64(0xFFu)) << 19u)
-            | ((u64(in.quad_id) & u64(0x1FFFFFu)) << 27u)
-            | ((u64(in.normal) & u64(0x7u)) << 48u)
-            | ((u64(depth) & u64(0x1FFFu)) << 51u);
+            | ((u64(in.quad_id) & u64(0x1FFFFu)) << 27u)
+            | ((u64(in.normal) & u64(0x7u)) << 44u)
+            | ((u64(depth) & u64(0x1FFFFu)) << 47u);
 
   var pix = u32(floor(in.pos.y) * f32(cam.width) + floor(in.pos.x));
   pix = min(pix, cam.width * cam.height - 1u);
@@ -273,8 +284,8 @@ pub fn prepass_pipeline(
     });
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("strata_prepass_layout"),
-        bind_group_layouts: &[layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
     });
     device.create_render_pipeline(&RenderPipelineDescriptor {
         label: Some("strata_prepass_pipeline"),
@@ -301,7 +312,7 @@ pub fn prepass_pipeline(
         },
         depth_stencil: None,
         multisample: MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }

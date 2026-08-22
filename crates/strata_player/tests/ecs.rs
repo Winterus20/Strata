@@ -8,7 +8,7 @@ use strata_core::prelude::*;
 use strata_player::controller::{PlayerController, PlayerLook, PlayerState};
 use strata_player::input::PlayerInput;
 use strata_player::interaction::{
-    PlayerBreak, PlayerPlace, player_break_system, player_place_system,
+    ChunkMap, PlayerBreak, PlayerPlace, player_break_system, player_place_system,
 };
 use strata_player::inventory::{Inventory, hotbar_system};
 
@@ -18,6 +18,7 @@ fn build_app() -> (App, Entity, Entity) {
     app.insert_resource(GlobalBrickPool::new());
     app.insert_resource(load_block_registry());
     app.insert_resource(PlayerInput::default());
+    app.insert_resource(ChunkMap::default());
     app.add_message::<PlayerBreak>();
     app.add_message::<PlayerPlace>();
     app.add_systems(
@@ -36,11 +37,17 @@ fn build_app() -> (App, Entity, Entity) {
         BlockId(1),
     )
     .expect("test set_block");
-    let snapshot = SectorSnapshot(std::sync::Arc::new(map.pack(&pool, &palette).expect("pack")));
+    let snapshot = SectorSnapshot(std::sync::Arc::new(
+        map.pack(&pool, &palette).expect("pack"),
+    ));
     let sector = app
         .world_mut()
         .spawn((SectorCoord(0, 0, 0), map, palette, snapshot))
         .id();
+    app.world_mut()
+        .resource_mut::<ChunkMap>()
+        .0
+        .insert(SectorCoord(0, 0, 0), sector);
 
     // Player positioned just outside the +Z face (default yaw=0 looks toward -Z),
     // with the eye (translation + EYE_HEIGHT) on the block's center line (y=7.5).
@@ -132,6 +139,7 @@ fn break_message_at_boundary_marks_neighbor_sector() {
     app.insert_resource(GlobalBrickPool::new());
     app.insert_resource(load_block_registry());
     app.insert_resource(PlayerInput::default());
+    app.insert_resource(ChunkMap::default());
     app.add_message::<PlayerBreak>();
     app.add_message::<PlayerPlace>();
     app.add_systems(
@@ -150,11 +158,17 @@ fn break_message_at_boundary_marks_neighbor_sector() {
         BlockId(1),
     )
     .expect("test boundary set_block");
-    let snapshot = SectorSnapshot(std::sync::Arc::new(map.pack(&pool, &palette).expect("pack")));
+    let snapshot = SectorSnapshot(std::sync::Arc::new(
+        map.pack(&pool, &palette).expect("pack"),
+    ));
     let sector = app
         .world_mut()
         .spawn((SectorCoord(0, 0, 0), map, palette, snapshot))
         .id();
+    app.world_mut()
+        .resource_mut::<ChunkMap>()
+        .0
+        .insert(SectorCoord(0, 0, 0), sector);
 
     // Spawn neighbor sector at (1, 0, 0)
     let neighbor_map = XBrickMap::new(SectorCoord(1, 0, 0));
@@ -171,6 +185,10 @@ fn break_message_at_boundary_marks_neighbor_sector() {
             neighbor_snapshot,
         ))
         .id();
+    app.world_mut()
+        .resource_mut::<ChunkMap>()
+        .0
+        .insert(SectorCoord(1, 0, 0), neighbor_sector);
 
     // Position player looking at the block at (31, 7, 3) in sector (0,0,0)
     // block center is at x=31.5, y=7.5, z=3.5.
@@ -219,6 +237,7 @@ fn break_message_crosses_sector_boundary() {
     app.insert_resource(GlobalBrickPool::new());
     app.insert_resource(load_block_registry());
     app.insert_resource(PlayerInput::default());
+    app.insert_resource(ChunkMap::default());
     app.add_message::<PlayerBreak>();
     app.add_message::<PlayerPlace>();
     app.add_systems(
@@ -229,26 +248,39 @@ fn break_message_crosses_sector_boundary() {
     let mut pool = GlobalBrickPool::new();
     let mut palette = SectorPalette::new();
     let map_a = XBrickMap::new(SectorCoord(0, 0, 0));
-    let snapshot_a = SectorSnapshot(std::sync::Arc::new(map_a.pack(&pool, &palette).expect("pack")));
+    let snapshot_a = SectorSnapshot(std::sync::Arc::new(
+        map_a.pack(&pool, &palette).expect("pack"),
+    ));
     let sector_a = app
         .world_mut()
         .spawn((SectorCoord(0, 0, 0), map_a, palette.clone(), snapshot_a))
         .id();
+    app.world_mut()
+        .resource_mut::<ChunkMap>()
+        .0
+        .insert(SectorCoord(0, 0, 0), sector_a);
 
     // Solid block in sector B at (0, 7, 3)
     let mut map_b = XBrickMap::new(SectorCoord(1, 0, 0));
-    map_b.set_block(
-        &mut pool,
-        &mut palette,
-        VoxelCoord::new(0, 7, 3),
-        BlockId(1),
-    )
-    .expect("test sector_b set_block");
-    let snapshot_b = SectorSnapshot(std::sync::Arc::new(map_b.pack(&pool, &palette).expect("pack")));
+    map_b
+        .set_block(
+            &mut pool,
+            &mut palette,
+            VoxelCoord::new(0, 7, 3),
+            BlockId(1),
+        )
+        .expect("test sector_b set_block");
+    let snapshot_b = SectorSnapshot(std::sync::Arc::new(
+        map_b.pack(&pool, &palette).expect("pack"),
+    ));
     let sector_b = app
         .world_mut()
         .spawn((SectorCoord(1, 0, 0), map_b, palette, snapshot_b))
         .id();
+    app.world_mut()
+        .resource_mut::<ChunkMap>()
+        .0
+        .insert(SectorCoord(1, 0, 0), sector_b);
 
     // Player stands in sector A at (31.5, 6.5, 3.5), looking towards +X (yaw = -90.0)
     app.world_mut().spawn((
@@ -296,6 +328,7 @@ fn place_message_crosses_sector_boundary() {
     app.insert_resource(GlobalBrickPool::new());
     app.insert_resource(load_block_registry());
     app.insert_resource(PlayerInput::default());
+    app.insert_resource(ChunkMap::default());
     app.add_message::<PlayerBreak>();
     app.add_message::<PlayerPlace>();
     app.add_systems(
@@ -308,26 +341,39 @@ fn place_message_crosses_sector_boundary() {
 
     // Empty sector A at (0, 0, 0)
     let map_a = XBrickMap::new(SectorCoord(0, 0, 0));
-    let snapshot_a = SectorSnapshot(std::sync::Arc::new(map_a.pack(&pool, &palette).expect("pack")));
+    let snapshot_a = SectorSnapshot(std::sync::Arc::new(
+        map_a.pack(&pool, &palette).expect("pack"),
+    ));
     let sector_a = app
         .world_mut()
         .spawn((SectorCoord(0, 0, 0), map_a, palette.clone(), snapshot_a))
         .id();
+    app.world_mut()
+        .resource_mut::<ChunkMap>()
+        .0
+        .insert(SectorCoord(0, 0, 0), sector_a);
 
     // Solid block in sector B at (0, 7, 3)
     let mut map_b = XBrickMap::new(SectorCoord(1, 0, 0));
-    map_b.set_block(
-        &mut pool,
-        &mut palette,
-        VoxelCoord::new(0, 7, 3),
-        BlockId(1),
-    )
-    .expect("test sector_b set_block");
-    let snapshot_b = SectorSnapshot(std::sync::Arc::new(map_b.pack(&pool, &palette).expect("pack")));
+    map_b
+        .set_block(
+            &mut pool,
+            &mut palette,
+            VoxelCoord::new(0, 7, 3),
+            BlockId(1),
+        )
+        .expect("test sector_b set_block");
+    let snapshot_b = SectorSnapshot(std::sync::Arc::new(
+        map_b.pack(&pool, &palette).expect("pack"),
+    ));
     let sector_b = app
         .world_mut()
         .spawn((SectorCoord(1, 0, 0), map_b, palette, snapshot_b))
         .id();
+    app.world_mut()
+        .resource_mut::<ChunkMap>()
+        .0
+        .insert(SectorCoord(1, 0, 0), sector_b);
 
     // Player stands in sector A at (29.5, 6.5, 3.5), looking towards +X (yaw = -90.0)
     // Hotbar has Stone (BlockId(1))

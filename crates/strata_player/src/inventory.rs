@@ -51,11 +51,11 @@ impl Inventory {
 
     /// Try to consume 1 item from the active slot. Returns `true` if an item was available and consumed.
     pub fn consume_active(&mut self) -> bool {
-        if let Some(stack) = self.hotbar.get_mut(self.active) {
-            if stack.count > 0 {
-                stack.count -= 1;
-                return true;
-            }
+        if let Some(stack) = self.hotbar.get_mut(self.active)
+            && stack.count > 0
+        {
+            stack.count -= 1;
+            return true;
         }
         false
     }
@@ -128,8 +128,10 @@ mod tests {
 
     #[test]
     fn active_slot_out_of_bounds_returns_empty_stack() {
-        let mut inv = Inventory::default();
-        inv.active = 99; // manually set out of bounds
+        let mut inv = Inventory {
+            active: 99,
+            ..Default::default()
+        };
         let slot = inv.active_slot();
         assert_eq!(slot.count, 0);
         assert_eq!(slot.block, BlockId::AIR);

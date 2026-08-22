@@ -16,6 +16,91 @@ use crate::streaming::{StreamingManager, load_priority};
 
 const LIGHTING_BUDGET: usize = 2;
 
+/// Dial 16-bucket queue for BFS lighting propagation (plan 13 §1.3).
+///
+/// Light levels range 0..=15, so 16 buckets map directly to levels.
+/// Dequeue is O(1) amortized via a rotating head pointer; insert is O(1).
+struct DialQueue {
+    buckets: [Vec<usize>; 16],
+    head: usize,
+}
+
+impl DialQueue {
+    fn new() -> Self {
+        Self {
+            buckets: Default::default(),
+            head: 0,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn clear(&mut self) {
+        for b in &mut self.buckets {
+            b.clear();
+        }
+        self.head = 0;
+    }
+
+    fn push(&mut self, idx: usize, level: u8) {
+        let bucket = (self.head + level as usize) % 16;
+        self.buckets[bucket].push(idx);
+    }
+
+    fn pop(&mut self) -> Option<(usize, u8)> {
+        loop {
+            if !self.buckets[self.head].is_empty() {
+                let idx = self.buckets[self.head].pop().unwrap();
+                let level = self.head as u8;
+                return Some((idx, level));
+            }
+            self.head = (self.head + 1) % 16;
+            if self.head == 0 {
+                return None;
+            }
+        }
+    }
+}
+
+/// Pooled visited bitset for `remove_source` (plan 13 §1.3).
+///
+/// Generation-stamped so the same allocation is reused across calls without
+/// clearing the entire buffer each time.
+struct VisitedPool {
+    bits: Vec<u64>,
+    generation: Vec<u32>,
+    current_gen: u32,
+}
+
+impl VisitedPool {
+    fn new() -> Self {
+        let words = SECTOR_VOXELS.div_ceil(64);
+        Self {
+            bits: vec![0u64; words],
+            generation: vec![0u32; words],
+            current_gen: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.current_gen = self.current_gen.wrapping_add(1);
+    }
+
+    #[inline]
+    fn is_visited(&self, idx: usize) -> bool {
+        let word = idx >> 6;
+        let bit = idx & 63;
+        self.generation[word] == self.current_gen && (self.bits[word] & (1u64 << bit)) != 0
+    }
+
+    #[inline]
+    fn mark(&mut self, idx: usize) {
+        let word = idx >> 6;
+        let bit = idx & 63;
+        self.generation[word] = self.current_gen;
+        self.bits[word] |= 1u64 << bit;
+    }
+}
+
 /// Per-frame timings for L0/L1 light compute (surfaced to client DIAG).
 #[derive(Resource, Default)]
 pub struct LightingTimers {
@@ -55,12 +140,7 @@ const NEIGHBOR_OFFSETS: [(i32, i32, i32); 6] = [
 /// Vertical sky is handled by the column-first pass at full strength. Mixing
 /// ±Y into the attenuation BFS lets light climb through a dug hole onto the
 /// floor-surface air layer and paint a Manhattan "glow" on neighbouring tops.
-const SKY_HORIZONTAL_OFFSETS: [(i32, i32, i32); 4] = [
-    (1, 0, 0),
-    (-1, 0, 0),
-    (0, 0, 1),
-    (0, 0, -1),
-];
+const SKY_HORIZONTAL_OFFSETS: [(i32, i32, i32); 4] = [(1, 0, 0), (-1, 0, 0), (0, 0, 1), (0, 0, -1)];
 
 /// Packed 16-bit light value.
 ///
@@ -130,7 +210,7 @@ impl LightData {
 /// Light is *derived* data. The buffer is heap-allocated (`Box`) so ECS
 /// insert/replace moves a pointer (~8 B) instead of memcpy'ing ~64 KiB when
 /// the component is not `Copy`. Indexed by local [`VoxelCoord`].
-#[derive(Debug, Clone, Component)]
+#[derive(Debug, Clone, PartialEq, Component)]
 pub struct SectorLight {
     pub data: Box<[LightData; SECTOR_VOXELS]>,
 }
@@ -216,8 +296,10 @@ impl LightEngine {
     ) -> (SectorLight, LightingTimers) {
         let pool_guard = pool.read_inner();
         let mut light = SectorLight::default();
-        let mut timers = LightingTimers::default();
-        timers.applied = 1;
+        let mut timers = LightingTimers {
+            applied: 1,
+            ..Default::default()
+        };
 
         let t0 = std::time::Instant::now();
         let sky_bfs = self.compute_sky(map, &pool_guard, palette, registry, &mut light);
@@ -235,8 +317,19 @@ impl LightEngine {
         (light, timers)
     }
 
-    /// Recompute a sector after an edit (block place/break). Full per-sector
-    /// recompute is the documented M7 behaviour (correct, not yet incremental).
+    /// Mutate `existing_light` after a known edit (block break/place).
+    ///
+    /// If the caller provides a [`DirtyVoxel`] describing the changed voxel and
+    /// its old `BlockId`, this method performs **incremental** lighting:
+    ///
+    /// | Change | Sky | Block light |
+    /// |--------|-----|-------------|
+    /// | Break  | Column (x,z) recompute + horizontal BFS re-seed from that column | `remove_source` if old block was a light source |
+    /// | Place  | Same column update | Propagate from the placed voxel if it emits light |
+    ///
+    /// Without a `DirtyVoxel` (e.g. first-generation sector), falls back to a
+    /// full [`compute_sector`].
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_edit(
         &self,
         coord: SectorCoord,
@@ -244,8 +337,165 @@ impl LightEngine {
         pool: &GlobalBrickPool,
         palette: &SectorPalette,
         registry: &BlockRegistry,
-    ) -> (SectorLight, LightingTimers) {
-        self.compute_sector(coord, map, pool, palette, registry)
+        existing_light: &mut SectorLight,
+        dirty: Option<&DirtyVoxel>,
+    ) -> LightingTimers {
+        let Some(dv) = dirty else {
+            let (light, timers) = self.compute_sector(coord, map, pool, palette, registry);
+            *existing_light = light;
+            return timers;
+        };
+
+        let pool_guard = pool.read_inner();
+        let mut timers = LightingTimers {
+            applied: 1,
+            ..Default::default()
+        };
+
+        // ---- Sky: column-only incremental ----
+        let t0 = std::time::Instant::now();
+        let sky_bfs = self.compute_sky_column(
+            map,
+            &pool_guard,
+            palette,
+            registry,
+            existing_light,
+            dv.voxel.x,
+            dv.voxel.z,
+        );
+        timers.sky_us = t0.elapsed().as_micros() as u64;
+        timers.sky_bfs_pushed = sky_bfs;
+
+        // ---- Block: incremental ----
+        let t1 = std::time::Instant::now();
+        let (block_bfs, sources) =
+            self.apply_block_incremental(map, &pool_guard, palette, registry, existing_light, dv);
+        timers.block_us = t1.elapsed().as_micros() as u64;
+        timers.block_bfs_pushed = block_bfs;
+        timers.light_sources = sources;
+        timers.apply_us = timers.sky_us + timers.block_us;
+
+        timers
+    }
+
+    /// Sky light for a single (x,z) column only, then re-seed the horizontal
+    /// BFS from sky-lit voxels in that column. ~32× cheaper than the full
+    /// all-column scan for single-voxel edits.
+    #[allow(clippy::too_many_arguments)]
+    fn compute_sky_column(
+        &self,
+        map: &XBrickMap,
+        pool: &InnerPool,
+        palette: &SectorPalette,
+        registry: &BlockRegistry,
+        light: &mut SectorLight,
+        cx: u32,
+        cz: u32,
+    ) -> usize {
+        // Phase 1: recompute the single column top-down.
+        let mut blocked = false;
+        for y in (0..SECTOR_DIM).rev() {
+            let c = VoxelCoord::new(cx, y, cz);
+            let id = map.get_block_locked(pool, palette, c);
+            let sky = if !registry.is_transparent(id) {
+                blocked = true;
+                0
+            } else if blocked {
+                0
+            } else {
+                MAX_LIGHT
+            };
+            light.data[SectorLight::idx_of(c)].set_sky(sky);
+        }
+
+        // Phase 2: seed horizontal BFS from this column only.
+        let mut bfs = DialQueue::new();
+        for y in 0..SECTOR_DIM {
+            let idx = SectorLight::idx_of(VoxelCoord::new(cx, y, cz));
+            if light.data[idx].sky() == 0 {
+                continue;
+            }
+            for (dx, _dy, dz) in SKY_HORIZONTAL_OFFSETS {
+                let nx = cx as i32 + dx;
+                let nz = cz as i32 + dz;
+                if nx < 0 || nz < 0 || nx >= SECTOR_DIM as i32 || nz >= SECTOR_DIM as i32 {
+                    continue;
+                }
+                let nc = VoxelCoord::new(nx as u32, y, nz as u32);
+                let nidx = SectorLight::idx_of(nc);
+                if light.data[nidx].sky() == 0 {
+                    let nid = map.get_block_locked(pool, palette, nc);
+                    if registry.is_transparent(nid) {
+                        bfs.push(idx, 1);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Run the same horizontal BFS as compute_sky.
+        let mut sky_bfs_count = 0usize;
+        while let Some((idx, level)) = bfs.pop() {
+            sky_bfs_count += 1;
+            let cur = light.data[idx].sky();
+            let new = cur.saturating_sub(1);
+            if new == 0 {
+                continue;
+            }
+            let (x, y, z) = coord_of(idx);
+            for (dx, _dy, dz) in SKY_HORIZONTAL_OFFSETS {
+                let nx = x as i32 + dx;
+                let nz = z as i32 + dz;
+                if nx < 0 || nz < 0 || nx >= SECTOR_DIM as i32 || nz >= SECTOR_DIM as i32 {
+                    continue;
+                }
+                let nc = VoxelCoord::new(nx as u32, y, nz as u32);
+                let nidx = SectorLight::idx_of(nc);
+                if light.data[nidx].sky() < new {
+                    let nid = map.get_block_locked(pool, palette, nc);
+                    if registry.is_transparent(nid) {
+                        light.data[nidx].set_sky(new);
+                        bfs.push(nidx, level);
+                    }
+                }
+            }
+        }
+        sky_bfs_count
+    }
+
+    /// Incremental block-light update after a single-voxel edit.
+    fn apply_block_incremental(
+        &self,
+        map: &XBrickMap,
+        pool: &InnerPool,
+        palette: &SectorPalette,
+        registry: &BlockRegistry,
+        light: &mut SectorLight,
+        dv: &DirtyVoxel,
+    ) -> (usize, usize) {
+        let idx = SectorLight::idx_of(dv.voxel);
+
+        // If the old block was a light source, remove its contribution first.
+        let old_emission = registry.light_emission(dv.old_block);
+        let mut bfs_count = 0usize;
+        if old_emission > 0 {
+            self.remove_source(dv.voxel, map, pool, palette, registry, light);
+        }
+
+        // If the current block emits light (placed a torch, etc.), seed and propagate.
+        let current_id = map.get_block_locked(pool, palette, dv.voxel);
+        let current_emission = registry.light_emission(current_id);
+        let mut sources = 0usize;
+        if current_emission > 0 {
+            let e = current_emission.min(MAX_LIGHT);
+            light.data[idx].set_block(e);
+            let mut increase = DialQueue::new();
+            increase.push(idx, e);
+            bfs_count = self.propagate_increase(&mut increase, map, pool, palette, registry, light);
+            sources = 1;
+        }
+
+        (bfs_count, sources)
     }
 
     /// L0 sky light: column-first top-down, then **horizontal-only** BFS spread.
@@ -287,15 +537,15 @@ impl LightEngine {
 
         // Phase 2: horizontal-only BFS with level-1 decay (plan 13 §1.4).
         // Seed: any sky-lit voxel with a transparent non-sky-lit *horizontal* neighbour.
-        let mut bfs: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        let mut bfs = DialQueue::new();
         for i in 0..SECTOR_VOXELS {
             if light.data[i].sky() == 0 {
                 continue;
             }
             let (x, y, z) = coord_of(i);
-            for (dx, dy, dz) in SKY_HORIZONTAL_OFFSETS {
+            for (dx, _dy, dz) in SKY_HORIZONTAL_OFFSETS {
                 let nx = x as i32 + dx;
-                let ny = y as i32 + dy;
+                let ny = y as i32;
                 let nz = z as i32 + dz;
                 if nx < 0
                     || ny < 0
@@ -311,7 +561,7 @@ impl LightEngine {
                 if light.data[nidx].sky() == 0 {
                     let nid = map.get_block_locked(pool, palette, nc);
                     if registry.is_transparent(nid) {
-                        bfs.push_back(i);
+                        bfs.push(i, 1);
                         break;
                     }
                 }
@@ -319,7 +569,7 @@ impl LightEngine {
         }
 
         let mut sky_bfs_count = 0usize;
-        while let Some(idx) = bfs.pop_front() {
+        while let Some((idx, level)) = bfs.pop() {
             sky_bfs_count += 1;
             let cur = light.data[idx].sky();
             let new = cur.saturating_sub(1);
@@ -327,9 +577,9 @@ impl LightEngine {
                 continue;
             }
             let (x, y, z) = coord_of(idx);
-            for (dx, dy, dz) in SKY_HORIZONTAL_OFFSETS {
+            for (dx, _dy, dz) in SKY_HORIZONTAL_OFFSETS {
                 let nx = x as i32 + dx;
-                let ny = y as i32 + dy;
+                let ny = y as i32;
                 let nz = z as i32 + dz;
                 if nx < 0
                     || ny < 0
@@ -346,7 +596,7 @@ impl LightEngine {
                     let nid = map.get_block_locked(pool, palette, nc);
                     if registry.is_transparent(nid) {
                         light.data[nidx].set_sky(new);
-                        bfs.push_back(nidx);
+                        bfs.push(nidx, level);
                     }
                 }
             }
@@ -369,7 +619,7 @@ impl LightEngine {
             d.set_block(0);
         }
 
-        let mut increase: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        let mut increase = DialQueue::new();
         let mut sources = 0usize;
         for i in 0..SECTOR_VOXELS {
             let (x, y, z) = coord_of(i);
@@ -378,7 +628,7 @@ impl LightEngine {
             if emission > 0 {
                 let e = emission.min(MAX_LIGHT);
                 light.data[i].set_block(e);
-                increase.push_back(i);
+                increase.push(i, e);
                 sources += 1;
             }
         }
@@ -391,7 +641,7 @@ impl LightEngine {
     /// exceeds their stored level. Terminates because levels are bounded/capped.
     fn propagate_increase(
         &self,
-        queue: &mut std::collections::VecDeque<usize>,
+        queue: &mut DialQueue,
         map: &XBrickMap,
         pool: &InnerPool,
         palette: &SectorPalette,
@@ -399,7 +649,7 @@ impl LightEngine {
         light: &mut SectorLight,
     ) -> usize {
         let mut count = 0usize;
-        while let Some(idx) = queue.pop_front() {
+        while let Some((idx, _level)) = queue.pop() {
             count += 1;
             let cur = light.data[idx].block();
             let (x, y, z) = coord_of(idx);
@@ -425,7 +675,7 @@ impl LightEngine {
                 let new = cur.saturating_sub(1);
                 if new > light.data[nidx].block() {
                     light.data[nidx].set_block(new);
-                    queue.push_back(nidx);
+                    queue.push(nidx, new);
                 }
             }
         }
@@ -441,18 +691,17 @@ impl LightEngine {
     /// Phase 2 (increase): re-propagate from boundary sources only (not all
     /// emitters), restoring coverage from remaining lights.
     ///
-    /// Uses a `Vec<bool>` visited set to ensure each node is processed at most
-    /// once (K3), bringing complexity from O(15N) to O(N).
+    /// Uses a pooled, generation-stamped visited set (plan 13 §1.3) to ensure
+    /// each node is processed at most once, bringing complexity from O(15N) to O(N).
     pub fn remove_source(
         &self,
         source: VoxelCoord,
         map: &XBrickMap,
-        pool: &GlobalBrickPool,
+        pool: &InnerPool,
         palette: &SectorPalette,
         registry: &BlockRegistry,
         light: &mut SectorLight,
     ) {
-        let pool_guard = pool.read_inner();
         let sidx = SectorLight::idx_of(source);
 
         // Save the source's old level before zeroing.
@@ -463,29 +712,24 @@ impl LightEngine {
         // Each entry stores (index, level_at_source) — the level the removed
         // source contributed at that distance.
         //
-        // Visited set: packed `u64` bitmask (512 words for 32³ voxels) instead
-        // of `Vec<bool>` — avoids the `Vec<bool>` anti-pattern and its per-element
-        // proxy overhead. No new crate dependency required.
-        let mut visited: Vec<u64> = vec![0u64; SECTOR_VOXELS.div_ceil(64)];
-        // Helper: set bit `i`.
-        visited[sidx >> 6] |= 1u64 << (sidx & 63);
+        // Visited set: pooled, generation-stamped bitset — no per-call allocation.
+        let mut visited = VisitedPool::new();
+        visited.reset();
+        visited.mark(sidx);
 
-        let mut decrease: std::collections::VecDeque<(usize, u8)> =
-            std::collections::VecDeque::new();
+        let mut decrease = DialQueue::new();
         // Seed neighbors of the source with level = old_level - 1.
         let seed_level = old_level.saturating_sub(1);
         for n in self.neighbor_indices(sidx) {
-            let word = n >> 6;
-            let bit = n & 63;
-            if (visited[word] & (1u64 << bit)) == 0 {
-                visited[word] |= 1u64 << bit;
-                decrease.push_back((n, seed_level));
+            if !visited.is_visited(n) {
+                visited.mark(n);
+                decrease.push(n, seed_level);
             }
         }
 
         let mut boundary_sources: Vec<usize> = Vec::new();
 
-        while let Some((idx, src_contrib)) = decrease.pop_front() {
+        while let Some((idx, src_contrib)) = decrease.pop() {
             let cur = light.data[idx].block();
             if cur == 0 {
                 // Already dark — nothing to propagate through.
@@ -498,11 +742,9 @@ impl LightEngine {
                 let next_level = src_contrib.saturating_sub(1);
                 if next_level > 0 {
                     for n in self.neighbor_indices(idx) {
-                        let word = n >> 6;
-                        let bit = n & 63;
-                        if (visited[word] & (1u64 << bit)) == 0 {
-                            visited[word] |= 1u64 << bit;
-                            decrease.push_back((n, next_level));
+                        if !visited.is_visited(n) {
+                            visited.mark(n);
+                            decrease.push(n, next_level);
                         }
                     }
                 }
@@ -515,11 +757,12 @@ impl LightEngine {
         }
 
         // Phase 2: re-propagate from boundary sources only.
-        let mut increase: std::collections::VecDeque<usize> = std::collections::VecDeque::new();
+        let mut increase = DialQueue::new();
         for &idx in &boundary_sources {
-            increase.push_back(idx);
+            let lvl = light.data[idx].block();
+            increase.push(idx, lvl);
         }
-        self.propagate_increase(&mut increase, map, &pool_guard, palette, registry, light);
+        self.propagate_increase(&mut increase, map, pool, palette, registry, light);
     }
 
     #[inline]
@@ -554,8 +797,11 @@ impl LightEngine {
 /// set. Filter-First — only `Generated` sectors missing `SectorLight` or with
 /// `ChunkDirty` are (re)computed. `ChunkDirty` is cleared here after a successful
 /// pass: Physics (earlier in the `StrataSet` chain) and save (`Added<ChunkDirty>`)
-/// already observed it this frame. Leaving it forever re-lit + re-meshed every
-/// frame (pending never drains, phys_sync thrash).
+/// already observed it this frame. Leaving it forever re-lit every frame.
+///
+/// Does **not** insert `NeedsRemesh`: light-only updates refresh via
+/// `Changed<SectorLight>` → client lightmap re-upload. Geometry remesh is owned
+/// by interaction / `mark_generated_for_remesh` (Meshing runs before Lighting).
 pub struct LightingPlugin;
 
 impl StrataPlugin for LightingPlugin {
@@ -574,6 +820,10 @@ impl StrataPlugin for LightingPlugin {
 
 /// Filter-First lighting pass: recompute `SectorLight` for changed/generated
 /// sectors and store it as a component on the sector entity.
+///
+/// For sectors carrying a [`DirtyVoxel`] (single-voxel edit), uses incremental
+/// column-only sky + single-source block light via [`LightEngine::apply_edit`].
+/// First-generation sectors fall back to full [`LightEngine::compute_sector`].
 #[allow(clippy::type_complexity)]
 fn lighting_system(
     mut commands: Commands,
@@ -582,8 +832,15 @@ fn lighting_system(
     engine: Res<LightEngine>,
     streaming: Option<Res<StreamingManager>>,
     mut timers: ResMut<LightingTimers>,
-    query: Query<
-        (Entity, &SectorCoord, &XBrickMap, &SectorPalette),
+    mut query: Query<
+        (
+            Entity,
+            &SectorCoord,
+            &XBrickMap,
+            &SectorPalette,
+            Option<&mut SectorLight>,
+            Option<&DirtyVoxel>,
+        ),
         (
             With<Generated>,
             Or<(Without<SectorLight>, With<ChunkDirty>)>,
@@ -607,24 +864,50 @@ fn lighting_system(
         .unwrap_or(SectorCoord(0, 0, 0));
 
     let t0 = std::time::Instant::now();
-    let mut pending: Vec<(Entity, SectorCoord, &XBrickMap, &SectorPalette)> = Vec::new();
-    for (entity, coord, map, palette) in &query {
-        pending.push((entity, *coord, map, palette));
+    let mut pending: Vec<(
+        Entity,
+        SectorCoord,
+        &XBrickMap,
+        &SectorPalette,
+        Option<Mut<SectorLight>>,
+        Option<&DirtyVoxel>,
+    )> = Vec::new();
+    for (entity, coord, map, palette, light, dv) in &mut query {
+        pending.push((entity, *coord, map, palette, light, dv));
     }
-    pending.sort_by_key(|(_, c, _, _)| load_priority(player, move_dir, *c));
+    pending.sort_by_key(|(_, c, _, _, _, _)| load_priority(player, move_dir, *c));
     let mut budget = LIGHTING_BUDGET;
-    for (entity, coord, map, palette) in pending {
+    for (entity, coord, map, palette, existing_light, dirty) in pending {
         if budget == 0 {
             break;
         }
-        let (light, t) = engine.compute_sector(coord, map, &pool, palette, &registry);
-        // Clear ChunkDirty only for sectors we actually processed this frame so
-        // budget overflow keeps remaining dirty sectors queued for next tick.
-        commands
-            .entity(entity)
-            .insert(light)
-            .insert(NeedsRemesh)
-            .remove::<ChunkDirty>();
+
+        let t;
+        if let Some(mut current_light) = existing_light {
+            // Already has SectorLight — use incremental path.
+            // Clone to compute the new value, then use set_if_neq to only
+            // trigger Changed<SectorLight> when the value actually differs.
+            // This avoids the explicit O(32K) comparison in user code —
+            // set_if_neq handles it internally and conditionally updates the
+            // change tick, preventing GPU lightmap re-dirty on no-op updates.
+            let mut new_light = current_light.clone();
+            t = engine.apply_edit(coord, map, &pool, palette, &registry, &mut new_light, dirty);
+            current_light.set_if_neq(new_light);
+            commands
+                .entity(entity)
+                .remove::<ChunkDirty>()
+                .remove::<DirtyVoxel>();
+        } else {
+            // First generation — full compute.
+            let (light, full_t) = engine.compute_sector(coord, map, &pool, palette, &registry);
+            t = full_t;
+            commands
+                .entity(entity)
+                .insert(light)
+                .remove::<ChunkDirty>()
+                .remove::<DirtyVoxel>();
+        }
+
         budget -= 1;
         timers.applied += 1;
         timers.sky_us += t.sky_us;

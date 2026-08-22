@@ -5,6 +5,8 @@
 //! and queried with archetype-level `With<T>`/`Without<T>` filters — never a
 //! per-entity `if option.is_some()` check.
 
+use crate::registry::BlockId;
+use crate::xbrickmap::VoxelCoord;
 use bevy::prelude::*;
 
 /// A 32³ sector coordinate in sector-space (not voxel-space).
@@ -36,6 +38,17 @@ pub enum Tier {
 #[derive(Debug, Component)]
 #[component(storage = "SparseSet")]
 pub struct ChunkDirty;
+
+/// Records which voxel was edited and its previous block ID, so the lighting
+/// system can perform incremental (column-only sky + single-source block)
+/// recomputation instead of a full 32³ sector BFS.
+#[derive(Debug, Clone, Component)]
+#[component(storage = "SparseSet")]
+pub struct DirtyVoxel {
+    pub voxel: VoxelCoord,
+    /// Block ID before the edit (`BlockId::AIR` means the voxel was empty).
+    pub old_block: BlockId,
+}
 
 /// Marker: sector mesh must be rebuilt.
 #[derive(Debug, Component)]
@@ -80,4 +93,41 @@ pub fn count_dirty_sectors(
     mut count: ResMut<DirtySectorCount>,
 ) {
     count.set_if_neq(DirtySectorCount(dirty.iter().count() as u32));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// DirtyVoxel must be constructible with the correct voxel coordinate and
+    /// previous block ID, and both fields must be accessible.
+    #[test]
+    fn dirty_voxel_fields_accessible() {
+        let voxel = VoxelCoord::new(5, 10, 15);
+        let old_block = BlockId(42);
+
+        let dirty = DirtyVoxel { voxel, old_block };
+
+        assert_eq!(
+            dirty.voxel, voxel,
+            "voxel field must match the constructed value"
+        );
+        assert_eq!(dirty.voxel.x, 5);
+        assert_eq!(dirty.voxel.y, 10);
+        assert_eq!(dirty.voxel.z, 15);
+
+        assert_eq!(
+            dirty.old_block, old_block,
+            "old_block field must match the constructed value"
+        );
+        assert_eq!(dirty.old_block.0, 42);
+
+        // The AIR sentinel is a valid old_block (voxel was empty before edit).
+        let air_dirty = DirtyVoxel {
+            voxel: VoxelCoord::new(0, 0, 0),
+            old_block: BlockId::AIR,
+        };
+        assert_eq!(air_dirty.old_block, BlockId::AIR);
+        assert_eq!(air_dirty.voxel, VoxelCoord::new(0, 0, 0));
+    }
 }

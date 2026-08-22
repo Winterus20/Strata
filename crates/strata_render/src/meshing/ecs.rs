@@ -380,6 +380,16 @@ pub fn spawn_mesh_tasks(
     timers.spawn_us = spawn_t0.elapsed().as_micros() as u64;
 }
 
+/// True when a finished mesh task must be discarded: the sector was edited
+/// (or otherwise re-queued) after the snapshot was taken **and** a prior mesh
+/// already exists. Publishing that stale mesh would upload wrong quads/origins
+/// (dig → morph / multi-texture). First-ever meshes still apply even if
+/// `NeedsRemesh` was re-queued (streaming remesh-on-load), otherwise the
+/// storage stays empty while neighbors keep bouncing the flag.
+pub(crate) fn should_discard_stale_mesh(needs_remesh_again: bool, already_has_mesh: bool) -> bool {
+    needs_remesh_again && already_has_mesh
+}
+
 /// Poll completed background meshing tasks and apply their results on the main
 /// thread (insert into [`MeshStorage`], bump generation, drive `remesh-on-load`).
 pub fn apply_mesh_tasks(
@@ -387,7 +397,7 @@ pub fn apply_mesh_tasks(
     mut pending: ResMut<PendingMesh>,
     mut storage: ResMut<MeshStorage>,
     mut timers: ResMut<MeshingTimers>,
-    all: Query<(Entity, &SectorCoord)>,
+    all: Query<(Entity, &SectorCoord, Option<&NeedsRemesh>)>,
     streaming: Option<Res<strata_world::streaming::StreamingManager>>,
 ) {
     timers.apply_us = 0;
@@ -421,6 +431,30 @@ pub fn apply_mesh_tasks(
         apply_budget -= 1;
         timers.applied += 1;
 
+        // Resolve the sector entity + whether a newer edit re-queued remesh
+        // while this task was in flight (snapshot is then stale).
+        let entity_info = if let Some(sm) = &streaming {
+            sm.entity_for(&coord).map(|e| {
+                let stale = all.get(e).ok().and_then(|(_, _, n)| n).is_some();
+                (e, stale)
+            })
+        } else {
+            all.iter()
+                .find(|(_, c, _)| **c == coord)
+                .map(|(e, _, n)| (e, n.is_some()))
+        };
+
+        if let Some((ne, stale)) = entity_info
+            && should_discard_stale_mesh(stale, storage.meshes.contains_key(&coord))
+        {
+            // Drop the stale result; `NeedsRemesh` stays so spawn takes a fresh
+            // snapshot. Do not touch MeshStorage / dirty / neighbor_mask.
+            let _ = ne;
+            let _ = mesh;
+            let _ = mt;
+            continue;
+        }
+
         storage.version += 1;
         let mut mesh = mesh;
         mesh.generation = storage.version;
@@ -429,12 +463,7 @@ pub fn apply_mesh_tasks(
         storage.dirty.insert(coord);
 
         // Mark the sector entity as Meshed
-        let entity = if let Some(sm) = &streaming {
-            sm.entity_for(&coord)
-        } else {
-            all.iter().find(|(_, c)| **c == coord).map(|(e, _)| e)
-        };
-        if let Some(ne) = entity {
+        if let Some((ne, _)) = entity_info {
             commands.entity(ne).insert(Meshed);
             // First-pass mesh skipped neighbor planes while neighbors were
             // resident: re-queue so the repair pass (already_meshed → no skip)
@@ -463,7 +492,7 @@ pub fn apply_mesh_tasks(
                 let ne = if let Some(sm) = &streaming {
                     sm.entity_for(&n)
                 } else {
-                    all.iter().find(|(_, c)| **c == n).map(|(e, _)| e)
+                    all.iter().find(|(_, c, _)| **c == n).map(|(e, _, _)| e)
                 };
                 if let Some(ne) = ne {
                     commands.entity(ne).insert(NeedsRemesh);
@@ -519,6 +548,17 @@ mod tests {
             !needs_boundary_repair(true, 0),
             "skip with no neighbors needs no repair"
         );
+    }
+
+    #[test]
+    fn discard_stale_mesh_when_needs_remesh_requeued() {
+        // Dig while a remesh of an *already meshed* sector is in flight.
+        assert!(should_discard_stale_mesh(true, true));
+        // Streaming remesh-on-load may set NeedsRemesh before the first mesh
+        // lands — still publish so MeshStorage is not starved.
+        assert!(!should_discard_stale_mesh(true, false));
+        assert!(!should_discard_stale_mesh(false, true));
+        assert!(!should_discard_stale_mesh(false, false));
     }
 
     #[test]

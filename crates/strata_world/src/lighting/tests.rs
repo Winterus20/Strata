@@ -135,7 +135,19 @@ fn two_phase_removal_recompute() {
 
     // Break the block, recompute (apply_edit path).
     set(&mut map, &mut pool, &mut pal, 16, 16, 16, BlockId::AIR);
-    (light, _) = engine.apply_edit(SectorCoord(0, 0, 0), &map, &pool, &pal, &reg);
+    let dv = DirtyVoxel {
+        voxel: c,
+        old_block: glow,
+    };
+    let _timers = engine.apply_edit(
+        SectorCoord(0, 0, 0),
+        &map,
+        &pool,
+        &pal,
+        &reg,
+        &mut light,
+        Some(&dv),
+    );
 
     // Light retracts: previously-lit voxels return to 0.
     assert_eq!(light.block(probe), 0);
@@ -156,7 +168,7 @@ fn two_phase_removal_remove_source() {
 
     // Break the block in the map, THEN run two-phase removal (real edit order).
     set(&mut map, &mut pool, &mut pal, 10, 10, 10, BlockId::AIR);
-    engine.remove_source(c, &map, &pool, &pal, &reg, &mut light);
+    engine.remove_source(c, &map, &pool.read_inner(), &pal, &reg, &mut light);
 
     for i in 0..SECTOR_VOXELS {
         assert_eq!(
@@ -182,7 +194,7 @@ fn two_phase_removal_keeps_remaining_source() {
 
     // Break `a` in the map, THEN run two-phase removal (real edit order).
     set(&mut map, &mut pool, &mut pal, 5, 5, 5, BlockId::AIR);
-    engine.remove_source(a, &map, &pool, &pal, &reg, &mut light);
+    engine.remove_source(a, &map, &pool.read_inner(), &pal, &reg, &mut light);
 
     // Source `b` survives and still lights; `a` is dark.
     assert_eq!(light.block(b), 15);
@@ -354,6 +366,13 @@ fn sky_does_not_spread_through_opaque() {
     let engine = LightEngine::default();
     let (light, _timers) = engine.compute_sector(SectorCoord(0, 0, 0), &map, &pool, &pal, &reg);
 
+    // The wall voxel itself is opaque -> sky must be 0.
+    assert_eq!(
+        light.sky(VoxelCoord::new(16, 10, 16)),
+        0,
+        "opaque wall voxel must not receive sky light"
+    );
+
     // Both sides are open columns, so they get full sky. The wall is opaque.
     // Sky light should not pass through the wall.
     assert_eq!(
@@ -482,7 +501,7 @@ fn remove_source_no_ghost_lights() {
 
     // Remove source.
     set(&mut map, &mut pool, &mut pal, 16, 16, 16, BlockId::AIR);
-    engine.remove_source(c, &map, &pool, &pal, &reg, &mut light);
+    engine.remove_source(c, &map, &pool.read_inner(), &pal, &reg, &mut light);
 
     // Every voxel should be 0 (no ghost lights).
     for i in 0..SECTOR_VOXELS {
@@ -519,7 +538,7 @@ fn remove_source_preserves_other_source_in_overlap() {
 
     // Remove source A.
     set(&mut map, &mut pool, &mut pal, 10, 16, 16, BlockId::AIR);
-    engine.remove_source(a, &map, &pool, &pal, &reg, &mut light);
+    engine.remove_source(a, &map, &pool.read_inner(), &pal, &reg, &mut light);
 
     // Source A's position is now AIR. Source B at (20,16,16) contributes
     // level 5 at distance 10 through the air. This is correct behavior.
@@ -585,9 +604,10 @@ fn lighting_plugin_computes_sector_component() {
     assert_eq!(light.block(VoxelCoord::new(16, 16, 16)), 15);
     assert_eq!(light.sky(VoxelCoord::new(16, 31, 16)), 15);
 
-    app.world()
-        .get::<NeedsRemesh>(e)
-        .expect("NeedsRemesh should be inserted with SectorLight");
+    assert!(
+        app.world().get::<NeedsRemesh>(e).is_none(),
+        "lighting must not insert NeedsRemesh (light-only → SectorLight/lightmap)"
+    );
     assert!(
         app.world().get::<ChunkDirty>(e).is_none(),
         "ChunkDirty must clear after lighting so remesh/phys do not thrash"
@@ -618,10 +638,11 @@ fn chunk_dirty_lighting_does_not_retrash_next_frame() {
 
     app.update();
     assert!(app.world().get::<ChunkDirty>(e).is_none());
-    assert!(app.world().get::<NeedsRemesh>(e).is_some());
+    assert!(
+        app.world().get::<NeedsRemesh>(e).is_none(),
+        "ChunkDirty lighting must not queue a geometry remesh"
+    );
 
-    // Simulate meshing consuming NeedsRemesh; a stuck ChunkDirty would re-insert it.
-    app.world_mut().entity_mut(e).remove::<NeedsRemesh>();
     app.update();
 
     let timers = app.world().resource::<LightingTimers>();
@@ -632,6 +653,49 @@ fn chunk_dirty_lighting_does_not_retrash_next_frame() {
     assert!(
         app.world().get::<NeedsRemesh>(e).is_none(),
         "lighting must not re-queue NeedsRemesh without a new dirty/edit"
+    );
+}
+
+/// Dig path: interaction inserts NeedsRemesh+ChunkDirty; meshing consumes
+/// NeedsRemesh before Lighting. Lighting must refresh SectorLight only — not
+/// re-insert NeedsRemesh (would cause a second remesh for the same dig).
+#[test]
+fn lighting_after_meshed_dig_does_not_second_remesh() {
+    use strata_core::plugin::AddStrataPlugin;
+
+    let reg = registry();
+    let glow = reg.id_by_name("glowstone").unwrap();
+    let mut pool = GlobalBrickPool::new();
+    let mut pal = SectorPalette::new();
+    let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+    set(&mut map, &mut pool, &mut pal, 16, 16, 16, glow);
+
+    let mut app = App::new();
+    app.add_strata_plugin(StrataSchedulingPlugin);
+    app.add_strata_plugin(BlockRegistryPlugin);
+    app.insert_resource(pool);
+    app.add_strata_plugin(LightingPlugin);
+
+    // Post-meshing state for a dig: geometry remesh already applied, light pending.
+    let e = app
+        .world_mut()
+        .spawn((
+            SectorCoord(0, 0, 0),
+            map,
+            pal,
+            Generated,
+            ChunkDirty,
+            SectorLight::default(),
+        ))
+        .id();
+
+    app.update();
+
+    assert!(app.world().get::<SectorLight>(e).is_some());
+    assert!(app.world().get::<ChunkDirty>(e).is_none());
+    assert!(
+        app.world().get::<NeedsRemesh>(e).is_none(),
+        "light-only ChunkDirty pass must not thrash NeedsRemesh after dig remesh"
     );
 }
 
@@ -674,12 +738,12 @@ fn lighting_system_counts_sectors_once() {
 
     app.update();
 
-    // Both sectors receive SectorLight and NeedsRemesh; dirty flag is consumed.
+    // Both sectors receive SectorLight; dirty flag is consumed; no remesh thrash.
     assert!(app.world().get::<SectorLight>(e_dirty).is_some());
-    assert!(app.world().get::<NeedsRemesh>(e_dirty).is_some());
+    assert!(app.world().get::<NeedsRemesh>(e_dirty).is_none());
     assert!(app.world().get::<ChunkDirty>(e_dirty).is_none());
     assert!(app.world().get::<SectorLight>(e_new).is_some());
-    assert!(app.world().get::<NeedsRemesh>(e_new).is_some());
+    assert!(app.world().get::<NeedsRemesh>(e_new).is_none());
 
     // Exactly 2 sectors processed (no double-count).
     let timers = app.world().resource::<LightingTimers>();

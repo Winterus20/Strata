@@ -238,10 +238,7 @@ fn region_undersized_slot_rejected_no_panic() {
     let result = std::panic::catch_unwind(|| RegionFile::open(&path));
     assert!(result.is_ok(), "parse must not panic");
     let open = result.unwrap();
-    assert!(
-        open.is_err(),
-        "slot size < SectorHeader must be rejected"
-    );
+    assert!(open.is_err(), "slot size < SectorHeader must be rejected");
 
     cleanup(&dir);
 }

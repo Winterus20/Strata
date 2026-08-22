@@ -309,12 +309,41 @@ fn transparent_block_goes_to_transparent_batch() {
     let mut pool = GlobalBrickPool::new();
     let mut palette = SectorPalette::new();
     let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
-    map.set_block(&mut pool, &mut palette, VoxelCoord::new(5, 5, 5), glass);
+    let _ = map.set_block(&mut pool, &mut palette, VoxelCoord::new(5, 5, 5), glass);
 
     let mesher = GreedyMesher::new(&reg);
     let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &none_neighbors(&pool));
     assert_eq!(mesh.transparent.len(), 6);
     assert!(mesh.opaque.is_empty());
+}
+
+/// Worldgen places leaf/water/ice as transparent; they must still reach the
+/// prepass upload or they render as holes in the world.
+#[test]
+fn worldgen_transparent_blocks_reach_prepass_upload() {
+    let reg = load_block_registry();
+    let mesher = GreedyMesher::new(&reg);
+    for name in ["leaf", "water", "ice", "glass"] {
+        let id = reg
+            .id_by_name(name)
+            .unwrap_or_else(|| panic!("{name} registered"));
+        let mut pool = GlobalBrickPool::new();
+        let mut palette = SectorPalette::new();
+        let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
+        let _ = map.set_block(&mut pool, &mut palette, VoxelCoord::new(8, 8, 8), id);
+        let mesh = mesher.mesh_sector(&map, &palette, &pool, &reg, &none_neighbors(&pool));
+        assert!(
+            !mesh.transparent_gpu.is_empty(),
+            "{name} must mesh into transparent_gpu"
+        );
+        let upload = crate::pipeline::mesh_prepass_bytes(&mesh);
+        assert_eq!(
+            upload.len(),
+            mesh.opaque_gpu.len() + mesh.transparent_gpu.len(),
+            "{name} transparent quads must not be dropped from prepass upload"
+        );
+        assert!(!upload.is_empty(), "{name}-only sector must upload quads");
+    }
 }
 
 /// Stress: build a wide variety of blocks and ensure meshing never panics and

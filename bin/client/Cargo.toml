@@ -12,9 +12,9 @@ path = "src/main.rs"
 dev = ["bevy/dynamic_linking"]
 
 [dependencies]
-# Window + input ONLY. Bevy's render feature is intentionally disabled so WE own
-# the single wgpu device (strata_render's Renderer). The `bevy_*` features below
-# pull in just windowing/input/log; all render-dependent plugins are cfg'd out.
+# Window + input + render. Per plan 31 §1.5, Bevy's RenderPlugin is ENABLED
+# (creates the single wgpu device/surface). ClientGpu borrows Bevy's
+# RenderDevice/RenderQueue — no independent wgpu::Instance/Device/Surface.
 bevy = { workspace = true, default-features = false, features = [
     "std",
     "bevy_window",
@@ -25,15 +25,12 @@ bevy = { workspace = true, default-features = false, features = [
     # size matters; keep for local schedule debugging.
     "debug",
     # Rapier's physics plugin conditionally adds AssetPlugin/MeshPlugin/ScenePlugin,
-    # so those crates must be compiled (they do NOT pull in bevy_render).
+    # so those crates must be compiled.
     "bevy_asset",
     "bevy_mesh",
     "bevy_scene",
-    # The client references `bevy::render::RenderPlugin` (to disable it) and
-    # `bevy::shader::{Shader, ShaderLoader}` (to register the asset itself since
-    # RenderPlugin is off). These types live behind `bevy_render`, so the client
-    # must enable it explicitly — previously it leaked in via strata_render's
-    # `default-features = true` (now removed for modularity).
+    # RenderPlugin is now ENABLED (was disabled to avoid double-device conflict).
+    # It creates Bevy's wgpu device/surface that ClientGpu borrows.
     "bevy_render",
 ] }
 bevy_rapier3d = { workspace = true }
@@ -52,8 +49,7 @@ strata_storage = { path = "../../crates/strata_storage" }
 postcard = { version = "1.1", features = ["alloc"] }
 blake3 = { workspace = true }
 
-# GPU + helpers for M9b surface presentation (same wgpu 27 line as strata_render).
-wgpu = "27"
+# GPU helpers for M9b surface presentation (wgpu version aligned with Bevy 0.18).
+wgpu = "29"
 bytemuck = { version = "1", features = ["derive"] }
-raw-window-handle = "0.6"
 pollster = "0.4"

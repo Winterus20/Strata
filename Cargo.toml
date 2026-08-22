@@ -18,8 +18,8 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/Kilo-Org/strata"
 
 [workspace.dependencies]
-bevy = { version = "0.18", default-features = false }
-bevy_rapier3d = { version = "0.34", default-features = false, features = [
+bevy = { version = "0.19", default-features = false }
+bevy_rapier3d = { version = "0.35", default-features = false, features = [
     "enhanced-determinism",
     "dim3",
 ] }

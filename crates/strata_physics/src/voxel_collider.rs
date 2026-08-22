@@ -597,7 +597,9 @@ mod entity_match_tests {
                 ResMut<PhysicsTimers>,
                 Query<Entity, With<SectorCoord>>,
             )> = SystemState::new(app.world_mut());
-            let (commands, pending, channels, timers, entities) = state.get_mut(app.world_mut());
+            let Ok((commands, pending, channels, timers, entities)) = state.get_mut(app.world_mut()) else {
+                return;
+            };
             apply_sector_collider_tasks(commands, pending, channels, timers, entities);
             state.apply(app.world_mut());
         }

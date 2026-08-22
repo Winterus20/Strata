@@ -404,14 +404,14 @@ pub fn player_controller_system(
             wy.div_euclid(32) as i32,
             wz.div_euclid(32) as i32,
         );
-        if let Some(&entity) = sector_index.get(&sc) {
-            if let Ok((_, _, m, palette)) = sectors.get(entity) {
-                let lx = wx.rem_euclid(32) as u32;
-                let ly = wy.rem_euclid(32) as u32;
-                let lz = wz.rem_euclid(32) as u32;
-                let id = m.get_block(&pool, palette, VoxelCoord::new(lx, ly, lz));
-                return id != BlockId::AIR && registry.is_solid(id);
-            }
+        if let Some(&entity) = sector_index.get(&sc)
+            && let Ok((_, _, m, palette)) = sectors.get(entity)
+        {
+            let lx = wx.rem_euclid(32) as u32;
+            let ly = wy.rem_euclid(32) as u32;
+            let lz = wz.rem_euclid(32) as u32;
+            let id = m.get_block(&pool, palette, VoxelCoord::new(lx, ly, lz));
+            return id != BlockId::AIR && registry.is_solid(id);
         }
         false
     };

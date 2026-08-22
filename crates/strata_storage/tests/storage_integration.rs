@@ -248,7 +248,9 @@ async fn write_sector_awaits_durable_completion() {
     // No sleep / no flush — Ok implies the region file already has the sector.
     let path = strata_storage::backend::region_path_for(&dir, coord);
     let rf = RegionFile::open(&path).unwrap();
-    let (_h, on_disk) = rf.read_sector(coord).expect("durable write must be on disk");
+    let (_h, on_disk) = rf
+        .read_sector(coord)
+        .expect("durable write must be on disk");
     let decompressed = strata_storage::compress::decompress(&on_disk).unwrap();
     assert_eq!(decompressed, payload);
 
@@ -327,7 +329,10 @@ async fn read_accepts_legacy_uncompressed_payload() {
     }
 
     let backend = TokioBackend::new(dir.clone()).unwrap();
-    let read = backend.read_sector(coord).await.expect("legacy raw must load");
+    let read = backend
+        .read_sector(coord)
+        .await
+        .expect("legacy raw must load");
     assert_eq!(read, payload);
 
     cleanup(&dir);

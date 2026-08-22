@@ -494,7 +494,8 @@ mod tests {
         let mut palette = SectorPalette::new();
         let mut map = XBrickMap::new(SectorCoord(1, 2, 3));
         let c = VoxelCoord::new(5, 6, 7);
-        map.set_block(&mut pool, &mut palette, c, BlockId(1)).unwrap();
+        map.set_block(&mut pool, &mut palette, c, BlockId(1))
+            .unwrap();
         assert!(map.is_occupied(&pool, c));
         assert_eq!(map.get_block(&pool, &palette, c), BlockId(1));
         map.set_block(&mut pool, &mut palette, c, BlockId::AIR)
@@ -642,11 +643,7 @@ mod tests {
         let mut palette = SectorPalette::new();
         let mut map = XBrickMap::new(SectorCoord(0, 0, 0));
         // Pub fields allow constructing an OOB coord without `new`/`try_new`.
-        let oob = VoxelCoord {
-            x: 32,
-            y: 0,
-            z: 0,
-        };
+        let oob = VoxelCoord { x: 32, y: 0, z: 0 };
         assert_eq!(map.get_block(&pool, &palette, oob), BlockId::AIR);
         map.set_block(&mut pool, &mut palette, oob, BlockId(1))
             .unwrap();

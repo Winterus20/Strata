@@ -5,17 +5,17 @@
 //! buffer from these values. All packing is branchless bit arithmetic so the same
 //! shifts can be mirrored verbatim in the shader.
 //!
-//! Bit layout (M12 visbuf v5 — 21-bit global quad_id for >64K SSBO slots):
+//! Bit layout (M12 visbuf v6 — 17-bit depth for stable coplanar atomicMax):
 //! * `bit[0:15]`   voxel_pos    (15 bits, sector-local 5+5+5; 0..32767)
 //! * `bit[15:19]`  block_id     (4 bits, copied from `PackedQuad::data[4]`, 0..15)
 //! * `bit[19:27]`  ao_corners   (8 bits, 4 corners x 2 bits — c0[0:2] c1[2:4] c2[4:6] c3[6:8])
 //!   0 = most occluded, 3 = fully open. The fragment shader
 //!   does bi-linear interpolation across the quad via the UV
 //!   coords reconstructed in `get_quad_space_uv`.
-//! * `bit[27:48]`  quad_id      (21 bits, global SSBO / lightmap slot; up to 2M quads)
-//! * `bit[48:51]`  normal       (3 bits, 0..7)
-//! * `bit[51:64]`  depth        (13 bits, reversed-Z; clear = 0)
-//!   (13-bit depth = 8192 levels, giving ~0.03 m precision at 250 m)
+//! * `bit[27:43]`  quad_id      (17 bits, global SSBO / lightmap slot; up to 131072)
+//! * `bit[44:46]`  normal       (3 bits, 0..7)
+//! * `bit[47:63]`  depth        (17 bits, reversed-Z; clear = 0)
+//!   (17-bit depth = 131072 levels — stable coplanar atomicMax vs old 13-bit ties)
 //!
 //! v4 stored a 4-bit `sector_id` and only 16-bit `quad_id`. With streaming AOI
 //! caches past ~65K quads, truncated `quad_id` made resolve sample the wrong
@@ -35,18 +35,18 @@ pub const VOXEL_POS_MASK: u64 = (1u64 << 15) - 1;
 pub const BLOCK_ID_MASK: u64 = (1u64 << 4) - 1;
 /// `ao_corners` occupies 8 bits starting at bit 19 (4 corners x 2 bits).
 pub const AO_CORNERS_MASK: u64 = (1u64 << 8) - 1;
-/// `quad_id` occupies 21 bits starting at bit 27 (global SSBO slot, up to 2M).
-pub const QUAD_ID_MASK: u64 = (1u64 << 21) - 1;
-/// `normal` occupies 3 bits starting at bit 48.
+/// `quad_id` occupies 17 bits starting at bit 27 (global SSBO slot, up to 131072).
+pub const QUAD_ID_MASK: u64 = (1u64 << 17) - 1;
+/// `normal` occupies 3 bits starting at bit 44.
 pub const NORMAL_MASK: u64 = 0x7;
-/// `depth` occupies 13 bits starting at bit 51 (reversed-Z depth precision).
-pub const DEPTH_MASK: u64 = (1u64 << 13) - 1;
+/// `depth` occupies 17 bits starting at bit 47 (reversed-Z depth precision).
+pub const DEPTH_MASK: u64 = (1u64 << 17) - 1;
 
 const BLOCK_ID_SHIFT: u32 = 15;
 const AO_CORNERS_SHIFT: u32 = 19;
 const QUAD_ID_SHIFT: u32 = 27;
-const NORMAL_SHIFT: u32 = 48;
-const DEPTH_SHIFT: u32 = 51;
+const NORMAL_SHIFT: u32 = 44;
+const DEPTH_SHIFT: u32 = 47;
 
 /// A single visibility-buffer entry stored as a raw `u64`.
 ///
@@ -167,6 +167,20 @@ pub fn meshdata_to_gpu_bytes(mesh: &MeshData) -> (Vec<u8>, Vec<u8>) {
     (opaque, transparent)
 }
 
+/// Bytes uploaded for the single-draw depth prepass.
+///
+/// Contract: every non-empty mesh batch that should appear on screen must be
+/// present here. Until a dedicated blended transparent pass exists, transparent
+/// quads are appended after opaque so water/leaf/ice/glass stay visible
+/// (drawn as solid; alpha blending comes later).
+#[inline]
+pub fn mesh_prepass_bytes(mesh: &MeshData) -> Vec<u8> {
+    let mut out = Vec::with_capacity(mesh.opaque_gpu.len() + mesh.transparent_gpu.len());
+    out.extend_from_slice(&mesh.opaque_gpu);
+    out.extend_from_slice(&mesh.transparent_gpu);
+    out
+}
+
 #[inline]
 fn pack_batch(batch: &[PackedQuad]) -> Vec<u8> {
     let gpu: Vec<PackedQuadGpu> = batch.iter().map(PackedQuadGpu::from_packed_quad).collect();
@@ -180,9 +194,9 @@ mod tests {
     const MAX_VOXEL_POS: u32 = (1u32 << 15) - 1;
     const MAX_BLOCK_ID: u32 = (1u32 << 4) - 1;
     const MAX_AO_CORNERS: u8 = 0xFF;
-    const MAX_QUAD_ID: u32 = (1u32 << 21) - 1;
+    const MAX_QUAD_ID: u32 = (1u32 << 17) - 1;
     const MAX_NORMAL: u8 = 0x7;
-    const MAX_DEPTH: u32 = (1u32 << 13) - 1;
+    const MAX_DEPTH: u32 = (1u32 << 17) - 1;
 
     fn pack_max_all() -> VisBufEntry {
         VisBufEntry::pack(
@@ -227,7 +241,7 @@ mod tests {
     fn test_visbuf_round_trip_scattered() {
         // Each tuple: (voxel_pos, block_id, ao_corners byte, quad_id, normal, depth)
         let cases: [(u32, u32, u8, u32, u8, u32); 8] = [
-            (0x3BCD, 0x5, 0xFF, 0x1234, 0x3, 0x1FFF),
+            (0x3BCD, 0x5, 0xFF, 0x1234, 0x3, 0x1FFFF),
             (1, 1, 0x5A, 1, 1, 1),
             (MAX_VOXEL_POS, 0, 0, 0, 0, 0),
             (0, MAX_BLOCK_ID, 0, 0, 0, 0),
@@ -297,16 +311,15 @@ mod tests {
     }
 
     /// Regression: global SSBO slots past 64K must survive packing. v4's 16-bit
-    /// `quad_id` truncated these, so resolve sampled lightmap[id & 0xFFFF]
-    /// (sector-aligned dark slabs until a remesh reshuffled the slot).
+    /// `quad_id` truncated these; v6 keeps 17 bits (131072 slots).
     #[test]
     fn test_visbuf_quad_id_past_64k_round_trips() {
-        for qid in [65_536u32, 100_000, 318_259, MAX_QUAD_ID] {
-            let e = VisBufEntry::pack(0x1234, 0xC, 0x5A, qid, 5, 0x1FFF);
+        for qid in [65_536u32, 100_000, 118_259, MAX_QUAD_ID] {
+            let e = VisBufEntry::pack(0x1234, 0xC, 0x5A, qid, 5, 0x1FFFF);
             assert_eq!(e.quad_id(), qid, "quad_id={qid} must not truncate");
             assert_eq!(e.voxel_pos(), 0x1234);
             assert_eq!(e.block_id(), 0xC);
-            assert_eq!(e.depth(), 0x1FFF);
+            assert_eq!(e.depth(), 0x1FFFF);
         }
     }
 
@@ -331,12 +344,41 @@ mod tests {
         assert_eq!(cast_t[0].data, qt.data);
     }
 
+    /// Regression: dropping the transparent batch makes water/leaf/ice/glass
+    /// invisible in-game (meshed, never uploaded).
     #[test]
-    fn test_visbuf_13bit_depth_precision() {
-        assert_eq!(DEPTH_SHIFT, 51, "depth shift must start at bit 51");
-        assert_eq!(QUAD_ID_MASK, (1 << 21) - 1, "21-bit quad_id mask");
-        let entry = VisBufEntry::pack(0, 0, 0, 0, 0, 8191);
-        assert_eq!(entry.depth(), 8191);
+    fn prepass_bytes_include_transparent_batch() {
+        let mut mesh = MeshData::default();
+        let qo = PackedQuad::new(0, 0, 0, 1, 1, 0, 1, 0, 0, 0);
+        let qt = PackedQuad::new(1, 1, 1, 1, 1, 2, 3, 0, 0, 0);
+        mesh.opaque.push(qo);
+        mesh.transparent.push(qt);
+        let (opaque_gpu, transparent_gpu) = meshdata_to_gpu_bytes(&mesh);
+        mesh.opaque_gpu = opaque_gpu;
+        mesh.transparent_gpu = transparent_gpu;
+
+        let upload = mesh_prepass_bytes(&mesh);
+        assert_eq!(
+            upload.len(),
+            mesh.opaque_gpu.len() + mesh.transparent_gpu.len(),
+            "transparent quads must reach the prepass upload"
+        );
+
+        let mut transparent_only = MeshData::default();
+        transparent_only.transparent_gpu = mesh.transparent_gpu.clone();
+        assert_eq!(
+            mesh_prepass_bytes(&transparent_only).len(),
+            8,
+            "transparent-only sector (e.g. leaf/water) must not upload empty"
+        );
+    }
+
+    #[test]
+    fn test_visbuf_17bit_depth_precision() {
+        assert_eq!(DEPTH_SHIFT, 47, "depth shift must start at bit 47");
+        assert_eq!(QUAD_ID_MASK, (1 << 17) - 1, "17-bit quad_id mask");
+        let entry = VisBufEntry::pack(0, 0, 0, 0, 0, 131_071);
+        assert_eq!(entry.depth(), 131_071);
     }
 
     /// Verify the CPU bit layout matches the GPU packing in prepass.rs.
@@ -348,8 +390,8 @@ mod tests {
             "ao_corners shift must be 19 (GPU << 19u)"
         );
         assert_eq!(QUAD_ID_SHIFT, 27, "quad_id shift must be 27 (GPU << 27u)");
-        assert_eq!(NORMAL_SHIFT, 48, "normal shift must be 48 (GPU << 48u)");
-        assert_eq!(DEPTH_SHIFT, 51, "depth shift must be 51 (GPU << 51u)");
+        assert_eq!(NORMAL_SHIFT, 44, "normal shift must be 44 (GPU << 44u)");
+        assert_eq!(DEPTH_SHIFT, 47, "depth shift must be 47 (GPU << 47u)");
 
         assert_eq!(
             VOXEL_POS_MASK, 0x7FFF,
@@ -357,20 +399,17 @@ mod tests {
         );
         assert_eq!(BLOCK_ID_MASK, 0xF, "block_id mask must be 0xF (GPU)");
         assert_eq!(AO_CORNERS_MASK, 0xFF, "ao_corners mask must be 0xFF (GPU)");
-        assert_eq!(
-            QUAD_ID_MASK, 0x1F_FFFF,
-            "quad_id mask must be 0x1FFFFF (GPU)"
-        );
+        assert_eq!(QUAD_ID_MASK, 0x1_FFFF, "quad_id mask must be 0x1FFFF (GPU)");
         assert_eq!(NORMAL_MASK, 0x7, "normal mask must be 0x7 (GPU)");
-        assert_eq!(DEPTH_MASK, 0x1FFF, "depth mask must be 0x1FFF (GPU)");
+        assert_eq!(DEPTH_MASK, 0x1_FFFF, "depth mask must be 0x1FFFF (GPU)");
 
-        let e = VisBufEntry::pack(0x3BCD, 0xC, 0x5A, 0x1_4242, 5, 0x1FFF);
+        let e = VisBufEntry::pack(0x3BCD, 0xC, 0x5A, 0x1_4242, 5, 0x1FFFF);
         let raw = e.raw();
         assert_eq!(raw & 0x7FFF, 0x3BCD, "voxel_pos at bit[0:15]");
         assert_eq!((raw >> 15) & 0xF, 0xC, "block_id at bit[15:19]");
         assert_eq!((raw >> 19) & 0xFF, 0x5A, "ao_corners at bit[19:27]");
-        assert_eq!((raw >> 27) & 0x1F_FFFF, 0x1_4242, "quad_id at bit[27:48]");
-        assert_eq!((raw >> 48) & 0x7, 5, "normal at bit[48:51]");
-        assert_eq!((raw >> 51) & 0x1FFF, 0x1FFF, "depth at bit[51:64]");
+        assert_eq!((raw >> 27) & 0x1_FFFF, 0x1_4242, "quad_id at bit[27:43]");
+        assert_eq!((raw >> 44) & 0x7, 5, "normal at bit[44:46]");
+        assert_eq!((raw >> 47) & 0x1_FFFF, 0x1FFFF, "depth at bit[47:63]");
     }
 }

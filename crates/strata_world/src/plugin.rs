@@ -391,14 +391,11 @@ fn spawn_sector_load_tasks(
             // No process runtime (unusual): block on a private runtime inside
             // the worldgen pool so the slot is filled when the job returns.
             pool.spawn(async move {
-                match tokio::runtime::Builder::new_current_thread()
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                 {
-                    Ok(rt) => {
-                        rt.block_on(load_fut);
-                    }
-                    Err(_) => {}
+                    rt.block_on(load_fut);
                 }
             })
             .detach();

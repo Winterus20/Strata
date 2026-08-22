@@ -30,6 +30,7 @@ use strata_core::component::SectorCoord;
 
 use crate::envelope::{SectorHeader, Tier};
 use crate::error::{StorageError, StorageResult};
+use crate::metadata::MetadataStore;
 use crate::region::{REGION_DIM, RegionCoord, RegionFile};
 
 /// Streaming-tier priority. Lower number = higher priority (plan 15 §1.4 / D8).
@@ -98,20 +99,25 @@ pub(crate) fn bounded_channel(
 pub struct TokioBackend {
     tx: mpsc::Sender<PriorityRequest>,
     worker: Arc<Worker>,
+    metadata: Option<Arc<dyn MetadataStore>>,
 }
 
 impl TokioBackend {
     /// Spawn the backend at `root`, creating the worker task on the current runtime.
     pub fn new(root: PathBuf) -> StorageResult<Self> {
-        Self::with_order_tracer(root, None)
+        Self::with_order_tracer(root, None, None)
     }
 
     /// Like [`new`](Self::new) but, when `tracer` is `Some`, the worker appends the
     /// processed request's priority to it in completion order — used by tests to
     /// assert the priority-channel ordering (plan 15 §1.4 / D8).
+    ///
+    /// When `metadata` is `Some`, [`flush`](AsyncStorageBackend::flush) will also
+    /// fsync the metadata store (plan 15 §1.4).
     pub fn with_order_tracer(
         root: PathBuf,
         tracer: Option<Arc<tokio::sync::Mutex<Vec<u8>>>>,
+        metadata: Option<Arc<dyn MetadataStore>>,
     ) -> StorageResult<Self> {
         let (tx, rx) = bounded_channel(128);
         let worker = Arc::new(Worker {
@@ -123,7 +129,11 @@ impl TokioBackend {
         tokio::spawn(async move {
             w.run(rx).await;
         });
-        Ok(Self { tx, worker })
+        Ok(Self {
+            tx,
+            worker,
+            metadata,
+        })
     }
 
     /// Enqueue a write without waiting for durable completion.
@@ -168,9 +178,7 @@ impl TokioBackend {
         Ok(respond_rx)
     }
 
-    async fn await_reply(
-        rx: oneshot::Receiver<StorageResult<Vec<u8>>>,
-    ) -> StorageResult<Vec<u8>> {
+    async fn await_reply(rx: oneshot::Receiver<StorageResult<Vec<u8>>>) -> StorageResult<Vec<u8>> {
         rx.await
             .map_err(|_| StorageError::Region("backend worker dropped response".into()))?
     }
@@ -198,17 +206,13 @@ impl AsyncStorageBackend for TokioBackend {
         payload: Vec<u8>,
         prio: u8,
     ) -> StorageResult<()> {
-        let rx = self
-            .enqueue(prio, coord, Request::Write(payload))
-            .await?;
+        let rx = self.enqueue(prio, coord, Request::Write(payload)).await?;
         Self::await_reply(rx).await?;
         Ok(())
     }
 
     async fn delete_sector(&self, coord: SectorCoord) -> StorageResult<()> {
-        let rx = self
-            .enqueue(priority::WARM, coord, Request::Delete)
-            .await?;
+        let rx = self.enqueue(priority::WARM, coord, Request::Delete).await?;
         Self::await_reply(rx).await?;
         Ok(())
     }
@@ -224,17 +228,18 @@ impl AsyncStorageBackend for TokioBackend {
     }
 
     async fn flush(&self) -> StorageResult<()> {
+        // Fsync region files under root (best-effort on Windows dirs).
         let path = self.worker.root.clone();
-        tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
+        let region_result = tokio::task::spawn_blocking(move || -> Result<(), std::io::Error> {
             if path.is_dir() {
                 // Fsync each region file under root (Windows cannot fsync a directory).
                 if let Ok(entries) = std::fs::read_dir(&path) {
                     for entry in entries.flatten() {
                         let p = entry.path();
-                        if p.extension().and_then(|e| e.to_str()) == Some("strata") {
-                            if let Ok(f) = std::fs::OpenOptions::new().write(true).open(&p) {
-                                let _ = f.sync_all();
-                            }
+                        if p.extension().and_then(|e| e.to_str()) == Some("strata")
+                            && let Ok(f) = std::fs::OpenOptions::new().write(true).open(&p)
+                        {
+                            let _ = f.sync_all();
                         }
                     }
                 }
@@ -251,7 +256,14 @@ impl AsyncStorageBackend for TokioBackend {
         })
         .await
         .map_err(|e| StorageError::Region(format!("flush join: {e}")))??;
-        Ok(())
+
+        // Fsync the metadata store (plan 15 §1.4: "fsync region files after sync"
+        // also requires metadata store durability).
+        if let Some(meta) = &self.metadata {
+            meta.flush().await?;
+        }
+
+        Ok(region_result)
     }
 }
 

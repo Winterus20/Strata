@@ -6,6 +6,10 @@
 
 use bytemuck::{Pod, Zeroable};
 
+/// Default perspective clip planes (client + resolve depth reconstruction).
+pub const DEFAULT_CAMERA_NEAR: f32 = 0.1;
+pub const DEFAULT_CAMERA_FAR: f32 = 2000.0;
+
 /// Host mirror of the WGSL `CameraView` uniform (see `prepass.rs`).
 ///
 /// Offsets (column-major `f32`):

@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use fjall::{Config, Keyspace, PartitionCreateOptions};
+use fjall::{Config, Keyspace, PartitionCreateOptions, PersistMode};
 use serde::{Deserialize, Serialize};
 
 use strata_core::component::SectorCoord;
@@ -59,6 +59,9 @@ pub trait MetadataStore: Send + Sync {
     async fn list_dirty(&self) -> StorageResult<Vec<SectorMetadata>>;
     /// Atomic-ish multi-put: all rows land together via a fjall batch.
     async fn batch_write(&self, metas: Vec<SectorMetadata>) -> StorageResult<()>;
+    /// Flush the metadata store to disk (plan 15 §1.4: fsync region files after sync
+    /// also requires metadata store durability). For fjall this calls `persist(SyncAll)`.
+    async fn flush(&self) -> StorageResult<()>;
 }
 
 /// Primary fjall-backed metadata store (plan 15 §1.5: fjall birincil).
@@ -145,6 +148,13 @@ impl MetadataStore for FjallMetadata {
             .map_err(|e| StorageError::Metadata(format!("batch commit: {e}")))?;
         Ok(())
     }
+
+    async fn flush(&self) -> StorageResult<()> {
+        self._keyspace
+            .persist(PersistMode::SyncAll)
+            .map_err(|e| StorageError::Metadata(format!("persist: {e}")))?;
+        Ok(())
+    }
 }
 
 /// In-memory metadata store for tests and dev runs (no disk).
@@ -199,6 +209,11 @@ impl MetadataStore for InMemoryMetadata {
         for m in metas {
             map.insert(m.coord, m);
         }
+        Ok(())
+    }
+
+    async fn flush(&self) -> StorageResult<()> {
+        // In-memory store: nothing to fsync.
         Ok(())
     }
 }

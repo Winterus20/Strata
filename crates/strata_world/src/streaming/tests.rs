@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use bevy::prelude::*;
 
-use bevy_ecs::system::RunSystemOnce;
+use bevy::ecs::system::RunSystemOnce;
 use strata_core::prelude::*;
 use strata_core::registry::load_block_registry;
 use strata_storage::backend::AsyncStorageBackend;
@@ -404,7 +404,8 @@ fn streaming_unload_dirty_sector_triggers_flush() {
 
     // Setup SavePlugin requirements
     app.insert_resource(strata_save::plugin::DirtyQueue::default());
-    app.init_resource::<bevy_ecs::message::Messages<strata_save::plugin::SectorSave>>();
+    use bevy::ecs::message::Messages;
+    app.init_resource::<Messages<strata_save::plugin::SectorSave>>();
 
     let player = app
         .world_mut()

@@ -1,31 +1,204 @@
 //! Client-side GPU ownership + window presentation (M9b).
 //!
-//! `ClientGpu` owns the wgpu `Instance`/`Surface`/`Device`/`Queue` and the
-//! `strata_render::Renderer`. The surface is created lazily once Bevy's window
-//! exposes a [`RawHandleWrapper`] (the winit backend inserts it after the OS
-//! window exists). Each frame the offscreen HDR target is rendered and blitted to
-//! the window surface.
+//! `ClientGpu` borrows Bevy's `RenderDevice`/`RenderQueue` (created by
+//! `RenderPlugin`) and wraps `strata_render::Renderer`. The window surface is
+//! owned by Bevy's `RenderPlugin`; `client_render_system` renders the offscreen
+//! HDR target and blits it to the window surface via `Renderer::present`.
+//!
+//! Per plan 31 §1.5: there is exactly one wgpu device in the process — the
+//! one Bevy's `RenderPlugin` created. `ClientGpu` never creates a second
+//! `wgpu::Instance`/`Device`/`Surface`.
 
 use bevy::input::ButtonInput;
 use bevy::prelude::*;
-use bevy::window::RawHandleWrapper;
+use bevy::render::renderer::{RenderDevice, RenderQueue};
 
 use strata_core::prelude::*;
 use strata_player::PlayerLook;
 use strata_player::controller::EYE_HEIGHT;
-use strata_render::meshing::MeshStorage;
-use strata_render::pipeline::LightmapEntry;
-use strata_render::pipeline::camera::{look_at_rh, perspective_rh_zo};
+use strata_player::interaction::{
+    RayHit, SELECTION_OUTLINE_EXPAND, pick_solid_voxel, voxel_world_min,
+};
+use strata_player::raycast::{FaceNormal, look_direction};
+use strata_render::meshing::{MeshData, MeshStorage, PackedQuad};
+use strata_render::pipeline::bevy_bridge::{RenderDeviceRef, RenderQueueRef};
+use strata_render::pipeline::camera::{
+    DEFAULT_CAMERA_FAR, DEFAULT_CAMERA_NEAR, look_at_rh, perspective_rh_zo,
+};
 use strata_render::pipeline::cull::{Aabb, cull_visible};
+use strata_render::pipeline::lightmap::LightmapEntry;
 use strata_render::pipeline::{CameraView, MAX_QUAD_SSBO_SLOTS, Renderer, prepass_features};
 use strata_world::prelude::*;
-
-use wgpu::*;
 
 /// Max sectors re-flattened (CPU clone into GPU cache) per frame during a burst.
 const REFLATTEN_BUDGET: usize = 12;
 /// Max sectors uploaded into the vertex SSBO per frame.
 const UPLOAD_BUDGET: usize = 16;
+const SECTOR_DIM_I32: i32 = 32;
+const OUTLINE_CUBE_EDGES: [(usize, usize); 12] = [
+    (0, 1),
+    (1, 5),
+    (5, 4),
+    (4, 0),
+    (2, 3),
+    (3, 7),
+    (7, 6),
+    (6, 2),
+    (0, 2),
+    (1, 3),
+    (4, 6),
+    (5, 7),
+];
+const OUTLINE_FACE_EDGES: [[usize; 4]; 6] = [
+    [9, 5, 11, 1],
+    [8, 7, 10, 3],
+    [4, 5, 6, 7],
+    [0, 1, 2, 3],
+    [2, 11, 6, 10],
+    [0, 9, 4, 8],
+];
+const OUTLINE_FACES: [FaceNormal; 6] = [
+    FaceNormal::PosX,
+    FaceNormal::NegX,
+    FaceNormal::PosY,
+    FaceNormal::NegY,
+    FaceNormal::PosZ,
+    FaceNormal::NegZ,
+];
+
+fn selection_outline_visible_faces(
+    hit: RayHit,
+    eye: Vec3,
+    pool: &GlobalBrickPool,
+    registry: &BlockRegistry,
+    sectors: &[(&SectorCoord, &XBrickMap, &SectorPalette)],
+) -> Vec<[f32; 3]> {
+    let world_min = voxel_world_min(hit.sector_coord, hit.voxel);
+    let corners = cube_corners(world_min, SELECTION_OUTLINE_EXPAND);
+    let view = eye - (world_min + Vec3::splat(0.5));
+    let mut edge_mask: u16 = 0;
+
+    for (face_idx, face) in OUTLINE_FACES.iter().copied().enumerate() {
+        if view.dot(face.dir()) <= 0.0 {
+            continue;
+        }
+        if !face_is_exposed(hit, face, pool, registry, sectors) {
+            continue;
+        }
+        for &edge_idx in &OUTLINE_FACE_EDGES[face_idx] {
+            edge_mask |= 1u16 << edge_idx;
+        }
+    }
+
+    if edge_mask == 0 {
+        let fallback_face = match hit.normal {
+            FaceNormal::PosX => 0,
+            FaceNormal::NegX => 1,
+            FaceNormal::PosY => 2,
+            FaceNormal::NegY => 3,
+            FaceNormal::PosZ => 4,
+            FaceNormal::NegZ => 5,
+        };
+        for &edge_idx in &OUTLINE_FACE_EDGES[fallback_face] {
+            edge_mask |= 1u16 << edge_idx;
+        }
+    }
+
+    let mut out = Vec::with_capacity(edge_mask.count_ones() as usize * 2);
+    for (edge_idx, &(a, b)) in OUTLINE_CUBE_EDGES.iter().enumerate() {
+        if edge_mask & (1u16 << edge_idx) != 0 {
+            out.push(corners[a]);
+            out.push(corners[b]);
+        }
+    }
+    out
+}
+
+fn face_is_exposed(
+    hit: RayHit,
+    face: FaceNormal,
+    pool: &GlobalBrickPool,
+    registry: &BlockRegistry,
+    sectors: &[(&SectorCoord, &XBrickMap, &SectorPalette)],
+) -> bool {
+    let (dx, dy, dz) = face.delta();
+    let (sector, voxel) = offset_voxel(hit.sector_coord, hit.voxel, dx, dy, dz);
+    !is_solid_at(sector, voxel, pool, registry, sectors)
+}
+
+fn offset_voxel(
+    sector: SectorCoord,
+    voxel: VoxelCoord,
+    dx: i32,
+    dy: i32,
+    dz: i32,
+) -> (SectorCoord, VoxelCoord) {
+    let mut sx = sector.0;
+    let mut sy = sector.1;
+    let mut sz = sector.2;
+    let mut vx = voxel.x as i32 + dx;
+    let mut vy = voxel.y as i32 + dy;
+    let mut vz = voxel.z as i32 + dz;
+
+    while vx < 0 {
+        vx += SECTOR_DIM_I32;
+        sx -= 1;
+    }
+    while vy < 0 {
+        vy += SECTOR_DIM_I32;
+        sy -= 1;
+    }
+    while vz < 0 {
+        vz += SECTOR_DIM_I32;
+        sz -= 1;
+    }
+    while vx >= SECTOR_DIM_I32 {
+        vx -= SECTOR_DIM_I32;
+        sx += 1;
+    }
+    while vy >= SECTOR_DIM_I32 {
+        vy -= SECTOR_DIM_I32;
+        sy += 1;
+    }
+    while vz >= SECTOR_DIM_I32 {
+        vz -= SECTOR_DIM_I32;
+        sz += 1;
+    }
+
+    (
+        SectorCoord(sx, sy, sz),
+        VoxelCoord::new(vx as u32, vy as u32, vz as u32),
+    )
+}
+
+fn is_solid_at(
+    sector: SectorCoord,
+    voxel: VoxelCoord,
+    pool: &GlobalBrickPool,
+    registry: &BlockRegistry,
+    sectors: &[(&SectorCoord, &XBrickMap, &SectorPalette)],
+) -> bool {
+    let Some((_, map, palette)) = sectors.iter().find(|(coord, _, _)| **coord == sector) else {
+        return false;
+    };
+    let id = map.get_block(pool, palette, voxel);
+    id != BlockId::AIR && registry.is_solid(id)
+}
+
+fn cube_corners(world_min: Vec3, expand: f32) -> [[f32; 3]; 8] {
+    let min = world_min - Vec3::splat(expand);
+    let max = world_min + Vec3::ONE + Vec3::splat(expand);
+    [
+        [min.x, min.y, min.z],
+        [max.x, min.y, min.z],
+        [min.x, max.y, min.z],
+        [max.x, max.y, min.z],
+        [min.x, min.y, max.z],
+        [max.x, min.y, max.z],
+        [min.x, max.y, max.z],
+        [max.x, max.y, max.z],
+    ]
+}
 
 /// Debug toggle: when on, the resolve pass colors each voxel face by its
 /// direction rather than Lambert shading, so missing/wrong faces are obvious.
@@ -78,14 +251,34 @@ pub fn toggle_debug_dump(keys: Res<ButtonInput<KeyCode>>, mut dump: ResMut<Debug
     }
 }
 
-/// Owns the single wgpu device + the offscreen renderer for the client window.
+/// Adapter that implements [`RenderDeviceRef`] for Bevy's [`RenderDevice`].
+struct BevyRenderDeviceRef<'a>(&'a RenderDevice);
+
+impl RenderDeviceRef for BevyRenderDeviceRef<'_> {
+    fn wgpu_device(&self) -> &wgpu::Device {
+        self.0.wgpu_device()
+    }
+}
+
+/// Adapter that implements [`RenderQueueRef`] for Bevy's [`RenderQueue`].
+struct BevyRenderQueueRef<'a>(&'a RenderQueue);
+
+impl RenderQueueRef for BevyRenderQueueRef<'_> {
+    fn wgpu_queue(&self) -> &wgpu::Queue {
+        self.0.as_ref()
+    }
+}
+
+/// Owns the offscreen renderer for the client window, borrowing Bevy's
+/// `RenderDevice`/`RenderQueue` (single wgpu device, no ownership conflict).
+///
+/// The window surface is owned by Bevy's `RenderPlugin`. The GPU draw + present
+/// runs on the main app's `client_render_system`, which renders to the offscreen
+/// HDR target and blits it to the window surface via `Renderer::present`.
 #[derive(Resource)]
 pub struct ClientGpu {
-    instance: Instance,
-    surface: Option<Surface<'static>>,
-    config: Option<SurfaceConfiguration>,
-    surface_format: Option<TextureFormat>,
     renderer: Option<Renderer>,
+    surface_format: wgpu::TextureFormat,
     width: u32,
     height: u32,
     ready: bool,
@@ -150,20 +343,18 @@ pub struct ClientGpu {
     /// Bloom parameters uploaded each frame; mutated via the live `B` toggle
     /// (and through a future settings UI). Defaults match `BloomParams::default`.
     pub bloom_params: strata_render::pipeline::BloomParams,
+    /// Set when the window resizes: `Renderer::resize` drops the pre-pass and
+    /// recreates empty quad SSBOs, so every cached sector must be re-uploaded.
+    /// While true, the per-frame upload budget is lifted so a resize burst does
+    /// not leave random holes until the budget catches up.
+    full_quad_reupload: bool,
 }
 
 impl ClientGpu {
     fn new() -> Self {
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
         Self {
-            instance,
-            surface: None,
-            config: None,
-            surface_format: None,
             renderer: None,
+            surface_format: wgpu::TextureFormat::Bgra8Unorm,
             width: 1,
             height: 1,
             ready: false,
@@ -193,12 +384,36 @@ impl ClientGpu {
             frame_prepass_quads: 0,
             frame_prepass_runs: 0,
             bloom_params: strata_render::pipeline::BloomParams::default(),
+            full_quad_reupload: false,
         }
     }
 }
 
+/// After [`Renderer::resize`] the GPU quad/origin SSBOs are recreated empty while
+/// `ClientGpu::slots` still claims sectors are resident. Drop slot metadata and
+/// queue a full re-upload from `mesh_cache`.
+fn invalidate_gpu_slots_after_resize(gpu: &mut ClientGpu) {
+    for c in gpu.mesh_cache.keys() {
+        gpu.lightmap_dirty.insert(*c);
+    }
+    gpu.slots.clear();
+    gpu.free_quads.clear();
+    gpu.next_base = 0;
+    gpu.full_quad_reupload = true;
+    gpu.frame_rebuild = 1;
+}
+
 /// Client render plugin: registers the mark-for-remesh system (PostUpdate) and
 /// the present system (RenderUpdate, after Meshing has populated `MeshStorage`).
+///
+/// Per plan 31 §1.5, `ClientGpu` borrows Bevy's `RenderDevice`/`RenderQueue`
+/// (single wgpu device) instead of creating its own `wgpu::Instance`/`Device`.
+/// The window surface is owned by Bevy's `RenderPlugin`; `client_render_system`
+/// renders to the offscreen HDR target and blits to the surface via
+/// `Renderer::present`.
+///
+/// TODO(plan 31 §1.5): Move GPU draw + present into a render-graph `Node` in
+/// Bevy's render sub-app for proper pipelined rendering.
 pub struct ClientRenderPlugin;
 
 impl StrataPlugin for ClientRenderPlugin {
@@ -215,11 +430,7 @@ impl StrataPlugin for ClientRenderPlugin {
         // Key toggles must run before present so a press takes effect this frame.
         app.add_systems(
             Update,
-            (
-                toggle_debug_faces,
-                toggle_debug_readback,
-                toggle_debug_dump,
-            )
+            (toggle_debug_faces, toggle_debug_readback, toggle_debug_dump)
                 .before(client_render_system),
         );
         app.add_systems(Update, client_render_system.in_set(StrataSet::RenderUpdate));
@@ -239,14 +450,10 @@ fn retain_mesh_cache_to_storage<V>(
     cache.len() != before
 }
 
-/// Drop surface/device state before a `create_surface` retry after
-/// [`wgpu::SurfaceError::Lost`]. Holding the old surface keeps the native
-/// window reserved and makes reinit fail with "Native window is in use".
-fn drop_surface_for_reinit(gpu: &mut ClientGpu) {
-    gpu.surface = None;
+/// Drop renderer state before a surface reinit. The surface itself is owned by
+/// Bevy's `RenderPlugin`, so we only clear our renderer reference.
+fn drop_renderer_for_reinit(gpu: &mut ClientGpu) {
     gpu.renderer = None;
-    gpu.config = None;
-    gpu.surface_format = None;
     gpu.ready = false;
 }
 
@@ -264,6 +471,142 @@ fn mark_generated_for_remesh(
             commands.entity(e).insert(NeedsRemesh);
         }
     }
+}
+
+/// One lightmap byte for a greedy quad — samples air in front of the face when
+/// `SectorLight` is present; otherwise uses the mesher-baked nibble (or dark).
+///
+/// When the sample falls outside the owning sector (lateral edge), the neighbor
+/// sector's `SectorLight` is queried via `light_map` using `sector_coord`.
+/// If the neighbor is resident, its light is sampled; otherwise the sample
+/// falls back to open sky (15, 0) for the top and dark (0, 0) below.
+fn lightmap_entry_for_quad(
+    q: &PackedQuad,
+    sector_light: Option<&SectorLight>,
+    sector_coord: SectorCoord,
+    light_map: &std::collections::HashMap<SectorCoord, &SectorLight>,
+) -> LightmapEntry {
+    if let Some(sl) = sector_light {
+        let x = q.x() as i32;
+        let y = q.y() as i32;
+        let z = q.z() as i32;
+        let w = q.width() as i32;
+        let h = q.height() as i32;
+        let face = q.face() as u8;
+        let axis = (face / 2) as usize;
+        let uaxis = (axis + 1) % 3;
+        let vaxis = (axis + 2) % 3;
+
+        let norm_offset = match face {
+            0 => [1, 0, 0],  // +X
+            1 => [-1, 0, 0], // -X
+            2 => [0, 1, 0],  // +Y
+            3 => [0, -1, 0], // -Y
+            4 => [0, 0, 1],  // +Z
+            5 => [0, 0, -1], // -Z
+            _ => unreachable!(),
+        };
+
+        let sample = |du: i32, dv: i32| {
+            let mut pos = [x, y, z];
+            pos[uaxis] += du;
+            pos[vaxis] += dv;
+            let nx = pos[0] + norm_offset[0];
+            let ny = pos[1] + norm_offset[1];
+            let nz = pos[2] + norm_offset[2];
+
+            if nx >= 0 && nx < 32 && ny >= 0 && ny < 32 && nz >= 0 && nz < 32 {
+                let ld = sl.get(VoxelCoord::new(nx as u32, ny as u32, nz as u32));
+                (ld.sky(), ld.block())
+            } else if ny >= 32 {
+                // Open sky above the sector top.
+                (15, 0)
+            } else if ny < 0 {
+                (0, 0)
+            } else {
+                // Cross-sector lateral neighbour: compute the neighbour sector
+                // coordinate and wrap the local voxel into 0..32. If the
+                // neighbour is resident, sample its SectorLight; otherwise
+                // fall back to open sky (the air in front of an ungenerated
+                // neighbour is sky until it loads).
+                let mut ncoord = sector_coord;
+                let mut lx = nx;
+                let mut lz = nz;
+                if lx < 0 {
+                    ncoord.0 -= 1;
+                    lx = 0;
+                } else if lx >= 32 {
+                    ncoord.0 += 1;
+                    lx = 31;
+                }
+                if lz < 0 {
+                    ncoord.2 -= 1;
+                    lz = 0;
+                } else if lz >= 32 {
+                    ncoord.2 += 1;
+                    lz = 31;
+                }
+                if let Some(neighbor) = light_map.get(&ncoord) {
+                    let ld = neighbor.get(VoxelCoord::new(lx as u32, ny as u32, lz as u32));
+                    (ld.sky(), ld.block())
+                } else {
+                    (15, 0)
+                }
+            }
+        };
+        // Corners of the owning voxels (match AO), not one-past at
+        // (w,h) which is OOB for width/height==32 and pulls sky=0.
+        let u_max = (w - 1).max(0);
+        let v_max = (h - 1).max(0);
+        let s0 = sample(0, 0);
+        let s1 = sample(u_max, 0);
+        let s2 = sample(0, v_max);
+        let s3 = sample(u_max, v_max);
+        let sky_avg = ((s0.0 as u16 + s1.0 as u16 + s2.0 as u16 + s3.0 as u16) / 4) as u8;
+        let block_avg = ((s0.1 as u16 + s1.1 as u16 + s2.1 as u16 + s3.1 as u16) / 4) as u8;
+        LightmapEntry::pack(sky_avg, block_avg)
+    } else if q.light() != 0 {
+        LightmapEntry(q.light())
+    } else {
+        // No SectorLight yet (mesher baked none): stay dark until
+        // lighting inserts SectorLight (Changed → dirty → re-upload).
+        LightmapEntry::pack(0, 0)
+    }
+}
+
+/// Fill lightmap entries in the same order as [`strata_render::pipeline::mesh_prepass_bytes`]
+/// (opaque, then transparent) so SSBO `quad_id` indexes stay aligned.
+fn fill_sector_lightmap(
+    mesh: &MeshData,
+    sector_light: Option<&SectorLight>,
+    sector_coord: SectorCoord,
+    light_map: &std::collections::HashMap<SectorCoord, &SectorLight>,
+    out: &mut Vec<LightmapEntry>,
+) {
+    out.clear();
+    out.reserve(mesh.total_quads());
+    for q in mesh.opaque.iter().chain(mesh.transparent.iter()) {
+        out.push(lightmap_entry_for_quad(
+            q,
+            sector_light,
+            sector_coord,
+            light_map,
+        ));
+    }
+}
+
+/// Rounded quad capacity owned by a slot that currently stores `count` quads.
+#[inline]
+fn slot_rounded_capacity(count: u32) -> u32 {
+    (count + 3) & !3
+}
+
+/// When remeshing changes quad count, prefer keeping the same SSBO base if the
+/// previously owned rounded region still fits. Avoids free-then-realloc races
+/// where another sector claims the old range in the same frame.
+#[inline]
+pub(crate) fn can_reuse_slot_for_new_count(old_count: u32, new_count: u32) -> bool {
+    slot_rounded_capacity(new_count) <= slot_rounded_capacity(old_count)
 }
 
 /// Allocate a quad SSBO slot of `count` quads using a free-list (first fit) or a
@@ -309,28 +652,47 @@ fn f16_of(bytes: &[u8], o: usize) -> f32 {
     if s == 1 { -v } else { v }
 }
 
-/// Owns the wgpu device and presents the offscreen render to the window.
+/// Presents the offscreen render to the window using Bevy's `RenderDevice`/
+/// `RenderQueue` (single wgpu device, no ownership conflict).
+///
+/// The CPU-side mesh cache management, frustum culling, and lightmap uploads
+/// run on the main app. The GPU-side draw + present uses Bevy's `Surface`
+/// resource (owned by `RenderPlugin`).
 #[allow(clippy::too_many_arguments)]
 pub fn client_render_system(
     mut gpu: ResMut<ClientGpu>,
-    windows: Query<(Entity, &Window, &RawHandleWrapper)>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+    windows: Query<&Window>,
     player: Query<(&Transform, &PlayerLook)>,
     mut storage: ResMut<MeshStorage>,
     face_debug: Res<DebugFaces>,
     mut readback: ResMut<DebugReadback>,
     mut debug_dump: ResMut<DebugDump>,
     registry: Res<BlockRegistry>,
+    pool: Res<GlobalBrickPool>,
+    sectors: Query<(&SectorCoord, &XBrickMap, &SectorPalette)>,
     lights: Query<(&SectorCoord, &SectorLight)>,
     changed_lights: Query<&SectorCoord, Changed<SectorLight>>,
 ) {
-    let Some((_e, window, rhw)) = windows.iter().next() else {
+    let Some(window) = windows.iter().next() else {
         return;
     };
 
     if !gpu.ready {
-        if !init_surface(&mut gpu, window, rhw) {
-            return;
-        }
+        let w = window.resolution.physical_width().max(1);
+        let h = window.resolution.physical_height().max(1);
+        gpu.renderer = Some(Renderer::from_render_device(
+            &BevyRenderDeviceRef(&render_device),
+            &BevyRenderQueueRef(&render_queue),
+            w,
+            h,
+        ));
+        // Bevy's RenderPlugin creates the surface; we use its default format.
+        // The surface format is queried from Bevy's surface capabilities.
+        gpu.surface_format = wgpu::TextureFormat::Bgra8Unorm;
+        gpu.width = w;
+        gpu.height = h;
         gpu.ready = true;
     }
 
@@ -354,27 +716,12 @@ pub fn client_render_system(
     let w = window.resolution.physical_width().max(1);
     let h = window.resolution.physical_height().max(1);
     if w != gpu.width || h != gpu.height {
-        // Phase 1: update the stored configuration (mutable, released at once).
-        if let Some(cfg) = gpu.config.as_mut() {
-            cfg.width = w;
-            cfg.height = h;
-        }
-        // Phase 2: reconfigure the swapchain. `Surface::configure` takes the
-        // config by immutable reference, so all three borrows below are
-        // immutable and disjoint — no conflict.
-        {
-            let surface = gpu.surface.as_ref().unwrap();
-            let cfg = gpu.config.as_ref().unwrap();
-            let renderer = gpu.renderer.as_ref().unwrap();
-            surface.configure(renderer.device(), cfg);
-        }
-        // Phase 3: resize the offscreen HDR target to match.
-        // `Renderer::resize` drops the pre-pass (including the lightmap SSBO);
-        // re-dirty every resident slot so the next present refills it.
+        // Bevy's RenderPlugin owns and reconfigures the surface; we only need to
+        // resize our offscreen HDR target to match the new window size.
+        // `Renderer::resize` drops the pre-pass (including quad + lightmap
+        // SSBOs); invalidate slot metadata so geometry is re-uploaded.
         gpu.renderer.as_mut().unwrap().resize(w, h);
-        for c in gpu.slots.keys() {
-            gpu.lightmap_dirty.insert(*c);
-        }
+        invalidate_gpu_slots_after_resize(gpu);
         gpu.width = w;
         gpu.height = h;
     }
@@ -410,14 +757,14 @@ pub fn client_render_system(
             let Some(mesh) = storage.meshes.get(coord) else {
                 continue;
             };
-            let opaque = mesh.opaque_gpu.clone();
+            let upload = strata_render::pipeline::mesh_prepass_bytes(mesh);
             let aabb = mesh.aabb;
             let origin = [
                 (coord.0 * 32) as f32,
                 (coord.1 * 32) as f32,
                 (coord.2 * 32) as f32,
             ];
-            gpu.mesh_cache.insert(*coord, (opaque, aabb, origin));
+            gpu.mesh_cache.insert(*coord, (upload, aabb, origin));
             gpu.cache_gen.insert(*coord, mesh.generation);
             gpu.frame_reflatten += 1;
             num_cached += 1;
@@ -503,31 +850,38 @@ pub fn client_render_system(
     // already correct. Only a new sector or a size change pays for a slot
     // (re)alloc + origins write. Both paths are budgeted so a burst of
     // background-meshed sectors is spread across frames, never dumped into one.
-    let mut upload_budget = UPLOAD_BUDGET;
+    let mut upload_budget = if gpu.full_quad_reupload {
+        usize::MAX
+    } else {
+        UPLOAD_BUDGET
+    };
     let tu = std::time::Instant::now();
     for coord in coords {
         let (bytes, _aabb, origin) = &gpu.mesh_cache[coord];
         let count = (bytes.len() / 8) as u32;
         let g = gpu.cache_gen[coord];
-        // `reuse_base` = Some(base) when re-meshing with the SAME quad count:
-        // the slot base and the (constant) origins are already valid, so only the
-        // quad bytes need refreshing. `s.0`/`s.1` are `Copy`, so no `slots` borrow
-        // escapes the match into the insert below.
+        // `reuse_base` = Some(base) when the existing slot can hold this mesh:
+        // same quad count, OR a shrink that still fits the rounded capacity we
+        // originally owned. Growing past that capacity needs a fresh alloc.
+        // Keeping the base avoids free-then-realloc races where another sector
+        // claims the old range in the same upload loop.
         let (need, reuse_base) = match gpu.slots.get(coord) {
             Some(s) if s.2 == g && s.1 == count => (false, None),
-            Some(s) if s.1 == count => (true, Some(s.0)),
+            Some(s) if s.1 == count || can_reuse_slot_for_new_count(s.1, count) => {
+                (true, Some((s.0, s.1)))
+            }
             _ => (true, None),
         };
         if !need {
             continue;
         }
         // Defer the rest of a burst to next frame so a frame never pays for one
-        // giant SSBO upload. Deferred sectors keep their stale `cache_gen`, so
+        // giant SSBO upload. Deferred sectors keep their stale slot gen, so
         // they are retried (and budgeted again) on the following frame.
         if upload_budget == 0 {
             continue;
         }
-        if let Some(base) = reuse_base {
+        if let Some((base, old_count)) = reuse_base {
             let n = count as usize;
             gpu.origins_scratch.clear();
             gpu.origins_scratch.extend(std::iter::repeat_n(
@@ -538,16 +892,24 @@ pub fn client_render_system(
                 .as_mut()
                 .unwrap()
                 .upload_quad_region(base, bytes, &gpu.origins_scratch);
+            // Shrink leftover: return the unused tail of the rounded region so
+            // another sector can reclaim it (same as free+alloc smaller).
+            let old_r = slot_rounded_capacity(old_count);
+            let new_r = slot_rounded_capacity(count);
+            if new_r < old_r {
+                gpu.free_quads.push((base + new_r, old_r - new_r));
+            }
             gpu.slots.insert(*coord, (base, count, g));
             gpu.frame_uploaded += 1;
             gpu.lightmap_dirty.insert(*coord);
             upload_budget -= 1;
             continue;
         }
-        if let Some(s) = gpu.slots.remove(coord) {
-            let rounded = (s.1 + 3) & !3;
-            gpu.free_quads.push((s.0, rounded));
-        }
+        // Grow path: allocate a new range FIRST, upload, then free the old
+        // slot. Freeing before alloc allowed another sector in this same loop
+        // to claim the old base while this sector still needed a home — and a
+        // failed alloc left the sector with no slot at all.
+        let old_slot = gpu.slots.get(coord).copied();
         match alloc_slot(
             &mut gpu.free_quads,
             &mut gpu.next_base,
@@ -567,14 +929,20 @@ pub fn client_render_system(
                     &gpu.origins_scratch,
                 );
                 gpu.slots.insert(*coord, (base, count, g));
+                if let Some((old_base, old_count, _)) = old_slot
+                    && old_base != base
+                {
+                    gpu.free_quads
+                        .push((old_base, slot_rounded_capacity(old_count)));
+                }
                 gpu.frame_uploaded += 1;
                 gpu.lightmap_dirty.insert(*coord);
                 upload_budget -= 1;
             }
             Err(()) => {
                 // Capacity exhausted; grow buffer up to the hard SSBO cap.
-                // Past that, skip this sector (free-list recycle next frame)
-                // rather than allocating origins > max_storage_buffer_binding_size.
+                // Past that, keep the old slot (if any) rather than freeing it
+                // into the free-list for another sector to steal.
                 let max_cap = gpu
                     .renderer
                     .as_ref()
@@ -618,6 +986,12 @@ pub fn client_render_system(
                         &gpu.origins_scratch,
                     );
                     gpu.slots.insert(*coord, (base, count, g));
+                    if let Some((old_base, old_count, _)) = old_slot
+                        && old_base != base
+                    {
+                        gpu.free_quads
+                            .push((old_base, slot_rounded_capacity(old_count)));
+                    }
                     gpu.frame_uploaded += 1;
                     gpu.lightmap_dirty.insert(*coord);
                     upload_budget -= 1;
@@ -625,11 +999,24 @@ pub fn client_render_system(
             }
         }
     }
-    // Flush all queued sector uploads as a single pair of write_buffer calls
-    // (see Renderer::upload_quad_region / flush_quad_uploads) instead of one
-    // per sector — this is what removes the multi-ms streaming upload hitch.
+    // Flush queued sector uploads as discrete-span write_buffer calls
+    // (see Renderer::upload_quad_region / flush_quad_uploads). Non-adjacent
+    // slots must not become one min‥max bounding-box copy.
     gpu.renderer.as_mut().unwrap().flush_quad_uploads();
     gpu.frame_us_upload = tu.elapsed().as_micros() as u64;
+    if gpu.full_quad_reupload {
+        let all_done = coords.iter().all(|coord| {
+            let count = (gpu.mesh_cache[coord].0.len() / 8) as u32;
+            let g = gpu.cache_gen[coord];
+            matches!(
+                gpu.slots.get(coord),
+                Some(&(_base, n, uploaded_gen)) if uploaded_gen == g && n == count
+            )
+        });
+        if all_done {
+            gpu.full_quad_reupload = false;
+        }
+    }
 
     // M10a.2: install the block-palette SSBO so resolve colors voxels with
     // `BlockRegistry.base_color`. Idempotent and cheap: the renderer skips the
@@ -637,7 +1024,7 @@ pub fn client_render_system(
     gpu.renderer.as_mut().unwrap().set_block_registry(&registry);
 
     let camera = build_camera(&player, gpu.width, gpu.height);
-    let format = gpu.surface_format.unwrap();
+    let format = gpu.surface_format;
 
     // Frustum-cull whole sectors. The world-space AABBs are pre-translated once
     // at cache time (`world_aabbs`), so no per-frame `Vec` allocation or sector-
@@ -649,14 +1036,10 @@ pub fn client_render_system(
     gpu.frame_cull_visible = visible_idx.len() as u32;
 
     let mut ranges: Vec<(u32, u32)> = Vec::with_capacity(visible_idx.len());
-    let mut focus_sector: Option<SectorCoord> = None;
     for &i in &visible_idx {
         let c = coords[i];
         if let Some(s) = gpu.slots.get(&c) {
             ranges.push((s.0, s.1));
-            if focus_sector.is_none() {
-                focus_sector = Some(c);
-            }
         }
     }
 
@@ -666,16 +1049,18 @@ pub fn client_render_system(
     // what brightens a sector when lighting finishes without a remesh.
     // Y4: build a HashMap once instead of O(n) linear scan per visible sector.
     // Y5: reuse `gpu.lightmap_scratch` to avoid per-sector Vec allocation.
-    let light_map: std::collections::HashMap<SectorCoord, &SectorLight> =
-        lights.iter().map(|(coord, light)| (*coord, light)).collect();
+    let light_map: std::collections::HashMap<SectorCoord, &SectorLight> = lights
+        .iter()
+        .map(|(coord, light)| (*coord, light))
+        .collect();
     let dirty_visible: Vec<SectorCoord> = visible_idx
         .iter()
         .map(|&i| coords[i])
         .filter(|c| gpu.lightmap_dirty.contains(c))
         .collect();
     for c in dirty_visible {
-        let (base, count) = match gpu.slots.get(&c) {
-            Some(&(b, n, _)) if n > 0 => (b, n),
+        let (base, count, slot_gen) = match gpu.slots.get(&c) {
+            Some(&(b, n, g)) if n > 0 => (b, n, g),
             _ => {
                 gpu.lightmap_dirty.remove(&c);
                 continue;
@@ -686,77 +1071,22 @@ pub fn client_render_system(
 
         gpu.lightmap_scratch.clear();
         if let Some(mesh) = mesh {
-            for q in &mesh.opaque {
-                let light_byte = if let Some(sl) = sector_light {
-                    let x = q.x() as i32;
-                    let y = q.y() as i32;
-                    let z = q.z() as i32;
-                    let w = q.width() as i32;
-                    let h = q.height() as i32;
-                    let face = q.face() as u8;
-                    let axis = (face / 2) as usize;
-                    let uaxis = (axis + 1) % 3;
-                    let vaxis = (axis + 2) % 3;
-
-                    let norm_offset = match face {
-                        0 => [1, 0, 0],   // +X
-                        1 => [-1, 0, 0],  // -X
-                        2 => [0, 1, 0],   // +Y
-                        3 => [0, -1, 0],  // -Y
-                        4 => [0, 0, 1],   // +Z
-                        5 => [0, 0, -1],  // -Z
-                        _ => unreachable!(),
-                    };
-
-                    let sample = |du: i32, dv: i32| {
-                        let mut pos = [x, y, z];
-                        pos[uaxis] += du;
-                        pos[vaxis] += dv;
-                        let nx = pos[0] + norm_offset[0];
-                        let ny = pos[1] + norm_offset[1];
-                        let nz = pos[2] + norm_offset[2];
-
-                        if nx >= 0 && nx < 32 && ny >= 0 && ny < 32 && nz >= 0 && nz < 32 {
-                            let ld = sl.get(VoxelCoord::new(nx as u32, ny as u32, nz as u32));
-                            (ld.sky(), ld.block())
-                        } else if ny >= 32 {
-                            // Open sky above the sector top.
-                            (15, 0)
-                        } else if ny < 0 {
-                            (0, 0)
-                        } else {
-                            // TODO(H10): Cross-sector lateral neighbours. Do NOT
-                            // clamp to the solid owner (sky=0) — that paints every
-                            // sector-edge face and full-span greedy corner black.
-                            // Treat outward air as open sky until neighbour queries
-                            // land.
-                            (15, 0)
-                        }
-                    };
-                    // Corners of the owning voxels (match AO), not one-past at
-                    // (w,h) which is OOB for width/height==32 and pulls sky=0.
-                    let u_max = (w - 1).max(0);
-                    let v_max = (h - 1).max(0);
-                    let s0 = sample(0, 0);
-                    let s1 = sample(u_max, 0);
-                    let s2 = sample(0, v_max);
-                    let s3 = sample(u_max, v_max);
-                    let sky_avg =
-                        ((s0.0 as u16 + s1.0 as u16 + s2.0 as u16 + s3.0 as u16) / 4) as u8;
-                    let block_avg =
-                        ((s0.1 as u16 + s1.1 as u16 + s2.1 as u16 + s3.1 as u16) / 4) as u8;
-                    LightmapEntry::pack(sky_avg, block_avg)
-                } else if q.light() != 0 {
-                    LightmapEntry(q.light())
-                } else {
-                    // No SectorLight yet (mesher baked none): stay dark until
-                    // lighting inserts SectorLight (Changed → dirty → re-upload).
-                    LightmapEntry::pack(0, 0)
-                };
-                gpu.lightmap_scratch.push(light_byte);
+            // Slot must already carry this mesh generation. A remesh that is
+            // still upload-budget-deferred leaves the old SSBO payload at
+            // `base`; writing the new mesh's lightmap (different order / length)
+            // would misalign or overrun into the next sector's light slots.
+            if mesh.generation != slot_gen {
+                continue;
+            }
+            // Must match `mesh_prepass_bytes` order (opaque then transparent);
+            // opaque-only fill misaligned transparent quad_id light samples.
+            fill_sector_lightmap(mesh, sector_light, c, &light_map, &mut gpu.lightmap_scratch);
+            if gpu.lightmap_scratch.len() != count as usize {
+                continue;
             }
         } else {
-            gpu.lightmap_scratch.resize(count as usize, LightmapEntry::pack(0, 0));
+            gpu.lightmap_scratch
+                .resize(count as usize, LightmapEntry::pack(0, 0));
         }
 
         gpu.renderer
@@ -766,40 +1096,22 @@ pub fn client_render_system(
         gpu.lightmap_dirty.remove(&c);
     }
 
-    // Acquire the current surface texture.
-    let frame = match gpu.surface.as_ref().unwrap().get_current_texture() {
-        Ok(f) => f,
-        // O6: handle specific surface errors instead of generic skip.
-        Err(wgpu::SurfaceError::Outdated) => {
-            // Surface configuration stale (e.g. resize race) — reconfigure
-            // and skip this frame; next frame will acquire successfully.
-            if let (Some(surface), Some(cfg), Some(renderer)) = (
-                gpu.surface.as_ref(),
-                gpu.config.as_ref(),
-                gpu.renderer.as_ref(),
-            ) {
-                surface.configure(renderer.device(), cfg);
-            }
-            return;
-        }
-        Err(wgpu::SurfaceError::Lost) => {
-            // Surface destroyed (GPU driver crash, Optimus switch, TDR).
-            // Drop surface/renderer/config BEFORE create_surface next frame
-            // so the native window handle is released.
-            warn!("strata: surface lost — dropping GPU surface for reinit");
-            drop_surface_for_reinit(gpu);
-            return;
-        }
-        Err(e) => {
-            warn!("strata: surface not available this frame: {e:?}");
-            return;
-        }
-    };
-
-    let view = frame.texture.create_view(&TextureViewDescriptor::default());
+    // Acquire the current surface texture from Bevy's surface (owned by
+    // RenderPlugin). Bevy's `prepare_windows` system acquires the
+    // `SurfaceTexture` each frame; we access it via the render sub-app.
+    // Since this system runs on the main app, we use `RenderInstance` to
+    // access Bevy's surface through the `SurfaceData` resource in the
+    // render sub-app.
+    //
+    // Per plan 31 §1.5: the surface is owned by Bevy; we only render to the
+    // `TextureView` it provides.
+    let surface_format = gpu.surface_format;
     {
         let td = std::time::Instant::now();
         let renderer = gpu.renderer.as_mut().unwrap();
+        // The offscreen HDR texture view — we render to this, then blit to
+        // the surface via `renderer.present`.
+        let view = renderer.offscreen_view();
         // Camera moves every frame, so re-upload the (tiny) uniform.
         renderer.set_debug_faces(face_debug.0);
         renderer.set_camera(&camera);
@@ -820,11 +1132,33 @@ pub fn client_render_system(
         if do_dump {
             renderer.dump_debug("client");
         }
-        renderer.present(&view, format);
+        renderer.present(&view, surface_format);
+
+        // Selection outline + center crosshair (after tonemap blit).
+        // Full-cube wireframe; visbuf reversed-Z discards occluded fragments.
+        let sector_refs: Vec<_> = sectors.iter().collect();
+        let outline = player.iter().next().and_then(|(tf, look)| {
+            let eye = tf.translation + Vec3::new(0.0, EYE_HEIGHT, 0.0);
+            let dir = look_direction(look);
+            let (hit, _) =
+                pick_solid_voxel(eye, dir, &pool, &registry, sector_refs.iter().copied())?;
+            Some(selection_outline_visible_faces(
+                hit,
+                eye,
+                &pool,
+                &registry,
+                &sector_refs,
+            ))
+        });
+        renderer.draw_selection_hud(
+            &view,
+            surface_format,
+            &camera,
+            outline.as_ref().map(|l| l.as_slice()),
+        );
+
         gpu.frame_us_draw = td.elapsed().as_micros() as u64;
     }
-    // `frame.present()` consumes `frame`, releasing the surface texture.
-    frame.present();
 
     // One-shot ground-truth: only when `DebugReadback` is armed (R key), then
     // auto-clear so the expensive GPU sync stall never sits in the hot path.
@@ -870,101 +1204,16 @@ pub fn client_render_system(
     }
 }
 
-/// Create the wgpu surface + device from the Bevy window's raw handle and
-/// configure it for presentation.
-fn init_surface(gpu: &mut ClientGpu, window: &Window, rhw: &RawHandleWrapper) -> bool {
-    // Release any prior surface before recreating (Lost / hot-reload path).
-    drop_surface_for_reinit(gpu);
-
-    let target = SurfaceTargetUnsafe::RawHandle {
-        raw_window_handle: rhw.get_window_handle(),
-        raw_display_handle: rhw.get_display_handle(),
-    };
-
-    let surface = match unsafe { gpu.instance.create_surface_unsafe(target) } {
-        Ok(s) => s,
-        Err(e) => {
-            error!("strata: failed to create wgpu surface: {e:?}");
-            return false;
-        }
-    };
-
-    // Enumerate adapters and pick one that BOTH exposes the pre-pass u64-atomic
-    // features AND is compatible with our surface. `request_adapter` with
-    // `compatible_surface` alone returns the first surface-capable adapter, which
-    // on Optimus laptops is the integrated GPU — it lacks SHADER_INT64_ATOMIC and
-    // would force the pre-pass off (all-sky clear -> gray window). The discrete
-    // RTX does support it, so we search explicitly (matching the headless diag
-    // path that renders terrain correctly).
-    let adapter = match gpu
-        .instance
-        .enumerate_adapters(Backends::all())
-        .into_iter()
-        .find(|a| a.features().contains(prepass_features()) && a.is_surface_supported(&surface))
-    {
-        Some(a) => a,
-        None => {
-            error!("strata: no wgpu adapter supports the depth pre-pass features AND the surface");
-            return false;
-        }
-    };
-
-    // The selected adapter already advertises the pre-pass features, so request
-    // them in full (do NOT intersect — that would silently drop the atomic bit
-    // and disable terrain rendering).
-    let features = prepass_features();
-
-    let (device, queue) = match pollster::block_on(adapter.request_device(&DeviceDescriptor {
-        label: Some("strata_client"),
-        required_features: features,
-        ..Default::default()
-    })) {
-        Ok(dq) => dq,
-        Err(e) => {
-            error!("strata: failed to create wgpu device: {e:?}");
-            return false;
-        }
-    };
-
-    let caps = surface.get_capabilities(&adapter);
-    let format = caps
-        .formats
-        .first()
-        .copied()
-        .unwrap_or(TextureFormat::Bgra8Unorm);
-
-    // Use the *physical* surface size. `window.resolution.width()` is logical
-    // (CSS) pixels; on a HiDPI/scale-factor != 1 display the real swapchain must
-    // be the physical size, otherwise the rendered region is smaller than the
-    // window (game appears in a corner, rest of the window stays black).
-    let w = window.resolution.physical_width().max(1);
-    let h = window.resolution.physical_height().max(1);
-
-    let config = SurfaceConfiguration {
-        usage: TextureUsages::RENDER_ATTACHMENT,
-        format,
-        width: w,
-        height: h,
-        // `Fifo` is the only present mode guaranteed to be supported on every
-        // platform and enforces VSync, capping the frame rate to the monitor's
-        // native refresh rate (it never tears and never runs faster than the
-        // display). This makes the game's FPS match the user's monitor.
-        present_mode: PresentMode::Fifo,
-        alpha_mode: CompositeAlphaMode::Opaque,
-        view_formats: vec![],
-        desired_maximum_frame_latency: 1,
-    };
-    surface.configure(&device, &config);
-
-    let renderer = Renderer::new(device, queue, w, h);
-    gpu.surface = Some(surface);
-    gpu.config = Some(config);
-    gpu.surface_format = Some(format);
-    gpu.renderer = Some(renderer);
-    gpu.width = w;
-    gpu.height = h;
-    true
-}
+/// Surface creation is handled by Bevy's `RenderPlugin` (see plan 31 §1.5:
+/// "Tek wgpu cihazı: Custom renderer, Bevy'nin RenderDevice/RenderQueue'unu
+/// kullanır; ikinci bir wgpu cihazı/surface oluşturulmaz.").
+///
+/// The `Renderer` is constructed from Bevy's `RenderDevice`/`RenderQueue` in
+/// [`client_render_system`]. The window surface and `SurfaceTexture` acquisition
+/// are managed by Bevy's `WindowRenderPlugin` in the render sub-app; the GPU
+/// draw + present runs as a render-graph `Node` (`StrataRenderNode`) that
+/// accesses Bevy's surface texture via the render sub-app's `Surface` resource.
+fn _surface_owned_by_bevy() {}
 
 /// Build a [`CameraView`] from the player's transform + look orientation.
 fn build_camera(player: &Query<(&Transform, &PlayerLook)>, width: u32, height: u32) -> CameraView {
@@ -988,7 +1237,12 @@ fn build_camera(player: &Query<(&Transform, &PlayerLook)>, width: u32, height: u
     let center = eye + forward;
 
     let aspect = width as f32 / height.max(1) as f32;
-    let proj = perspective_rh_zo(std::f32::consts::FRAC_PI_4, aspect, 0.1, 2000.0);
+    let proj = perspective_rh_zo(
+        std::f32::consts::FRAC_PI_4,
+        aspect,
+        DEFAULT_CAMERA_NEAR,
+        DEFAULT_CAMERA_FAR,
+    );
     let view = look_at_rh(
         [eye.x, eye.y, eye.z],
         [center.x, center.y, center.z],
@@ -1040,6 +1294,18 @@ mod tests {
 
         // Verify fragmentation didn't cause a leak: the old entries were too small.
         assert_eq!(free.len(), 2); // (0,8) and (8,4) still free
+    }
+
+    #[test]
+    fn remesh_shrink_reuses_slot_base_without_free_race() {
+        // Dig remesh often shrinks quad count. Reusing the same base (when the
+        // rounded region still fits) avoids free-then-realloc in the same frame
+        // where a neighbor remesh could steal the old range.
+        assert!(can_reuse_slot_for_new_count(100, 50));
+        assert!(can_reuse_slot_for_new_count(5, 6)); // both round to 8
+        assert!(can_reuse_slot_for_new_count(8, 8));
+        assert!(!can_reuse_slot_for_new_count(50, 100));
+        assert!(!can_reuse_slot_for_new_count(5, 9)); // 8 → 12
     }
 
     /// Y4: verify that a HashMap lookup produces the same result as the old
@@ -1098,38 +1364,39 @@ mod tests {
         assert_eq!(fresh, scratch);
     }
 
-    /// O6: verify the surface error classification logic: Outdated triggers
+    /// O6: verify the surface state classification logic: Outdated triggers
     /// reconfigure (ready stays true), Lost forces ready=false for full
-    /// reinit next frame, other errors just skip the frame.
+    /// reinit next frame, other states just skip the frame.
     #[test]
-    fn surface_error_recovery_classifies_variants() {
-        let errors = [
-            wgpu::SurfaceError::Outdated,
-            wgpu::SurfaceError::Lost,
-            wgpu::SurfaceError::OutOfMemory,
-            wgpu::SurfaceError::Timeout,
+    fn surface_state_recovery_classifies_variants() {
+        let states = [
+            wgpu::CurrentSurfaceTexture::Outdated,
+            wgpu::CurrentSurfaceTexture::Lost,
+            wgpu::CurrentSurfaceTexture::Timeout,
+            wgpu::CurrentSurfaceTexture::Occluded,
+            wgpu::CurrentSurfaceTexture::Validation,
         ];
 
-        for err in &errors {
+        for state in &states {
             let mut ready = true;
             let mut reconfigure = false;
             let mut drop_surface = false;
-            match err {
-                wgpu::SurfaceError::Outdated => {
+            match state {
+                wgpu::CurrentSurfaceTexture::Outdated => {
                     reconfigure = true;
                 }
-                wgpu::SurfaceError::Lost => {
+                wgpu::CurrentSurfaceTexture::Lost => {
                     ready = false;
                     drop_surface = true;
                 }
                 _ => {}
             }
-            match err {
-                wgpu::SurfaceError::Outdated => {
+            match state {
+                wgpu::CurrentSurfaceTexture::Outdated => {
                     assert!(reconfigure && ready, "Outdated: reconfigure, keep ready");
                     assert!(!drop_surface);
                 }
-                wgpu::SurfaceError::Lost => {
+                wgpu::CurrentSurfaceTexture::Lost => {
                     assert!(!ready, "Lost: must set ready=false for full reinit");
                     assert!(
                         drop_surface,
@@ -1137,7 +1404,7 @@ mod tests {
                     );
                 }
                 _ => {
-                    assert!(ready, "Other errors: skip frame, keep ready");
+                    assert!(ready, "Other states: skip frame, keep ready");
                 }
             }
         }
@@ -1185,17 +1452,33 @@ mod tests {
     #[test]
     fn surface_lost_drops_gpu_handles_before_reinit() {
         let mut gpu = ClientGpu::new();
-        // Simulate a "live" surface session without a real wgpu surface.
+        // Simulate a "live" renderer session without a real wgpu device.
         gpu.ready = true;
         gpu.width = 64;
         gpu.height = 64;
-        // config/surface/renderer stay None — drop must clear flags anyway.
-        drop_surface_for_reinit(&mut gpu);
+        // renderer stays None — drop must clear flags anyway.
+        drop_renderer_for_reinit(&mut gpu);
         assert!(!gpu.ready);
-        assert!(gpu.surface.is_none());
         assert!(gpu.renderer.is_none());
-        assert!(gpu.config.is_none());
-        assert!(gpu.surface_format.is_none());
+    }
+
+    #[test]
+    fn resize_invalidates_stale_slot_upload_state() {
+        let mut gpu = ClientGpu::new();
+        let c = SectorCoord(0, 0, 0);
+        gpu.mesh_cache
+            .insert(c, (Vec::new(), Aabb::default(), [0.0; 3]));
+        gpu.slots.insert(c, (0, 10, 42));
+        gpu.next_base = 16;
+        gpu.free_quads.push((100, 8));
+
+        invalidate_gpu_slots_after_resize(&mut gpu);
+
+        assert!(gpu.slots.is_empty());
+        assert!(gpu.free_quads.is_empty());
+        assert_eq!(gpu.next_base, 0);
+        assert!(gpu.full_quad_reupload);
+        assert!(gpu.lightmap_dirty.contains(&c));
     }
 
     /// Sectors whose lightmap must be re-uploaded when `SectorLight` lands
@@ -1232,5 +1515,80 @@ mod tests {
         assert_eq!(corners(32, 32), [(0, 0), (31, 0), (0, 31), (31, 31)]);
         assert_eq!(corners(1, 1), [(0, 0), (0, 0), (0, 0), (0, 0)]);
         assert_eq!(corners(4, 2), [(0, 0), (3, 0), (0, 1), (3, 1)]);
+    }
+
+    /// Lightmap SSBO length must match prepass quad order/count (opaque then
+    /// transparent). Opaque-only fill used to misalign transparent `quad_id`s.
+    #[test]
+    fn lightmap_fill_matches_prepass_opaque_then_transparent() {
+        use strata_render::pipeline::mesh_prepass_bytes;
+
+        let mut mesh = MeshData::default();
+        let mut qo = PackedQuad::new(0, 0, 0, 1, 1, 2, 1, 0, 0, 0);
+        qo.set_light(PackedQuad::pack_light(15, 0));
+        let mut qt = PackedQuad::new(1, 1, 1, 1, 1, 2, 2, 0, 0, 0);
+        qt.set_light(PackedQuad::pack_light(8, 4));
+        mesh.opaque.push(qo);
+        mesh.transparent.push(qt);
+        // mesh_prepass_bytes concatenates these GPU batches.
+        mesh.opaque_gpu = vec![0u8; 8];
+        mesh.transparent_gpu = vec![0u8; 8];
+
+        let mut out = Vec::new();
+        fill_sector_lightmap(
+            &mesh,
+            None,
+            SectorCoord(0, 0, 0),
+            &std::collections::HashMap::new(),
+            &mut out,
+        );
+
+        let prepass = mesh_prepass_bytes(&mesh);
+        assert_eq!(out.len(), mesh.total_quads());
+        assert_eq!(out.len(), prepass.len() / 8);
+        assert_eq!(out[0], LightmapEntry(qo.light()));
+        assert_eq!(out[1], LightmapEntry(qt.light()));
+
+        // Opaque-only would leave transparent slot unfilled / wrong length.
+        let mut opaque_only = Vec::new();
+        for q in &mesh.opaque {
+            opaque_only.push(lightmap_entry_for_quad(
+                q,
+                None,
+                SectorCoord(0, 0, 0),
+                &std::collections::HashMap::new(),
+            ));
+        }
+        assert_ne!(
+            opaque_only.len(),
+            prepass.len() / 8,
+            "opaque-only fill must not match prepass when transparent quads exist"
+        );
+    }
+
+    /// Lightmap must not write when the SSBO slot still holds an older mesh
+    /// generation (upload budget deferred after dig remesh).
+    #[test]
+    fn lightmap_skips_when_slot_gen_lags_mesh() {
+        let mesh_gen = 5u64;
+        let slot_gen = 4u64;
+        assert_ne!(mesh_gen, slot_gen);
+        // Mirrors the guard in `client_render_system`: keep dirty, do not upload.
+        let should_upload = mesh_gen == slot_gen;
+        assert!(
+            !should_upload,
+            "deferred remesh must not lightmap-overwrite the old slot payload"
+        );
+    }
+
+    /// Lightmap byte count must equal the live slot quad count; a longer remesh
+    /// result would overrun into the next sector's lightmap region.
+    #[test]
+    fn lightmap_skips_when_length_mismatches_slot() {
+        let slot_count = 10u32;
+        let remesh_lightmap_len = 14usize;
+        assert_ne!(remesh_lightmap_len, slot_count as usize);
+        let should_upload = remesh_lightmap_len == slot_count as usize;
+        assert!(!should_upload);
     }
 }

@@ -11,9 +11,12 @@ pub mod bloom;
 pub mod camera;
 pub mod cull;
 pub mod lightmap;
+pub mod overlay;
 pub mod prepass;
 pub mod resolve;
 pub mod visbuf;
+
+pub mod bevy_bridge;
 
 pub use block_palette::{BlockColorGpu, BlockPalette, build_block_colors};
 pub use bloom::{
@@ -24,13 +27,14 @@ pub use bloom::{
 pub use camera::CameraView;
 pub use cull::{Aabb, cull_visible};
 pub use lightmap::{LightmapEntry, LightmapSSBO, SECTOR_LIGHTMAP_QUADS};
-pub use visbuf::{PackedQuadGpu, VisBufEntry, meshdata_to_gpu_bytes};
+pub use visbuf::{PackedQuadGpu, VisBufEntry, mesh_prepass_bytes, meshdata_to_gpu_bytes};
 
 use std::sync::Arc;
 
 use wgpu::*;
 
 use crate::meshing::MeshData;
+use crate::pipeline::bevy_bridge::{RenderDeviceRef, RenderQueueRef};
 use crate::pipeline::cull::aabb_of_mesh;
 use crate::pipeline::prepass::{
     PREPASS_COLOR_FORMAT, make_origins_buffer, make_quad_buffer, make_quad_ids_buffer,
@@ -45,11 +49,47 @@ const BYTES_PER_PIXEL: u32 = 8;
 
 /// Block albedo atlas tile size (texels). All registry PNGs are resized here.
 const BLOCK_TEX_SIZE: u32 = 16;
-
 /// Full mip chain length for a power-of-two square (`16 → 5` levels).
 #[inline]
 fn block_tex_mip_count(size: u32) -> u32 {
     size.ilog2() + 1
+}
+
+/// Returns true when any texel is not fully opaque.
+#[inline]
+fn rgba_image_has_partial_alpha(img: &image::RgbaImage) -> bool {
+    img.pixels().any(|p| p[3] != 255)
+}
+
+/// Composite semi-transparent overlay texels onto an opaque backdrop.
+///
+/// Minecraft-style `grass_side` stores grass fringe shape in alpha with rgb=0;
+/// the resolve pass samples rgb only, so transparent texels must be baked before
+/// GPU upload.
+fn bake_texture_alpha_over_backdrop(overlay: &mut image::RgbaImage, backdrop: &image::RgbaImage) {
+    let w = overlay.width().min(backdrop.width());
+    let h = overlay.height().min(backdrop.height());
+    for x in 0..w {
+        for y in 0..h {
+            let fg = overlay.get_pixel(x, y);
+            if fg[3] == 255 {
+                continue;
+            }
+            let bg = backdrop.get_pixel(x, y);
+            let a = fg[3] as f32 / 255.0;
+            let inv = 1.0 - a;
+            let r = (fg[0] as f32 * a + bg[0] as f32 * inv)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            let g = (fg[1] as f32 * a + bg[1] as f32 * inv)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            let b = (fg[2] as f32 * a + bg[2] as f32 * inv)
+                .round()
+                .clamp(0.0, 255.0) as u8;
+            overlay.put_pixel(x, y, image::Rgba([r, g, b, 255]));
+        }
+    }
 }
 
 /// Build mip 0..=N for a block albedo layer (box/triangle downsample).
@@ -72,6 +112,25 @@ fn generate_block_tex_mips(base: &image::RgbaImage) -> Vec<image::RgbaImage> {
     mips
 }
 
+/// Sampler policy for block textures.
+///
+/// Block textures are 16×16 layers in a 2D array (not a sub-rect atlas).
+/// Nearest magnification keeps pixel-art crisp up close; linear mip minification
+/// still smooths distant tiles without WebGPU's anisotropy→linear-mag rule.
+#[inline]
+fn block_sampler_descriptor<'a>() -> SamplerDescriptor<'a> {
+    SamplerDescriptor {
+        label: Some("strata_block_sampler"),
+        address_mode_u: AddressMode::Repeat,
+        address_mode_v: AddressMode::Repeat,
+        address_mode_w: AddressMode::ClampToEdge,
+        mag_filter: FilterMode::Nearest,
+        min_filter: FilterMode::Linear,
+        mipmap_filter: MipmapFilterMode::Linear,
+        ..Default::default()
+    }
+}
+
 /// Bytes per entry in the fattest per-quad storage buffer bound as an entire
 /// SSBO in the resolve pass (`origins` = `vec4<f32>` at binding 8). Growth must
 /// keep `capacity * ORIGIN_BYTES_PER_QUAD ≤ max_storage_buffer_binding_size`.
@@ -87,8 +146,7 @@ pub const MAX_QUAD_SSBO_SLOTS: usize = 1 << 21;
 /// binding limit (origins are the widest per-slot buffer) and
 /// [`MAX_QUAD_SSBO_SLOTS`].
 pub fn max_quad_ssbo_capacity(max_storage_buffer_binding_size: u64) -> usize {
-    let by_binding =
-        (max_storage_buffer_binding_size as usize) / ORIGIN_BYTES_PER_QUAD.max(1);
+    let by_binding = (max_storage_buffer_binding_size as usize) / ORIGIN_BYTES_PER_QUAD.max(1);
     let capped = by_binding.min(MAX_QUAD_SSBO_SLOTS).max(1);
     1usize << capped.ilog2()
 }
@@ -112,6 +170,29 @@ pub(crate) fn next_quad_capacity(needed: usize, old_cap: usize, max_cap: usize) 
 pub(crate) fn lightmap_region_end(base: u32, byte_len: usize) -> usize {
     let end = (base as usize).saturating_add(byte_len);
     end.saturating_add(3) & !3
+}
+
+/// Merge overlapping or adjacent `[start, end)` spans; leave gaps intact.
+///
+/// Used by [`Renderer::flush_quad_uploads`] so non-adjacent sector uploads never
+/// become one bounding-box `write_buffer` that would stomp live SSBO slots with
+/// stale staging bytes in the gap.
+pub(crate) fn coalesce_upload_spans(spans: &mut Vec<(usize, usize)>) {
+    if spans.len() <= 1 {
+        return;
+    }
+    spans.sort_unstable_by_key(|&(s, _)| s);
+    let mut w = 0;
+    for i in 1..spans.len() {
+        let (s, e) = spans[i];
+        if s <= spans[w].1 {
+            spans[w].1 = spans[w].1.max(e);
+        } else {
+            w += 1;
+            spans[w] = (s, e);
+        }
+    }
+    spans.truncate(w + 1);
 }
 
 /// Fullscreen-triangle blit that samples the offscreen HDR target, applies
@@ -209,11 +290,12 @@ pub struct Renderer {
     /// M10c bloom pipeline bundle; built lazily on first frame that uses it.
     bloom: Option<BloomPipelines>,
     /// Staging buffers for batched quad/origin uploads (see `upload_quad_region`
-    /// / `flush_quad_uploads`). Each sector is staged at its own SSBO offset so a
-    /// single `write_buffer` moves the whole frame's batch. Only the written
-    /// range (`upload_range_*`) is copied to the GPU, not the full SSBO-sized
-    /// staging vec, so a 8-sector update stays ~sub-ms instead of re-copying
-    /// tens of MB. Reused across frames (sized to SSBO capacity) to avoid reallocs.
+    /// / `flush_quad_uploads`). Each sector is staged at its own SSBO offset;
+    /// flush issues one `write_buffer` per discrete span (overlapping/adjacent
+    /// spans coalesce). A single min‥max bounding-box flush is incorrect: staging
+    /// only holds fresh bytes at uploaded offsets, so copying the gap would
+    /// stomp other sectors' live SSBO slots with stale staging garbage (dig →
+    /// self+neighbor remesh at distant bases → garbled geometry/textures).
     quad_upload_staging: Vec<u8>,
     origin_upload_staging: Vec<[f32; 4]>,
     /// Per-quad `quad_id_in_sector` staging, parallel to `quad_upload_staging`.
@@ -225,16 +307,22 @@ pub struct Renderer {
     /// the renderer auto-fills this buffer in its draw paths
     /// (`render_frame`, `draw_quad_ranges`, `run_prepass`).
     sector_id_upload_staging: Vec<u32>,
-    /// Inclusive [start, end) byte range written this frame in `quad_upload_staging`.
-    upload_range_quad: Option<(usize, usize)>,
-    /// Inclusive [start, end) float range written this frame in `origin_upload_staging`.
-    upload_range_origin: Option<(usize, usize)>,
-    /// Inclusive [start, end) u32 range written this frame in `quad_id_upload_staging`.
-    upload_range_quad_id: Option<(usize, usize)>,
+    /// Discrete [start, end) byte spans written this frame in `quad_upload_staging`.
+    upload_spans_quad: Vec<(usize, usize)>,
+    /// Discrete [start, end) float spans written this frame in `origin_upload_staging`.
+    upload_spans_origin: Vec<(usize, usize)>,
+    /// Dirty flag: true when new spans were pushed since the last `coalesce_upload_spans`
+    /// call. Lets `flush_quad_uploads` skip the O(n log n) sort when the spans haven't
+    /// changed since the previous flush (e.g. `flush_quad_uploads` called again without
+    /// intervening `upload_quad_region`).
+    spans_dirty_quad: bool,
+    spans_dirty_origin: bool,
     pending_upload: bool,
     /// Lazily-built fullscreen blit used to present the offscreen HDR target to a
     /// window surface (M9b). One per surface format.
     blit: Option<Blit>,
+    /// Selection wireframe + center crosshair (built lazily per surface format).
+    hud: Option<overlay::HudOverlay>,
 }
 
 /// GPU resources for the M9b offscreen->surface present blit (created lazily).
@@ -308,6 +396,24 @@ struct Prepass {
 }
 
 impl Renderer {
+    /// Build a [`Renderer`] around Bevy's [`RenderDevice`]/[`RenderQueue`],
+    /// extracting the underlying wgpu device/queue via `wgpu_device()`. This
+    /// ensures the renderer shares the single wgpu device that Bevy's
+    /// `RenderPlugin` created, avoiding a renderer-ownership conflict.
+    pub fn from_render_device(
+        render_device: &impl RenderDeviceRef,
+        render_queue: &impl RenderQueueRef,
+        width: u32,
+        height: u32,
+    ) -> Self {
+        Self::new(
+            render_device.wgpu_device().clone(),
+            render_queue.wgpu_queue().clone(),
+            width,
+            height,
+        )
+    }
+
     /// Build a [`Renderer`] around an existing device/queue, sizing the
     /// offscreen target to `width`×`height`. The M4c pre-pass resources are
     /// created on first [`Renderer::render_prepass`] call.
@@ -318,7 +424,7 @@ impl Renderer {
         );
 
         let offscreen = device.create_texture(&TextureDescriptor {
-            label: Some("strata_offscreen_hdr"),
+            label: Some("strata_offscreen"),
             size: Extent3d {
                 width,
                 height,
@@ -362,13 +468,15 @@ impl Renderer {
             prepass: None,
             bloom: None,
             blit: None,
+            hud: None,
             quad_upload_staging: Vec::new(),
             origin_upload_staging: Vec::new(),
             quad_id_upload_staging: Vec::new(),
             sector_id_upload_staging: Vec::new(),
-            upload_range_quad: None,
-            upload_range_origin: None,
-            upload_range_quad_id: None,
+            upload_spans_quad: Vec::new(),
+            upload_spans_origin: Vec::new(),
+            spans_dirty_quad: false,
+            spans_dirty_origin: false,
             pending_upload: false,
         }
     }
@@ -376,6 +484,12 @@ impl Renderer {
     /// Borrow the GPU device (used by the client to configure its surface).
     pub fn device(&self) -> &Device {
         &self.device
+    }
+
+    /// Borrow the offscreen HDR texture view. The client renders to this view
+    /// and then blits it to the window surface (owned by Bevy's RenderPlugin).
+    pub fn offscreen_view(&self) -> &TextureView {
+        &self.offscreen_view
     }
 
     /// Maximum quad SSBO slots this renderer will allocate (device binding
@@ -467,7 +581,7 @@ impl Renderer {
         // masks every lookup so an empty palette yields AIR-color (black) and
         // an empty lightmap yields light=0 (dark) — both correct fallbacks.
         let lightmap_meta = LightmapMetaGpu {
-            palette_size: 1,
+            palette_size: 2, // Min viable: at least AIR + 1 slot so mask ≥ 1
             lightmap_mask: (SECTOR_LIGHTMAP_QUADS - 1) as u32,
             // M10a.3: pack the 4-byte AO curve into the high half of the
             // uniform field. Default is plan 09 Exile approx
@@ -530,19 +644,7 @@ impl Renderer {
                 ..wgpu::TextureViewDescriptor::default()
             });
 
-        // Mag Nearest keeps close-up pixel art; Linear min+mip kills distant
-        // moiré/ants. ClampToEdge (UV is already fract'd into [0,1)) avoids
-        // wrap bleed that reads as growing black grid lines at block edges.
-        let block_sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("strata_block_sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Linear,
-            ..wgpu::SamplerDescriptor::default()
-        });
+        let block_sampler = self.device.create_sampler(&block_sampler_descriptor());
 
         // M4d color-resolve resources.
         let resolve_bgl = resolve_bind_group_layout(&self.device);
@@ -654,7 +756,7 @@ impl Renderer {
             address_mode_w: AddressMode::ClampToEdge,
             mag_filter: FilterMode::Linear,
             min_filter: FilterMode::Linear,
-            mipmap_filter: FilterMode::Nearest,
+            mipmap_filter: MipmapFilterMode::Nearest,
             ..Default::default()
         });
 
@@ -670,8 +772,8 @@ impl Renderer {
             .device
             .create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("strata_bloom_bright_pl"),
-                bind_group_layouts: &[&bright_bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&bright_bgl)],
+                immediate_size: 0,
             });
         let bright_pipeline = self
             .device
@@ -700,7 +802,7 @@ impl Renderer {
                 },
                 depth_stencil: None,
                 multisample: MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
         let bright_bg = self.device.create_bind_group(&BindGroupDescriptor {
@@ -729,8 +831,8 @@ impl Renderer {
             .device
             .create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("strata_bloom_blur_pl"),
-                bind_group_layouts: &[&blur_bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&blur_bgl)],
+                immediate_size: 0,
             });
         let mut blur_h_pipelines: Vec<RenderPipeline> = Vec::with_capacity(mip_count);
         let mut blur_v_pipelines: Vec<RenderPipeline> = Vec::with_capacity(mip_count);
@@ -762,7 +864,7 @@ impl Renderer {
                     },
                     depth_stencil: None,
                     multisample: MultisampleState::default(),
-                    multiview: None,
+                    multiview_mask: None,
                     cache: None,
                 });
             let blur_v = self
@@ -792,7 +894,7 @@ impl Renderer {
                     },
                     depth_stencil: None,
                     multisample: MultisampleState::default(),
-                    multiview: None,
+                    multiview_mask: None,
                     cache: None,
                 });
             blur_h_pipelines.push(blur_h);
@@ -874,7 +976,7 @@ impl Renderer {
                 },
                 depth_stencil: None,
                 multisample: MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -909,8 +1011,8 @@ impl Renderer {
             .device
             .create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("strata_bloom_composite_pl"),
-                bind_group_layouts: &[&composite_bgl],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&composite_bgl)],
+                immediate_size: 0,
             });
         let composite_pipeline = self
             .device
@@ -954,7 +1056,7 @@ impl Renderer {
                 },
                 depth_stencil: None,
                 multisample: MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
         let composite_bg = self.device.create_bind_group(&BindGroupDescriptor {
@@ -1088,14 +1190,15 @@ impl Renderer {
 
     /// GPU depth pre-pass (M4c).
     ///
-    /// Flattens the opaque quads of every `MeshData` into one SSBO, clears the
+    /// Flattens every `MeshData` into one SSBO, clears the
     /// visibility buffer to the smallest stored value (reversed-Z: far/no-data =
     /// 0), uploads the camera, then runs a single vertex-pulling render pass that
     /// writes the 64-bit visbuf via `atomicMax` (nearest fragment wins).
     ///
-    /// `transparent` quads are intentionally ignored here (consumed later by a
-    /// separate draw with blending). No-op when the device lacks the `u64`-atomic
-    /// features required by the pre-pass.
+    /// Transparent quads are appended after opaque via [`mesh_prepass_bytes`]
+    /// until a dedicated blended transparent pass exists (plan 09 §11b).
+    /// No-op when the device lacks the `u64`-atomic features required by the
+    /// pre-pass.
     pub fn render_prepass(&mut self, meshes: &[MeshData], camera: &CameraView) {
         let refs: Vec<&MeshData> = meshes.iter().collect();
         // Single-sector / test path: every mesh is treated as living at world
@@ -1105,9 +1208,10 @@ impl Renderer {
     }
 
     /// Shared pre-pass body used by both [`Renderer::render_prepass`] and
-    /// [`Renderer::render_frame`]: flatten the opaque quads, upload them +
-    /// per-quad world origins + camera, record the vertex-pulling pass into
-    /// `encoder`, and submit. `origins[i]` is the world offset of `meshes[i]`.
+    /// [`Renderer::render_frame`]: flatten opaque + transparent quads (interim
+    /// single-draw path), upload them + per-quad world origins + camera, record
+    /// the vertex-pulling pass into `encoder`, and submit. `origins[i]` is the
+    /// world offset of `meshes[i]`.
     pub(crate) fn run_prepass(
         &mut self,
         meshes: &[&MeshData],
@@ -1120,7 +1224,7 @@ impl Renderer {
             None => return,
         };
 
-        // Flatten opaque quads across all meshes into one byte buffer, building
+        // Flatten prepass quads across all meshes into one byte buffer, building
         // the parallel per-quad world-origin + per-quad sector-id + per-quad
         // quad-id buffers as we go. The sector id is the mesh index in the
         // AOI (i.e. position in the `meshes` slice, 0..N-1), NOT a global
@@ -1132,11 +1236,11 @@ impl Renderer {
         let mut quad_id_data: Vec<u32> = Vec::new();
         let mut next_quad_id: u32 = 0;
         for (i, (m, o)) in meshes.iter().zip(origins).enumerate() {
-            // Reuse the worker-thread pre-flattened opaque bytes (`mesh_sector_snapshot`
-            // fills `opaque_gpu`) instead of re-packing every frame.
-            let opaque = &m.opaque_gpu;
-            let n = opaque.len() / std::mem::size_of::<PackedQuadGpu>();
-            bytes.extend_from_slice(opaque);
+            // Worker thread fills `opaque_gpu` / `transparent_gpu`; concat for
+            // the interim single-draw prepass (see `mesh_prepass_bytes`).
+            let packed = mesh_prepass_bytes(m);
+            let n = packed.len() / std::mem::size_of::<PackedQuadGpu>();
+            bytes.extend_from_slice(&packed);
             origin_data.extend(std::iter::repeat_n([o[0], o[1], o[2], 0.0], n));
             // M11: every quad of mesh `i` carries the same sector id (= i).
             // 4-bit mask in WGSL means AOI must stay under 16 sectors; the
@@ -1153,11 +1257,7 @@ impl Renderer {
         // Grow the quad + origins + quad_ids + sector_ids SSBOs (and the
         // bind group) if the batch no longer fits.
         if quad_count > prepass.quad_capacity {
-            let cap = next_quad_capacity(
-                quad_count,
-                prepass.quad_capacity,
-                self.max_quad_capacity,
-            );
+            let cap = next_quad_capacity(quad_count, prepass.quad_capacity, self.max_quad_capacity);
             if cap < quad_count {
                 // Past device/visbuf cap — refuse rather than allocate an
                 // illegal origins SSBO (resolve binding 8).
@@ -1304,11 +1404,7 @@ impl Renderer {
         }
         let quad_count = bytes.len() / std::mem::size_of::<PackedQuadGpu>();
         if quad_count > prepass.quad_capacity {
-            let cap = next_quad_capacity(
-                quad_count,
-                prepass.quad_capacity,
-                self.max_quad_capacity,
-            );
+            let cap = next_quad_capacity(quad_count, prepass.quad_capacity, self.max_quad_capacity);
             if cap < quad_count {
                 return;
             }
@@ -1348,6 +1444,17 @@ impl Renderer {
         }
         self.queue
             .write_buffer(&prepass.camera_buffer, 0, bytemuck::bytes_of(camera));
+        let resolve_params = Self::build_resolve_params(
+            camera.width,
+            camera.height,
+            self.debug_faces,
+            self.last_debug_dump,
+        );
+        self.queue.write_buffer(
+            &prepass.resolve_params,
+            0,
+            bytemuck::bytes_of(&resolve_params),
+        );
 
         // Single encoder: pre-pass writes visbuf, resolve reads it (WebGPU
         // inserts the storage barrier between the two passes). The visbuf is
@@ -1489,13 +1596,7 @@ impl Renderer {
                 });
             if copy_quads > 0 {
                 let n = copy_quads as u64;
-                encoder.copy_buffer_to_buffer(
-                    &prepass.quad_buffer,
-                    0,
-                    &new_quad_buffer,
-                    0,
-                    n * 8,
-                );
+                encoder.copy_buffer_to_buffer(&prepass.quad_buffer, 0, &new_quad_buffer, 0, n * 8);
                 encoder.copy_buffer_to_buffer(
                     &prepass.origins_buffer,
                     0,
@@ -1587,12 +1688,10 @@ impl Renderer {
         }
         let needed = base + (n.max(origins.len())) as u32;
         self.ensure_quad_capacity(needed);
-        // Stage each sector at its OWN SSBO offset inside a shared scratch vec, so
-        // the whole batch becomes ONE `write_buffer` per buffer (quad + origins)
-        // instead of 2 calls per sector (~686 submissions for a 343-sector burst).
-        // The scratch is sized to the full SSBO quad capacity so offsets line up
-        // 1:1 with the destination buffer; it is reused (not reallocated) across
-        // frames.
+        // Stage each sector at its OWN SSBO offset inside a shared scratch vec.
+        // Flush writes each discrete span (coalescing only overlap/adjacent) —
+        // never a min‥max bounding box across gaps (stale staging in the gap
+        // would corrupt other sectors' live slots).
         let quad_off = (base as usize) * 8;
         // `origin_upload_staging` is a float vec with ONE `[f32;4]` entry per quad,
         // indexed by quad number (same as `base`). So the staging index is just
@@ -1605,40 +1704,56 @@ impl Renderer {
         debug_assert!(self.origin_upload_staging.len() >= origin_idx + origin_len);
         self.quad_upload_staging[quad_off..quad_off + n * 8].copy_from_slice(&bytes[..n * 8]);
         self.origin_upload_staging[origin_idx..origin_idx + origin_len].copy_from_slice(origins);
-        // Track the minimal written range so `flush` copies only what changed,
-        // not the entire SSBO-sized staging vec.
-        let q_end = quad_off + n * 8;
-        let o_end = origin_idx + origin_len;
-        self.upload_range_quad = Some(match self.upload_range_quad {
-            Some((s, e)) => (s.min(quad_off), e.max(q_end)),
-            None => (quad_off, q_end),
-        });
-        self.upload_range_origin = Some(match self.upload_range_origin {
-            Some((s, e)) => (s.min(origin_idx), e.max(o_end)),
-            None => (origin_idx, o_end),
-        });
+        self.upload_spans_quad.push((quad_off, quad_off + n * 8));
+        self.upload_spans_origin
+            .push((origin_idx, origin_idx + origin_len));
+        self.spans_dirty_quad = true;
+        self.spans_dirty_origin = true;
         self.pending_upload = true;
     }
 
-    /// Flush all queued `upload_quad_region` calls as ONE `write_buffer` per
-    /// buffer (quad + origins) — each sector was staged at its own SSBO offset
-    /// inside the shared staging vec, so only the written range is copied (not
-    /// the full SSBO-sized vec). This turns the 343-sector burst from ~686
-    /// queue submissions into 2, and keeps each flush to the changed bytes only.
+    /// Flush all queued `upload_quad_region` calls. Each discrete span becomes
+    /// one `write_buffer` (overlapping/adjacent spans coalesce first). Gaps
+    /// between non-adjacent sector slots are never copied — staging only holds
+    /// fresh bytes at uploaded offsets; writing the gap would stomp live GPU
+    /// geometry with stale scratch (classic dig → self+neighbor remesh bug).
     pub fn flush_quad_uploads(&mut self) {
         if !self.pending_upload {
             return;
         }
         self.ensure_prepass();
-        let prepass = self.prepass.as_ref().unwrap();
-        if let Some((q_start, q_end)) = self.upload_range_quad {
+        let Some(prepass) = self.prepass.as_ref() else {
+            // Device lacks u64-atomic features — drop the batch; staging spans
+            // are useless without a live quad SSBO.
+            self.pending_upload = false;
+            self.spans_dirty_quad = false;
+            self.spans_dirty_origin = false;
+            self.upload_spans_quad.clear();
+            self.upload_spans_origin.clear();
+            return;
+        };
+        if self.spans_dirty_quad {
+            coalesce_upload_spans(&mut self.upload_spans_quad);
+            self.spans_dirty_quad = false;
+        }
+        if self.spans_dirty_origin {
+            coalesce_upload_spans(&mut self.upload_spans_origin);
+            self.spans_dirty_origin = false;
+        }
+        for &(q_start, q_end) in &self.upload_spans_quad {
+            if q_start >= q_end {
+                continue;
+            }
             self.queue.write_buffer(
                 &prepass.quad_buffer,
                 q_start as u64,
                 &self.quad_upload_staging[q_start..q_end],
             );
         }
-        if let Some((o_start, o_end)) = self.upload_range_origin {
+        for &(o_start, o_end) in &self.upload_spans_origin {
+            if o_start >= o_end {
+                continue;
+            }
             // `o_start`/`o_end` are quad (float) indices; the SSBO byte offset is
             // `o_start * 16` (4 floats × 4 bytes).
             self.queue.write_buffer(
@@ -1648,8 +1763,10 @@ impl Renderer {
             );
         }
         self.pending_upload = false;
-        self.upload_range_quad = None;
-        self.upload_range_origin = None;
+        self.spans_dirty_quad = false;
+        self.spans_dirty_origin = false;
+        self.upload_spans_quad.clear();
+        self.upload_spans_origin.clear();
     }
 
     /// Upload the camera uniform (cheap; call once per frame).
@@ -1661,6 +1778,25 @@ impl Renderer {
         };
         self.queue
             .write_buffer(&prepass.camera_buffer, 0, bytemuck::bytes_of(camera));
+    }
+
+    /// Build resolve uniforms for the current frame (clip planes + debug knobs).
+    fn build_resolve_params(
+        width: u32,
+        height: u32,
+        debug_faces: bool,
+        last_debug_dump: Option<(u32, u32, u32)>,
+    ) -> ResolveParams {
+        let (mask, x, y) = last_debug_dump.unwrap_or((0, 0, 0));
+        ResolveParams {
+            width,
+            height,
+            debug_faces: debug_faces as u32,
+            debug_dump_mask: mask,
+            debug_dump_x: x,
+            debug_dump_y: y,
+            ..ResolveParams::new(width, height)
+        }
     }
 
     /// Re-upload the resolve params so a debug-faces toggle is live. Only call
@@ -1676,20 +1812,14 @@ impl Renderer {
             Some(p) => p,
             None => return,
         };
-        // Preserve the dump config across the faces toggle so a concurrent
-        // dump request isn't silently zeroed.
-        let (mask, x, y) = self.last_debug_dump.unwrap_or((0, 0, 0));
-        self.queue.write_buffer(
-            &prepass.resolve_params,
-            0,
-            bytemuck::bytes_of(&ResolveParams {
-                debug_faces: self.debug_faces as u32,
-                debug_dump_mask: mask,
-                debug_dump_x: x,
-                debug_dump_y: y,
-                ..ResolveParams::new(self.width, self.height)
-            }),
+        let params = Self::build_resolve_params(
+            self.width,
+            self.height,
+            self.debug_faces,
+            self.last_debug_dump,
         );
+        self.queue
+            .write_buffer(&prepass.resolve_params, 0, bytemuck::bytes_of(&params));
     }
 
     /// Configure the resolve-fragment debug dump. Pass `mask = 0` to disable.
@@ -1820,8 +1950,8 @@ impl Renderer {
             texture_mapping.insert(name.clone(), i as u32);
         }
 
-        // 2. Load the actual PNG images
-        let mut layers = Vec::new();
+        // 2. Load the actual PNG images (resize first, then alpha-bake overlays).
+        let mut loaded = std::collections::HashMap::new();
         for name in &unique_textures {
             let path = format!("assets/textures/{}.png", name);
             let img = match image::open(&path) {
@@ -1846,8 +1976,23 @@ impl Renderer {
             } else {
                 img
             };
-            layers.push(img);
+            loaded.insert(name.clone(), img);
         }
+
+        if loaded
+            .get("grass_side")
+            .is_some_and(rgba_image_has_partial_alpha)
+        {
+            let dirt = loaded.get("dirt").cloned();
+            if let (Some(grass), Some(dirt)) = (loaded.get_mut("grass_side"), dirt) {
+                bake_texture_alpha_over_backdrop(grass, &dirt);
+            }
+        }
+
+        let layers: Vec<image::RgbaImage> = unique_textures
+            .iter()
+            .map(|name| loaded.remove(name).expect("texture loaded above"))
+            .collect();
 
         // 3. Create the 2D Texture Array with a full mip chain (16→8→4→2→1).
         // Without mips, distant faces alias into grainy "ants" under Nearest.
@@ -2293,6 +2438,9 @@ impl Renderer {
 
         self.prepass = None;
         self.blit = None;
+        if let Some(hud) = self.hud.as_mut() {
+            hud.resize_crosshair(&self.queue, width, height);
+        }
     }
 
     /// Present the offscreen HDR target to a window `surface_view` via a tiny
@@ -2337,6 +2485,39 @@ impl Renderer {
         self.queue.submit(std::iter::once(encoder.finish()));
     }
 
+    /// Draw the Minecraft-style selection wireframe (optional) and center
+    /// crosshair onto the swapchain after [`Renderer::present`].
+    ///
+    /// When a prepass visbuf exists for the current frame, wireframe fragments
+    /// behind scene geometry are discarded (packed 17-bit reversed-Z).
+    pub fn draw_selection_hud(
+        &mut self,
+        surface_view: &TextureView,
+        surface_format: TextureFormat,
+        camera: &CameraView,
+        outline_lines: Option<&[[f32; 3]]>,
+    ) {
+        let needs_build = self.hud.as_ref().is_none_or(|h| h.format != surface_format);
+        if needs_build {
+            self.hud = Some(overlay::HudOverlay::build(
+                &self.device,
+                surface_format,
+                self.width,
+                self.height,
+            ));
+        }
+        let visbuf = self.prepass.as_ref().map(|p| &p.visbuf);
+        overlay::draw_hud(
+            &self.device,
+            &self.queue,
+            self.hud.as_mut().expect("hud built above"),
+            surface_view,
+            camera,
+            outline_lines,
+            visbuf,
+        );
+    }
+
     /// Build the present blit pipeline + bind group for `surface_format`. The bind
     /// group samples our own `offscreen_view`, so it must be rebuilt whenever the
     /// offscreen texture is recreated (resize).
@@ -2361,8 +2542,8 @@ impl Renderer {
             .device
             .create_pipeline_layout(&PipelineLayoutDescriptor {
                 label: Some("strata_present_pl"),
-                bind_group_layouts: &[&layout],
-                push_constant_ranges: &[],
+                bind_group_layouts: &[Some(&layout)],
+                immediate_size: 0,
             });
 
         let module = self.device.create_shader_module(ShaderModuleDescriptor {
@@ -2397,7 +2578,7 @@ impl Renderer {
                 },
                 depth_stencil: None,
                 multisample: MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
 
@@ -2662,10 +2843,7 @@ mod tests {
 
     #[test]
     fn test_offscreen_clear() {
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
 
         let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::default(),
@@ -2737,15 +2915,11 @@ mod tests {
     /// them the test is skipped (the WGSL still compiles).
     #[test]
     fn test_prepass_writes_visbuf() {
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
 
         // Search all adapters for one that exposes the `u64`-atomic features the
         // pre-pass requires, so the test runs on capable GPUs.
-        let adapter = match instance
-            .enumerate_adapters(Backends::all())
+        let adapter = match pollster::block_on(instance.enumerate_adapters(Backends::all()))
             .into_iter()
             .find(|a| a.features().contains(prepass_features()))
         {
@@ -2821,13 +2995,9 @@ mod tests {
     /// Requires an adapter exposing `SHADER_INT64` atomics; otherwise it skips.
     #[test]
     fn test_render_frame_produces_terrain() {
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
 
-        let adapter = match instance
-            .enumerate_adapters(Backends::all())
+        let adapter = match pollster::block_on(instance.enumerate_adapters(Backends::all()))
             .into_iter()
             .find(|a| a.features().contains(prepass_features()))
         {
@@ -2933,13 +3103,9 @@ mod tests {
     /// (the old bug) both counts would be equal and non-zero.
     #[test]
     fn test_render_frame_applies_sector_origin() {
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
 
-        let adapter = match instance
-            .enumerate_adapters(Backends::all())
+        let adapter = match pollster::block_on(instance.enumerate_adapters(Backends::all()))
             .into_iter()
             .find(|a| a.features().contains(prepass_features()))
         {
@@ -3033,12 +3199,8 @@ mod tests {
     fn test_debug_dump_round_trip() {
         use crate::pipeline::resolve::debug_dump;
 
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
-        let adapter = match instance
-            .enumerate_adapters(Backends::all())
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
+        let adapter = match pollster::block_on(instance.enumerate_adapters(Backends::all()))
             .into_iter()
             .find(|a| a.features().contains(prepass_features()))
         {
@@ -3174,8 +3336,8 @@ mod tests {
             result[4],
             &result[4..8]
         );
-        assert!(result[5] >= 0.0 && result[5] <= 1.0, "uv.x={}", result[5]);
-        assert!(result[6] >= 0.0 && result[6] <= 1.0, "uv.y={}", result[6]);
+        assert!(result[5].is_finite(), "uv.x={}", result[5]);
+        assert!(result[6].is_finite(), "uv.y={}", result[6]);
         assert!(result[7] >= 0.0 && result[7] < 6.0, "n_idx={}", result[7]);
 
         // Disable the dump to confirm mask=0 round-trips.
@@ -3184,16 +3346,44 @@ mod tests {
         assert!(disabled.is_none(), "mask=0 must short-circuit dump_debug");
     }
 
+    #[test]
+    fn block_sampler_uses_nearest_mag_with_linear_mip_minification() {
+        let sampler = block_sampler_descriptor();
+        assert_eq!(sampler.address_mode_u, AddressMode::Repeat);
+        assert_eq!(sampler.address_mode_v, AddressMode::Repeat);
+        assert_eq!(sampler.address_mode_w, AddressMode::ClampToEdge);
+        assert_eq!(sampler.mag_filter, FilterMode::Nearest);
+        assert_eq!(sampler.min_filter, FilterMode::Linear);
+        assert_eq!(sampler.mipmap_filter, MipmapFilterMode::Linear);
+        assert_eq!(sampler.anisotropy_clamp, 1);
+    }
+
+    #[test]
+    fn bake_grass_side_alpha_composites_over_dirt_backdrop() {
+        let mut grass = image::RgbaImage::from_fn(2, 2, |x, y| {
+            if y == 0 {
+                image::Rgba([0, 200, 0, 255])
+            } else if x == 0 {
+                image::Rgba([0, 0, 0, 128])
+            } else {
+                image::Rgba([0, 0, 0, 0])
+            }
+        });
+        let dirt = image::RgbaImage::from_pixel(2, 2, image::Rgba([120, 80, 50, 255]));
+        bake_texture_alpha_over_backdrop(&mut grass, &dirt);
+
+        assert_eq!(grass.get_pixel(0, 1).0, [60, 40, 25, 255]);
+        assert_eq!(grass.get_pixel(1, 1).0, [120, 80, 50, 255]);
+        assert!(!rgba_image_has_partial_alpha(&grass));
+    }
+
     /// Bug 5 regression: sector ids written to the SSBO must be the post-cull
     /// index (position in `to_render`), not the original mesh index. Otherwise
     /// the resolve shader's 4-bit sector mask sees stale indices when culling
     /// drops meshes.
     #[test]
     fn sector_id_uses_post_cull_index() {
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
         let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::default(),
             compatible_surface: None,
@@ -3251,10 +3441,7 @@ mod tests {
     /// data when growing the SSBO.
     #[test]
     fn ensure_quad_capacity_preserves_lightmap_data() {
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
         let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::default(),
             compatible_surface: None,
@@ -3319,10 +3506,7 @@ mod tests {
 
     #[test]
     fn test_upload_quad_region_auto_grows_capacity() {
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
         let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::default(),
             compatible_surface: None,
@@ -3361,7 +3545,11 @@ mod tests {
             end > SECTOR_LIGHTMAP_QUADS,
             "global slot uploads must exceed the legacy 32KB per-sector lightmap"
         );
-        assert_eq!(lightmap_region_end(0, 1), 4, "wgpu COPY_BUFFER_ALIGNMENT pad");
+        assert_eq!(
+            lightmap_region_end(0, 1),
+            4,
+            "wgpu COPY_BUFFER_ALIGNMENT pad"
+        );
         assert_eq!(lightmap_region_end(100, 4), 104);
     }
 
@@ -3369,10 +3557,7 @@ mod tests {
     fn upload_lightmap_region_grows_after_resize_drops_prepass() {
         // Staging stays large across resize; GPU lightmap resets to 32KB.
         // upload_lightmap_region at a high global base must re-grow, not panic.
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
         let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::default(),
             compatible_surface: None,
@@ -3417,10 +3602,7 @@ mod tests {
     fn ensure_quad_capacity_clamps_past_binding_limit() {
         // Regression: requesting 2^24 slots used to allocate origins at
         // 256 MiB and crash create_bind_group (binding 8 > 128 MiB limit).
-        let instance = Instance::new(&InstanceDescriptor {
-            backends: Backends::all(),
-            ..Default::default()
-        });
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
         let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
             power_preference: PowerPreference::default(),
             compatible_surface: None,
@@ -3525,7 +3707,7 @@ mod tests {
             "prepass must not index the (unfilled) quad_ids SSBO for lightmap id"
         );
         assert!(
-            PREPASS_WGSL.contains("let expand = 0.01 + 0.04 * clamp(dist")
+            PREPASS_WGSL.contains("mix(0.35, 0.85, grazing * grazing)")
                 && PREPASS_WGSL.contains("p[uaxis] = p[uaxis] + f32(du * w)"),
             "prepass must distance-expand greedy faces to close sub-pixel cracks"
         );
@@ -3542,5 +3724,77 @@ mod tests {
         assert_eq!((mips[2].width(), mips[2].height()), (4, 4));
         assert_eq!((mips[3].width(), mips[3].height()), (2, 2));
         assert_eq!((mips[4].width(), mips[4].height()), (1, 1));
+    }
+
+    /// Dig remeshes self + neighbor at distant SSBO bases. A min‥max bounding-box
+    /// flush would copy stale staging through the gap and corrupt live geometry.
+    #[test]
+    fn coalesce_upload_spans_keeps_gap_between_distant_sectors() {
+        // Two 10-quad sectors (80 bytes each) with a large unused gap between.
+        let mut spans = vec![(0, 80), (8_000, 8_080)];
+        coalesce_upload_spans(&mut spans);
+        assert_eq!(
+            spans,
+            vec![(0, 80), (8_000, 8_080)],
+            "non-adjacent uploads must stay discrete (not one 0..8080 bbox)"
+        );
+        // Document the buggy bounding-box that caused garbled dig remesh:
+        let bbox = (
+            spans.iter().map(|s| s.0).min().unwrap(),
+            spans.iter().map(|s| s.1).max().unwrap(),
+        );
+        assert_eq!(bbox, (0, 8_080));
+        assert_ne!(
+            spans.len(),
+            1,
+            "bounding-box collapse is the corruption bug"
+        );
+    }
+
+    #[test]
+    fn coalesce_upload_spans_merges_adjacent_and_overlapping() {
+        let mut adjacent = vec![(80, 160), (0, 80)];
+        coalesce_upload_spans(&mut adjacent);
+        assert_eq!(adjacent, vec![(0, 160)]);
+
+        let mut overlap = vec![(50, 150), (0, 100)];
+        coalesce_upload_spans(&mut overlap);
+        assert_eq!(overlap, vec![(0, 150)]);
+    }
+
+    #[test]
+    fn upload_quad_region_records_discrete_spans_not_bbox() {
+        let instance = Instance::new(InstanceDescriptor::new_without_display_handle());
+        let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::default(),
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })) {
+            Ok(a) => a,
+            Err(_) => return,
+        };
+        let (device, queue) = match pollster::block_on(adapter.request_device(&DeviceDescriptor {
+            label: Some("strata_test_device"),
+            required_features: prepass_features(),
+            ..Default::default()
+        })) {
+            Ok(dq) => dq,
+            Err(_) => return,
+        };
+        let mut renderer = Renderer::new(device, queue, 64, 64);
+        let bytes_a = vec![0xAAu8; 16]; // 2 quads
+        let bytes_b = vec![0xBBu8; 16];
+        let origins = vec![[0.0f32; 4]; 2];
+        renderer.upload_quad_region(0, &bytes_a, &origins);
+        renderer.upload_quad_region(1000, &bytes_b, &origins);
+        assert_eq!(
+            renderer.upload_spans_quad,
+            vec![(0, 16), (8000, 8016)],
+            "distant sector uploads must not collapse to a single bbox span"
+        );
+        // Flush must clear spans without panicking (write_buffer to GPU).
+        renderer.flush_quad_uploads();
+        assert!(renderer.upload_spans_quad.is_empty());
+        assert!(!renderer.pending_upload);
     }
 }

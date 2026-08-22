@@ -127,7 +127,7 @@ fn empty_sector_round_trip() {
 /// Compression bomb: decompressed size past the sector cap must Error (not OOM).
 #[test]
 fn decompress_rejects_over_max_decompressed_size() {
-    use strata_storage::compress::{decompress_with_limit, MAX_DECOMPRESSED_SECTOR_BYTES};
+    use strata_storage::compress::{MAX_DECOMPRESSED_SECTOR_BYTES, decompress_with_limit};
     use strata_storage::envelope::compress as env_compress;
 
     // Highly compressible zeros — tiny on disk, huge when decoded.
@@ -153,9 +153,7 @@ fn decompress_rejects_over_max_decompressed_size() {
 
 #[test]
 fn zstd_magic_detection_and_decode_stored_payload() {
-    use strata_storage::compress::{
-        decode_stored_payload, is_zstd_frame, ZSTD_MAGIC,
-    };
+    use strata_storage::compress::{ZSTD_MAGIC, decode_stored_payload, is_zstd_frame};
 
     assert!(!is_zstd_frame(&[]));
     assert!(!is_zstd_frame(&[0x28, 0xB5]));

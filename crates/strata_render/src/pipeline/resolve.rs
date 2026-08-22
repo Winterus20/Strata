@@ -148,8 +148,8 @@ impl ResolveParams {
             fog_color: FOG_COLOR,
             exposure: EXPOSURE,
             fog_density: 0.0,
-            camera_near: 0.1,
-            camera_far: 1000.0,
+            camera_near: crate::pipeline::camera::DEFAULT_CAMERA_NEAR,
+            camera_far: crate::pipeline::camera::DEFAULT_CAMERA_FAR,
             _pad_tail: [0; 4],
         }
     }
@@ -368,13 +368,40 @@ fn get_world_space_uv(world_pos: vec3<f32>, normal: u32) -> vec2<f32> {
   return fract(uv);
 }
 
-// Full-texel inset: Linear min+mip kernels are wider than half a texel at
-// distant LODs, so 0.5/16 still bled across the fract wrap / dark stone edge
-// and read as a grainy black grid. Clamp first — expanded prepass geometry can
-// reconstruct UV slightly outside [0,1].
+// Ray–plane hit for resolve shading. Visbuf depth is 17-bit; unprojecting it for
+// world UV still wobbles at block boundaries — intersect the per-pixel view ray
+// with the packed voxel + face plane from the prepass instead.
+fn ray_plane_hit(eye: vec3<f32>, dir: vec3<f32>, plane_pt: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
+  let dn = dot(dir, n);
+  let denom = select(dn, sign(dn) * 1e-5, abs(dn) < 1e-5);
+  let t = dot(plane_pt - eye, n) / denom;
+  return eye + dir * max(t, 0.0);
+}
+
+fn face_plane_point(voxel_pos: u32, face: u32, origin: vec3<f32>) -> vec3<f32> {
+  let vx = f32(voxel_pos & 0x1Fu);
+  let vy = f32((voxel_pos >> 5u) & 0x1Fu);
+  let vz = f32((voxel_pos >> 10u) & 0x1Fu);
+  let axis = face / 2u;
+  var p = origin + vec3<f32>(vx, vy, vz);
+  p[axis] = p[axis] + f32(1u - (face & 1u));
+  return p;
+}
+
+// Half-texel inset: keep samples away from exact 0/1 endpoints when a block
+// uses quad-local UVs, but avoid the heavy blur a full-texel inset introduced.
 fn inset_block_uv(uv: vec2<f32>) -> vec2<f32> {
-  let inset = 1.0 / 16.0;
+  let inset = 0.5 / 16.0;
   return clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)) * (1.0 - 2.0 * inset) + inset;
+}
+
+// Nearest mag keeps pixel-art crisp; hardware mip selection via textureSample.
+// Tiny grazing bias only — the previous +1.25/+1.0 LOD overshoot collapsed
+// 16×16 tiles to mush. Seams are handled by visbuf v6 + cap AO, not mip crush.
+fn sample_block_albedo(uv: vec2<f32>, layer: i32, n_dot_v: f32, _dist: f32) -> vec3<f32> {
+  let grazing = 1.0 - clamp(n_dot_v, 0.0, 1.0);
+  let bias = grazing * grazing * 0.35;
+  return textureSampleBias(block_textures, block_sampler, uv, layer, bias).rgb;
 }
 
 fn get_quad_space_uv(world_pos: vec3<f32>, quad_id: u32) -> vec2<f32> {
@@ -485,29 +512,22 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   // Empty == cleared sentinel (0). select(false, true, cond).
   let is_empty = select(0.0, 1.0, entry == u64(0));
 
-  // Decode visbuf fields (v5: 13-bit depth, 21-bit quad_id).
+  // Decode visbuf fields (v6: 17-bit depth, 17-bit quad_id).
   //  - voxel_pos:  bit[0:15]   (15 bits)
   //  - block_id:   bit[15:19]  (4 bits)
   //  - ao_corners: bit[19:27]  (8 bits, 4 corners x 2 bits)
-  //  - quad_id:    bit[27:48]  (21 bits, global SSBO / lightmap slot)
-  //  - normal:     bit[48:51]  (3 bits)
-  //  - depth:      bit[51:64]  (13 bits, reversed-Z)
+  //  - quad_id:    bit[27:43]  (17 bits, global SSBO / lightmap slot)
+  //  - normal:     bit[44:46]  (3 bits)
+  //  - depth:      bit[47:63]  (17 bits, reversed-Z)
   let block_id = u32((entry >> u32(15)) & u64(0xFu));
   let ao_corners = u32((entry >> u32(19)) & u64(0xFFu));
-  let quad_id = u32((entry >> u32(27)) & u64(0x1FFFFFu));
+  let quad_id = u32((entry >> u32(27)) & u64(0x1FFFFu));
+  let voxel_pos = u32(entry & u64(0x7FFFu));
   // Face normal is 3 bits (0..7) but only 6 faces exist — clamp before indexing
   // the 6-element normals / textures / face_colors arrays.
-  let n_idx = min(u32((entry >> u32(48)) & u64(0x7u)), 5u);
-  let stored_depth = u32((entry >> u32(51)) & u64(0x1FFFu));
-  let depth_n = f32(stored_depth) / 8191.0; // 0..1, 0=far, 1=near
-  let linear_depth = params.camera_near / (1.0 - depth_n * (1.0 - params.camera_near / params.camera_far));
-  let fog_factor = 1.0 - exp(-params.fog_density * linear_depth);
-
-  // Reconstruct exact world position using depth and camera inverse view projection
-  let ndc_z = 1.0 - depth_n;
-  let clip_pos = vec4<f32>(ndc_x, ndc_y, ndc_z, 1.0);
-  let world_pos_w = cam.inv_view_proj * clip_pos;
-  let world_pos = world_pos_w.xyz / world_pos_w.w;
+  let n_idx = min(u32((entry >> u32(44)) & u64(0x7u)), 5u);
+  let stored_depth = u32((entry >> u32(47)) & u64(0x1FFFFu));
+  let depth_n = f32(stored_depth) / 131071.0; // 0..1, 0=far, 1=near
 
   var normals = array<vec3<f32>, 6>(
     vec3<f32>( 1.0,  0.0,  0.0),
@@ -518,6 +538,21 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
     vec3<f32>( 0.0,  0.0, -1.0)
   );
   let n = normals[n_idx];
+
+  let safe_quad_id = select(0u, quad_id, entry != u64(0));
+  let origin_count = arrayLength(&origins);
+  let safe_origin_id = select(0u, safe_quad_id, safe_quad_id < origin_count);
+  let plane_pt = face_plane_point(voxel_pos, n_idx, origins[safe_origin_id].xyz);
+  let surf_hit = ray_plane_hit(cam.eye.xyz, sky_dir, plane_pt, n);
+  let linear_depth = length(surf_hit - cam.eye.xyz);
+  let fog_factor = 1.0 - exp(-params.fog_density * linear_depth);
+
+  // Keep depth unproject for debug dump compatibility (signals only).
+  let ndc_z = 1.0 - depth_n;
+  let clip_pos = vec4<f32>(ndc_x, ndc_y, ndc_z, 1.0);
+  let world_pos_w = cam.inv_view_proj * clip_pos;
+  let world_pos = world_pos_w.xyz / world_pos_w.w;
+  let shade_pos = select(world_pos, surf_hit, entry != u64(0));
 
   // Hemispheric ambient is independent of the lightmap so sky=0 never paints
   // pure black. Lambert (sun) is gated by sky/block below — keeps caves darker
@@ -531,23 +566,22 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
   let palette_mask = palette_size - 1u;
   let ao_curve_packed = lightmap_meta.z;
 
-  let safe_quad_id = select(0u, quad_id, entry != u64(0));
   let safe_block_id = select(0u, block_id, entry != u64(0));
   let slot = safe_block_id & palette_mask;
   let block_prop = block_colors[slot];
   let base_color = block_prop.rgb;
   let use_quad_uv = block_prop.use_quad_uv != 0u;
-
   var uv = vec2<f32>(0.0, 0.0);
   if (use_quad_uv) {
-      uv = get_quad_space_uv(world_pos, safe_quad_id);
+      uv = get_quad_space_uv(shade_pos, safe_quad_id);
   } else {
-      uv = get_world_space_uv(world_pos, n_idx);
+      uv = get_world_space_uv(shade_pos, n_idx);
   }
   uv = inset_block_uv(uv);
 
   let tex_layer = block_prop.textures[n_idx];
-  let tex_color = textureSample(block_textures, block_sampler, uv, i32(tex_layer));
+  let n_dot_v = max(dot(n, normalize(surf_hit - cam.eye.xyz)), 0.0);
+  let tex_color = sample_block_albedo(uv, i32(tex_layer), n_dot_v, linear_depth);
 
   // Per-face tint
   let up = max(n.y, 0.0);
@@ -558,15 +592,23 @@ fn fs_main(in: VOut) -> @location(0) vec4<f32> {
 
   // AO always uses quad-space UV (0..1 across the face). Texture may use
   // world UV above; mixing fract(world) into sample_ao tears soft AO.
-  let ao_uv = get_quad_space_uv(world_pos, safe_quad_id);
+  let ao_uv = get_quad_space_uv(shade_pos, safe_quad_id);
   let ao_smooth = sample_ao(ao_corners, ao_uv);
   // Continuous smooth curve LUT interpolation removes discrete step-banding
   // and quantization seams across quad faces. Soften AO with distance so
   // dark corner samples don't alias into 1px black grid lines when a block
-  // is sub-pixel (near lighting unchanged).
+  // is sub-pixel (near lighting unchanged). Cap faces fade faster — flat
+  // grass tops shouldn't inherit greedy-quad corner occlusion at distance.
   let ao_raw = ao_curve_lookup(ao_smooth, ao_curve_packed);
-  let ao_dist_fade = clamp(linear_depth * (1.0 / 96.0), 0.0, 1.0);
-  let ao_mult = mix(ao_raw, 1.0, ao_dist_fade * 0.55);
+  let ao_dist_fade = clamp(linear_depth * (1.0 / 64.0), 0.0, 1.0);
+  let cap_fade = max(up, down);
+  let ao_fade_strength = mix(0.75, 1.0, cap_fade);
+  var ao_mult = mix(ao_raw, 1.0, ao_dist_fade * ao_fade_strength);
+  // Grass/dirt caps: greedy-quad corner AO reads as a dark grid at distance.
+  if (up > 0.5) {
+    let cap_kill = clamp(linear_depth * (1.0 / 8.0), 0.0, 1.0);
+    ao_mult = mix(ao_mult, 1.0, cap_kill);
+  }
 
   // Lightmap lookup (M10a.4): one byte per quad, packed as (sky<<4)|block.
   // Indexed by global SSBO slot (`quad_id` == instance_index from prepass).
@@ -832,8 +874,8 @@ pub fn resolve_pipeline(device: &Device, layout: &BindGroupLayout) -> RenderPipe
     });
     let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("strata_resolve_layout"),
-        bind_group_layouts: &[layout],
-        push_constant_ranges: &[],
+        bind_group_layouts: &[Some(&layout)],
+        immediate_size: 0,
     });
     device.create_render_pipeline(&RenderPipelineDescriptor {
         label: Some("strata_resolve_pipeline"),
@@ -860,7 +902,7 @@ pub fn resolve_pipeline(device: &Device, layout: &BindGroupLayout) -> RenderPipe
         },
         depth_stencil: None,
         multisample: MultisampleState::default(),
-        multiview: None,
+        multiview_mask: None,
         cache: None,
     })
 }
@@ -1170,13 +1212,39 @@ mod tests {
         assert!(
             RESOLVE_WGSL.contains("fn inset_block_uv")
                 && RESOLVE_WGSL.contains("uv = inset_block_uv(uv);")
-                && RESOLVE_WGSL.contains("let inset = 1.0 / 16.0;"),
-            "RESOLVE_WGSL must inset block UVs before textureSample"
+                && RESOLVE_WGSL.contains("let inset = 0.5 / 16.0;"),
+            "RESOLVE_WGSL must inset block UVs before texture sample"
         );
         assert!(
-            RESOLVE_WGSL.contains("ao_dist_fade")
-                && RESOLVE_WGSL.contains("mix(ao_raw, 1.0, ao_dist_fade"),
-            "RESOLVE_WGSL must soften AO with distance to avoid aliased edge lines"
+            RESOLVE_WGSL.contains("fn sample_block_albedo")
+                && RESOLVE_WGSL.contains("textureSampleBias(block_textures")
+                && RESOLVE_WGSL.contains("grazing * grazing * 0.35"),
+            "RESOLVE_WGSL must use mild grazing mip bias (not aggressive SampleLevel)"
+        );
+        assert!(
+            RESOLVE_WGSL.contains("fn get_world_space_uv")
+                && RESOLVE_WGSL.contains("return fract(uv);")
+                && RESOLVE_WGSL.contains("uv = get_world_space_uv(shade_pos, n_idx);"),
+            "RESOLVE_WGSL must support world-space fract UV when use_quad_uv=0"
+        );
+        assert!(
+            RESOLVE_WGSL.contains("fn ray_plane_hit")
+                && RESOLVE_WGSL.contains("fn face_plane_point")
+                && RESOLVE_WGSL.contains("let shade_pos = select(world_pos, surf_hit"),
+            "resolve must shade from ray–plane hits, not 13-bit depth unproject alone"
+        );
+        assert!(
+            !RESOLVE_WGSL.contains("select(-1e-5, 1e-5, abs(dn) < 1e-5)"),
+            "ray_plane_hit must not use the sign-losing select(-1e-5, 1e-5, ...) guard"
+        );
+        assert!(
+            RESOLVE_WGSL.contains("sign(dn) * 1e-5"),
+            "ray_plane_hit must preserve dn sign via sign(dn) * 1e-5"
+        );
+        assert!(
+            RESOLVE_WGSL.contains("ao_fade_strength = mix(0.75, 1.0, cap_fade)")
+                && RESOLVE_WGSL.contains("cap_kill"),
+            "cap faces must fade AO fully at distance to kill dark grid lines"
         );
         assert!(
             RESOLVE_WGSL.contains("let ambient = 0.14;")
@@ -1195,7 +1263,7 @@ mod tests {
         assert_eq!(clamp(6), 5);
         assert_eq!(clamp(7), 5);
         assert!(
-            RESOLVE_WGSL.contains("min(u32((entry >> u32(48)) & u64(0x7u)), 5u)"),
+            RESOLVE_WGSL.contains("min(u32((entry >> u32(44)) & u64(0x7u)), 5u)"),
             "resolve WGSL must clamp n_idx before indexing 6-element arrays"
         );
     }
@@ -1223,5 +1291,89 @@ mod tests {
         // Old wash was +0.15 on the lightmap channel itself; caves with that
         // looked nearly as bright as dim outdoor. Keep dark well below mid-grey.
         assert!(dark < 0.20, "cave/sky=0 must stay clearly dim, got {dark}");
+    }
+
+    /// M10a.2 ray_plane_hit: branchless div-by-zero guard must preserve the
+    /// sign of `dn` so that near-parallel rays hitting back-facing planes
+    /// are rejected (negative `t` → clamped to 0 by `max(t, 0.0)`).
+    ///
+    /// The old code used `select(-1e-5, 1e-5, abs(dn) < 1e-5)` which always
+    /// produced a positive `1e-5`, making back-facing near-parallel rays
+    /// appear to hit the plane behind the eye.
+    fn ray_plane_hit_cpu(
+        eye: [f32; 3],
+        dir: [f32; 3],
+        plane_pt: [f32; 3],
+        n: [f32; 3],
+    ) -> [f32; 3] {
+        let dn = dir[0] * n[0] + dir[1] * n[1] + dir[2] * n[2];
+        let denom = if dn.abs() < 1e-5 {
+            dn.signum() * 1e-5
+        } else {
+            dn
+        };
+        let num = (plane_pt[0] - eye[0]) * n[0]
+            + (plane_pt[1] - eye[1]) * n[1]
+            + (plane_pt[2] - eye[2]) * n[2];
+        let t = (num / denom).max(0.0);
+        [
+            eye[0] + dir[0] * t,
+            eye[1] + dir[1] * t,
+            eye[2] + dir[2] * t,
+        ]
+    }
+
+    #[test]
+    fn ray_plane_hit_preserves_sign_for_near_parallel_rays() {
+        let eye = [0.0, 0.0, 0.0];
+        let plane_pt = [1.0, 0.0, 0.0];
+        let n = [1.0, 0.0, 0.0];
+
+        // Front-facing near-parallel ray (dn slightly positive): should
+        // produce a finite hit point, not the eye.
+        let dir_front = [1e-6, 0.0, 0.0];
+        let hit_front = ray_plane_hit_cpu(eye, dir_front, plane_pt, n);
+        assert!(
+            hit_front != eye,
+            "front-facing near-parallel ray must produce a hit, not the eye"
+        );
+
+        // Back-facing near-parallel ray (dn slightly negative): the ray is
+        // going away from the plane, so `t` must be negative and clamped to
+        // 0 — the result must be exactly `eye`.
+        let dir_back = [-1e-6, 0.0, 0.0];
+        let hit_back = ray_plane_hit_cpu(eye, dir_back, plane_pt, n);
+        assert_eq!(
+            hit_back, eye,
+            "back-facing near-parallel ray must be rejected (result = eye)"
+        );
+
+        // Normal (non-parallel) ray: should hit the plane point exactly.
+        let dir_normal = [1.0, 0.0, 0.0];
+        let hit_normal = ray_plane_hit_cpu(eye, dir_normal, plane_pt, n);
+        assert!(
+            (hit_normal[0] - 1.0).abs() < 1e-5,
+            "normal ray must hit plane at x=1, got {}",
+            hit_normal[0]
+        );
+    }
+
+    /// ray_plane_hit WGSL: the shader must define the function and use the
+    /// sign-preserving `sign(dn) * 1e-5` guard (not the old sign-losing
+    /// `select(-1e-5, 1e-5, abs(dn) < 1e-5)` pattern).
+    #[test]
+    fn ray_plane_hit_wgsl_uses_sign_preserving_guard() {
+        assert!(
+            RESOLVE_WGSL.contains("fn ray_plane_hit"),
+            "RESOLVE_WGSL must define the ray_plane_hit function"
+        );
+        assert!(
+            RESOLVE_WGSL.contains("sign(dn) * 1e-5"),
+            "ray_plane_hit must preserve dn sign via sign(dn) * 1e-5"
+        );
+        assert!(
+            !RESOLVE_WGSL.contains("select(-1e-5, 1e-5, abs(dn) < 1e-5)"),
+            "ray_plane_hit must not use the sign-losing select(-1e-5, 1e-5, ...) guard"
+        );
     }
 }

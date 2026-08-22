@@ -21,7 +21,11 @@ pub mod raycast;
 
 pub use controller::{PlayerController, PlayerLook, PlayerState};
 pub use input::{InputAction, InputMapper, PlayerInput};
-pub use interaction::{PlayerBreak, PlayerPlace, RayHit, apply_break, apply_place};
+pub use interaction::{
+    ChunkMap, PlayerBreak, PlayerPlace, RayHit, SELECTION_OUTLINE_EXPAND, apply_break, apply_place,
+    pick_solid_voxel, selection_outline_front_facing, selection_outline_hit_face,
+    selection_outline_line_list, voxel_world_min,
+};
 pub use inventory::{Inventory, ItemStack};
 pub use plugin::{PlayerPlugin, spawn_player};
 pub use raycast::{FaceNormal, look_direction, raycast_voxel};

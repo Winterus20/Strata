@@ -261,7 +261,7 @@ pub fn streaming_system(
     sectors: Query<(Entity, &SectorCoord, Option<&XBrickMap>)>,
     pool: Res<GlobalBrickPool>,
     dirty_queue: Option<Res<strata_save::plugin::DirtyQueue>>,
-    mut messages: Option<ResMut<bevy_ecs::message::Messages<strata_save::plugin::SectorSave>>>,
+    mut messages: Option<ResMut<bevy::ecs::message::Messages<strata_save::plugin::SectorSave>>>,
     mut pending_gen: Option<ResMut<crate::plugin::PendingWorldGen>>,
     mut pending_load: Option<ResMut<crate::plugin::PendingSectorLoad>>,
 ) {
